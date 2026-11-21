@@ -6,8 +6,9 @@
 
 **Result:** 5,000 seeds × {3, 5} nodes with 0 violations. Each cluster size saw about 56k partitions
 (some one-way), 28k crash/restarts and 27k pauses. Liveness held after healing in every run.
-Mutation check: disks that lie about fsync produced two leaders in one term in 70 of 500 seeds, and the
-checkers caught every one.
+Mutation check (disks that lie about fsync): the vote-durability checker caught it in 50 of 50 seeds,
+on average 2.6 s into the run. With that checker off, the bug produced two leaders in one term in 70 of
+500 seeds, and the Election Safety checker caught every one.
 
 Replay: `./gradlew :raft-sim:test -Psim.seeds=5000` (gate), `-Psim.seed=N` (one seed).
 
