@@ -1,77 +1,64 @@
+# 3-node Raft KV cluster for real-process tests (kill -9, restart, recovery from the file WAL).
+#
+# STATUS: target for M5. It will not start until raft-node has a main class, gRPC transport
+# and raft-node/Dockerfile. The environment variables below are the contract that main must honour.
+#
+#   docker compose up -d            # start the cluster
+#   docker compose kill node2       # SIGKILL == kill -9: no shutdown hooks, no final fsync
+#   docker compose start node2      # restart; the node must recover from its own volume
+#   docker compose down -v          # stop and WIPE all data volumes
+
+x-raft-node: &raft-node
+  image: raft-kv-node:dev
+  build:
+    context: .
+    dockerfile: raft-node/Dockerfile
+  environment: &raft-env
+    RAFT_PEERS: "1=node1:7000,2=node2:7000,3=node3:7000"   # fixed membership (no reconfiguration in v1)
+    RAFT_PEER_PORT: "7000"                                 # node-to-node gRPC, internal network only
+    RAFT_CLIENT_PORT: "8080"                               # client API
+    RAFT_DATA_DIR: "/data"                                 # WAL segments + snapshots
+  networks: [raft-net]
+  # Never auto-restart: crash tests decide when a node comes back.
+  restart: "no"
+  # Named volumes (not bind mounts): on macOS, Docker Desktop's bind-mount file sharing
+  # can weaken fsync guarantees. Named volumes live on the Linux VM's own disk.
+
 services:
-  cassandra:
-    image: 'cassandra:latest'
+  node1:
+    <<: *raft-node
+    container_name: raft-node1
+    hostname: node1
     environment:
-      - 'CASSANDRA_DC=dc1'
-      - 'CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch'
-    ports:
-      - '9042'
-  elasticsearch:
-    image: 'docker.elastic.co/elasticsearch/elasticsearch:9.3.3'
+      <<: *raft-env
+      RAFT_NODE_ID: "1"
+    ports: ["8081:8080"]
+    volumes: ["node1-data:/data"]
+
+  node2:
+    <<: *raft-node
+    container_name: raft-node2
+    hostname: node2
     environment:
-      - 'ELASTIC_PASSWORD=secret'
-      - 'discovery.type=single-node'
-      - 'xpack.security.enabled=false'
-    ports:
-      - '9200'
-      - '9300'
-  grafana-lgtm:
-    image: 'grafana/otel-lgtm:latest'
-    ports:
-      - '3000:3000'
-      - '4317'
-      - '4318'
-  mongodb:
-    image: 'mongo:latest'
+      <<: *raft-env
+      RAFT_NODE_ID: "2"
+    ports: ["8082:8080"]
+    volumes: ["node2-data:/data"]
+
+  node3:
+    <<: *raft-node
+    container_name: raft-node3
+    hostname: node3
     environment:
-      - 'MONGO_INITDB_DATABASE=mydatabase'
-      - 'MONGO_INITDB_ROOT_PASSWORD=secret'
-      - 'MONGO_INITDB_ROOT_USERNAME=root'
-    ports:
-      - '27017'
-  mysql:
-    image: 'mysql:latest'
-    environment:
-      - 'MYSQL_DATABASE=mydatabase'
-      - 'MYSQL_PASSWORD=secret'
-      - 'MYSQL_ROOT_PASSWORD=verysecret'
-      - 'MYSQL_USER=myuser'
-    ports:
-      - '3306'
-  neo4j:
-    image: 'neo4j:latest'
-    environment:
-      - 'NEO4J_AUTH=neo4j/notverysecret'
-    ports:
-      - '7687'
-  oracle:
-    image: 'gvenzl/oracle-free:latest'
-    environment:
-      - 'ORACLE_PASSWORD=secret'
-    ports:
-      - '1521'
-  postgres:
-    image: 'postgres:latest'
-    environment:
-      - 'POSTGRES_DB=mydatabase'
-      - 'POSTGRES_PASSWORD=secret'
-      - 'POSTGRES_USER=myuser'
-    ports:
-      - '5432'
-  pulsar:
-    image: 'apachepulsar/pulsar:latest'
-    ports:
-      - '6650'
-      - '8080'
-    command: 'bin/pulsar standalone'
-  rabbitmq:
-    image: 'rabbitmq:latest'
-    environment:
-      - 'RABBITMQ_DEFAULT_PASS=secret'
-      - 'RABBITMQ_DEFAULT_USER=myuser'
-    ports:
-      - '5672'
-  redis:
-    image: 'redis:latest'
-    ports:
-      - '6379'
+      <<: *raft-env
+      RAFT_NODE_ID: "3"
+    ports: ["8083:8080"]
+    volumes: ["node3-data:/data"]
+
+networks:
+  raft-net: {}
+
+volumes:
+  node1-data: {}
+  node2-data: {}
+  node3-data: {}
