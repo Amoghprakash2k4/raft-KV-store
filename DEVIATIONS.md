@@ -7,9 +7,11 @@ and the code carries a matching `// SHORTCUT:` comment where it applies.
 
 | # | Where | Shortcut | Removed in |
 |---|-------|----------|------------|
-| P1 | `RaftNodeCore.broadcastHeartbeat` | Heartbeats always send `prevLogIndex = prevLogTerm = 0` and no entries, because the leader doesn't track `nextIndex` yet. This is valid under Figure 2 (index 0 always matches), but nothing gets replicated. | M2 |
-| P2 | `RaftNodeCore.becomeLeader` | A new leader doesn't append a no-op entry in its term (§8). It doesn't matter yet, since nothing commits in M1. | M2 |
-| P3 | `RaftNodeCore.step` | `ProposeCommand` and `ReadRequested` throw `UnsupportedOperationException`, and a non-empty AppendEntries also throws. They fail loudly rather than being silently ignored. | M2 / M4 |
+| P3 | `RaftNodeCore.step`, `NodeDriver.handle` | `ReadRequested` throws `UnsupportedOperationException` (and the driver throws on `ReadReady`/`ReadRejected`). It fails loudly rather than being silently ignored. Until then, reads go through the log as `KvCommand.Get`, which is linearizable but costs a log entry per read. | M4 |
+
+Removed in M2: **P1** (heartbeats with `prevLogIndex = 0`, now real `nextIndex`/`prevLogTerm` with entries), **P2**
+(no no-op on election, now appended in `becomeLeader`, §8), and the M2 half of **P3** (proposals and non-empty
+AppendEntries are handled). `grep -rnE "M1 only|arrives? in M2" raft-*/src/main` returns nothing.
 
 ## From the project brief
 
@@ -18,6 +20,13 @@ and the code carries a matching `// SHORTCUT:` comment where it applies.
 | B1 | Java 17 | Java 21 | Owner decision. Also gives final pattern-matching `switch` over sealed types, which the exhaustive-dispatch rule needs. |
 | B2 | `SimulatedNetwork` in the transport layer | Lives in `raft-sim` | It depends on the virtual clock; `raft-transport` stays free of simulation code. |
 | B3 | `Transport.send(nodeId, Message)` | Messages carry `to()` | A `Ready` is self-describing; the transport reads the destination from the message. |
+
+## Test-harness simplifications (the simulator, not the protocol)
+
+| # | What | Why it is acceptable now | Revisit |
+|---|------|--------------------------|---------|
+| H1 | Simulated client requests reach nodes over a reliable 1–5 ms channel (no drops or duplicates); only node crashes and pauses affect them. Outcomes are delivered back directly. | M2 checks replica agreement, not client-observed behaviour. Lossy client links only matter together with retries and dedup. | M4 (sessions, retries, linearizability checker) |
+| H2 | `RaftNodeCore.withMutationsForTesting` puts three test-only `if`s into production code (DESIGN.md M2-C). | The public constructor always uses no mutations; each `if` is marked `// MUTATION (test only)`. | Kept |
 
 ## Open (to decide at the named milestone)
 

@@ -89,3 +89,39 @@ construction. Its one requirement is that the driver is single-threaded.
 5. **A snapshot is taken at exactly `lastApplied`,** between two `Ready`s, and includes the client
    session table. In v1 it is taken synchronously on the loop thread. That blocks the loop, which only
    affects liveness, so it will be marked `// SHORTCUT:`; copy-on-write snapshots are a possible M6 item.
+
+## M2. Log replication decisions (approved 2026-11-22)
+
+### M2-A. Flow control: send on proposal and on heartbeat; `nextIndex` moves only on replies
+The leader sends AppendEntries (up to `maxEntriesPerAppend` entries from `nextIndex[p]`) to every peer
+when a proposal is appended and on every heartbeat. `nextIndex` changes only when a reply arrives:
+success raises it to `matchIndex + 1`, a rejection that answers the latest probe lowers it.
+**Rejected:** etcd-style optimistic pipelining (Probe/Replicate modes, in-flight windows): much more
+state and many more edge cases. Heartbeat-only sending: adds up to one heartbeat interval to every commit.
+**Cost:** a slow follower can receive the same batch several times until it acks; throughput is about
+one batch per round trip. Revisit in the M6 benchmarks.
+
+### M2-B. Command encoding: hand-written binary codec
+`DataOutputStream`/`DataInputStream`: a type byte, then fixed-width numbers and length-prefixed byte
+strings. No dependencies, canonical (equal values give identical bytes, needed for M3 snapshot
+comparison), and every byte is visible. Property-tested: `decode(encode(x)) == x`.
+**Rejected:** protobuf now (build complexity before M5, and its encoding is not guaranteed canonical);
+Java serialization (security risk, fragile, not a stable format).
+
+### M2-C. Mutation hooks: a test-only `Set<ProtocolMutation>`
+`RaftNodeCore.withMutationsForTesting(config, state, rng, mutations)` builds a core that breaks the named
+rules. The public constructor always passes an empty set. Each mutation is one marked `if` at the
+rule it breaks. **Rejected:** subclass overrides (non-final classes, `this-escape` lint); PIT
+(slow, untargeted; possible M6 extra).
+
+### M2-D. Simulated clients: open loop, no retries
+Simulated clients propose random PUT/DELETE/CAS commands every 20–100 ms to the node they believe is
+leader, follow rejection hints, and never retry an unknown outcome. M2 checks that replicas agree
+(invariants 2–5); what clients observe (linearizability) is M4, together with retries and sessions.
+
+### M2-E. Proposal bookkeeping in the driver
+The core emits `ProposalAccepted(proposalId, index, term)`. The driver remembers `index → (proposalId,
+term)`. When the entry at `index` is applied: same term means the proposal committed and gets the state
+machine's result; a different term means it was overwritten by another leader and is answered
+"lost, retry" (thesis §6.3). The command envelope carries `clientId` and `seq` from day one so that M4's
+dedup does not change the log format.

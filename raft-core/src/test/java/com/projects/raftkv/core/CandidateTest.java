@@ -3,6 +3,7 @@ package com.projects.raftkv.core;
 import static com.projects.raftkv.core.CoreFixtures.*;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
@@ -10,7 +11,7 @@ import org.junit.jupiter.api.Test;
 class CandidateTest {
 
     @Test
-    void becomesLeaderOnMajorityAndSendsHeartbeatsImmediately() {
+    void becomesLeaderOnMajorityAndSendsItsNoOpImmediately() {
         RaftNodeCore c = fresh(N1);
         tickUntilElection(c);
 
@@ -18,7 +19,10 @@ class CandidateTest {
 
         assertThat(c.status().soft()).isEqualTo(new SoftState(Role.LEADER, 1, Optional.of(N1)));
         assertThat(r.softState()).contains(new SoftState(Role.LEADER, 1, Optional.of(N1)));
-        assertThat(r.messages()).containsExactlyInAnyOrder(heartbeat(N1, N2, 1), heartbeat(N1, N3, 1));
+        // §8: the first AppendEntries of a new leader carries its no-op entry.
+        List<LogEntry> noop = List.of(new LogEntry(1, 1, new EntryPayload.Noop()));
+        assertThat(r.messages()).containsExactlyInAnyOrder(
+                append(N1, N2, 1, 0, 0, noop, 0), append(N1, N3, 1, 0, 0, noop, 0));
     }
 
     @Test
@@ -68,6 +72,6 @@ class CandidateTest {
 
         assertThat(c.status().soft()).isEqualTo(new SoftState(Role.FOLLOWER, 1, Optional.of(N2)));
         assertThat(c.status().hard().votedFor()).contains(N1);
-        assertThat(r.messages()).containsExactly(new Message.AppendEntriesResponse(N1, N2, 1, true, 0));
+        assertThat(r.messages()).containsExactly(ok(N1, N2, 1, 0));
     }
 }

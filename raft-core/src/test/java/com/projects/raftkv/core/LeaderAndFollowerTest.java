@@ -26,7 +26,7 @@ class LeaderAndFollowerTest {
     void leaderStepsDownOnHigherTermAndStartsAFreshElectionTimer() {
         RaftNodeCore leader = leaderOf3(N1);
 
-        receive(leader, new Message.AppendEntriesResponse(N2, N1, 9, false, 0));
+        receive(leader, reject(N2, N1, 9, 0));
 
         assertThat(leader.status().soft()).isEqualTo(new SoftState(Role.FOLLOWER, 9, Optional.empty()));
         assertThat(tickN(leader, T - 1)).isEmpty();
@@ -38,7 +38,7 @@ class LeaderAndFollowerTest {
         for (int i = 0; i < 5; i++) {
             tickN(f, T - 1);
             Ready r = receive(f, heartbeat(N2, N1, 1));
-            assertThat(r.messages()).containsExactly(new Message.AppendEntriesResponse(N1, N2, 1, true, 0));
+            assertThat(r.messages()).containsExactly(ok(N1, N2, 1, 0));
         }
         assertThat(f.status().soft()).isEqualTo(new SoftState(Role.FOLLOWER, 1, Optional.of(N2)));
     }
@@ -49,7 +49,7 @@ class LeaderAndFollowerTest {
         int ticks = 0;
         while (f.status().soft().role() == Role.FOLLOWER) {
             Ready r = receive(f, heartbeat(N2, N1, 4));
-            assertThat(r.messages()).containsExactly(new Message.AppendEntriesResponse(N1, N2, 5, false, 0));
+            assertThat(r.messages()).containsExactly(new Message.AppendEntriesResponse(N1, N2, 5, false, 0, 0, 0, 0));
             tick(f);
             ticks++;
             assertThat(ticks).isLessThan(2 * T);
@@ -61,7 +61,7 @@ class LeaderAndFollowerTest {
         RaftNodeCore leader = leaderOf3(N1);
         long term = leader.status().hard().currentTerm();
 
-        Ready r = receive(leader, new Message.AppendEntriesResponse(N2, N1, term - 1, false, 0));
+        Ready r = receive(leader, reject(N2, N1, term - 1, 0));
 
         assertThat(r.isEmpty()).isTrue();
     }
@@ -92,12 +92,5 @@ class LeaderAndFollowerTest {
         RaftNodeCore f = fresh(N1);
         assertThatThrownBy(() -> receive(f, heartbeat(N2, N3, 1)))
                 .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    void proposalsAreNotSupportedUntilM2() {
-        RaftNodeCore f = fresh(N1);
-        assertThatThrownBy(() -> f.step(new Event.ProposeCommand(1, Bytes.EMPTY)))
-                .isInstanceOf(UnsupportedOperationException.class);
     }
 }

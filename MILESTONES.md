@@ -14,35 +14,66 @@ Replay: `./gradlew :raft-sim:test -Psim.seeds=5000` (gate), `-Psim.seed=N` (one 
 
 ---
 
-## M2: Log replication, entry checklist
+## M2: Log replication ✅ done (gate passed 2026-11-22, accepted by the owner 2026-11-23)
 
-M2 is not done until every box is ticked.
+**Exit criterion:** invariants 1–5 hold under drops, duplicates, reordering, partitions and crashes.
 
-### Remove the M1 shortcuts (DEVIATIONS.md)
-- [ ] **P1:** heartbeats/AppendEntries use real `nextIndex[p]`: `prevLogIndex = nextIndex - 1`, `prevLogTerm = termAt(prevLogIndex)`, and send entries (Figure 2).
-- [ ] **P2:** a new leader appends a no-op entry in its own term on election (§8). Without it, the leader can't commit entries from earlier terms (Figure 8).
-- [ ] **P3:** `ProposeCommand` is handled by appending to the leader's log and emitting `ProposalAccepted`, or `ProposalRejected` with a leader hint on a non-leader. Non-empty AppendEntries are processed, not thrown. (`ReadRequested` stays loud until M4 and moves to the M4 checklist.)
-- [ ] `NodeDriver` applies `Ready.toApply` to the `KvStateMachine` (step 3 of E1) instead of throwing.
-- [ ] `grep -rnE "M1 only|arrives? in M2" raft-*/src/main` returns nothing, and P1 and P2 are deleted from DEVIATIONS.md (P3 shrinks to the M4 part). Today the grep finds 6 lines in `RaftNodeCore` and `NodeDriver`: the P1 and P2 shortcuts, the proposal throw, the non-empty AppendEntries throw and its Javadoc, and the driver's apply throw.
+**Result:** 5,000 seeds × {3, 5} nodes with 0 violations of Election Safety, Leader Append-Only, Log
+Matching, Leader Completeness and State Machine Safety, plus vote durability, replica KV-state agreement
+and liveness (a leader exists, commands still commit, and every node catches up). Per cluster size:
+about 28k crash/restarts, 56k partitions, 26–27k pauses, 3.24M client proposals, 2.0M (3 nodes) / 2.4M
+(5 nodes) committed, ~127k proposals lost to overwriting, logs up to ~630 entries. Gate runtime ~90 s.
 
-### New invariant checkers (separate classes, separate failure messages)
-- [ ] **Log Matching (invariant 3, §5.3):** if two logs have the same (index, term), their prefixes up to that index are identical.
-- [ ] **Leader Completeness (invariant 4, §5.4):** every committed entry is in the log of every leader of a later term. In M1 this was untestable because logs were empty.
-- [ ] **State Machine Safety (invariant 5, §5.4.3):** no two nodes apply different entries at the same index.
-- [ ] **Leader Append-Only (invariant 2):** a leader never overwrites or deletes entries in its own log.
-- [ ] Election Safety stays its own checker. Leader Completeness is a different property, so it gets its own checker and its own failure message rather than being folded into Election Safety.
+Mutation checks (each must be caught; measured rates):
 
-### Log up-to-date check under real load
-- [ ] The election restriction (§5.4.1) is exercised by chaos runs with non-empty, diverging logs. In M1 it was covered only by unit tests.
-- [ ] **Mutation:** skipping the log up-to-date check in `onRequestVote` is caught by Leader Completeness / State Machine Safety in some seed.
-- [ ] **Mutation:** committing an entry from an older term by counting replicas (the Figure 8 bug) is caught.
+| Mutation | Seeds | Caught by |
+|---|---|---|
+| Skip the log up-to-date check when voting (§5.4.1) | 100 | Leader Completeness 97 |
+| Commit an old-term entry by counting (Figure 8), batch size 1 | 1000 | Leader Completeness 11 (Liveness 18, unrelated: slow 1-entry catch-up) |
+| Same, batch size 64 | 200 | 0: the no-op travels with the old entries, so the bad window never opens |
+| Truncate even when entries match (§5.3) | 100 | Leader Completeness 49, replica state divergence 47, state machine order guard 4 |
+| Lying disks (M1), vote checker on | 50 | Vote durability 50 |
+| Lying disks, vote checker off | 300 | Leader Completeness 148, Election Safety 26, Log Matching 10, State Machine Safety 4 |
+| Control: no mutation, batch size 1 | 100 | no safety violations (1 slow-catch-up liveness miss) |
 
-### Unit scenarios from the paper
-- [ ] The Figure 7 follower logs (a)–(f) all converge to the leader's log.
-- [ ] The Figure 8 sequence: an old-term entry on a majority is not committed until a current-term entry is.
-- [ ] Reordered or duplicated AppendEntries never truncate entries that already match.
-- [ ] Reordered AppendEntriesResponses never move `matchIndex` backwards.
+The basic version (decrement nextIndex by one) was safe on its own (0 failures over 500 seeds × {3, 5}
+with a 20 s quiet period), but too slow to catch up within the normal 3 s window; fast backup fixed that.
 
-### Then
-- [ ] Fast log backup (conflictTerm / conflictIndex), added only after the basic version passes.
-- [ ] Gate: invariants 1–5 hold over 5,000 seeds with drops, duplicates, reordering, partitions and crashes.
+Re-run on 2026-11-23 before committing: build green, gate identical (same counts, so runs stay
+deterministic).
+
+Replay: `./gradlew :raft-sim:test -Psim.seeds=5000` (gate), `-Psim.seed=N` (one seed).
+
+### Entry checklist (all done)
+
+#### Remove the M1 shortcuts (DEVIATIONS.md)
+- [x] **P1:** heartbeats/AppendEntries use real `nextIndex[p]`: `prevLogIndex = nextIndex - 1`, `prevLogTerm = termAt(prevLogIndex)`, and send entries (Figure 2).
+- [x] **P2:** a new leader appends a no-op entry in its own term on election (§8). Without it, the leader can't commit entries from earlier terms (Figure 8).
+- [x] **P3:** `ProposeCommand` is handled by appending to the leader's log and emitting `ProposalAccepted`, or `ProposalRejected` with a leader hint on a non-leader. Non-empty AppendEntries are processed, not thrown. (`ReadRequested` stays loud until M4 and moves to the M4 checklist.)
+- [x] `NodeDriver` applies `Ready.toApply` to the `KvStateMachine` (step 3 of E1) instead of throwing.
+- [x] `grep -rnE "M1 only|arrives? in M2" raft-*/src/main` returns nothing, and P1 and P2 are deleted from DEVIATIONS.md (P3 shrinks to the M4 part). Done: the grep returns nothing.
+
+#### New invariant checkers (separate classes, separate failure messages)
+- [x] **Log Matching (invariant 3, §5.3):** if two logs have the same (index, term), their prefixes up to that index are identical.
+- [x] **Leader Completeness (invariant 4, §5.4):** every committed entry is in the log of every leader of a later term. In M1 this was untestable because logs were empty.
+- [x] **State Machine Safety (invariant 5, §5.4.3):** no two nodes apply different entries at the same index.
+- [x] **Leader Append-Only (invariant 2):** a leader never overwrites or deletes entries in its own log.
+- [x] Election Safety stays its own checker. Leader Completeness is a different property, so it gets its own checker and its own failure message rather than being folded into Election Safety.
+
+#### Log up-to-date check under real load
+- [x] The election restriction (§5.4.1) is exercised by chaos runs with non-empty, diverging logs. In M1 it was covered only by unit tests.
+- [x] **Mutation:** skipping the log up-to-date check in `onRequestVote` is caught by Leader Completeness / State Machine Safety in some seed.
+- [x] **Mutation:** committing an entry from an older term by counting replicas (the Figure 8 bug) is caught.
+
+#### Unit scenarios from the paper
+- [x] The Figure 7 follower logs (a)–(f) all converge to the leader's log.
+- [x] The Figure 8 sequence: an old-term entry on a majority is not committed until a current-term entry is.
+- [x] Reordered or duplicated AppendEntries never truncate entries that already match.
+- [x] Reordered AppendEntriesResponses never move `matchIndex` backwards.
+
+#### Then
+- [x] Fast log backup (conflictTerm / conflictIndex), added only after the basic version passes.
+- [x] Gate: invariants 1–5 hold over 5,000 seeds with drops, duplicates, reordering, partitions and crashes.
+
+### Carried to M4
+- [ ] `ReadRequested` / ReadIndex (P3 remainder). Client retries, sessions and dedup; lossy client links (H1).

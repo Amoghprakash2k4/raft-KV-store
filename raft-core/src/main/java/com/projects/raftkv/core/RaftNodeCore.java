@@ -1,6 +1,7 @@
 package com.projects.raftkv.core;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -9,8 +10,8 @@ import java.util.Set;
 import java.util.random.RandomGenerator;
 
 /**
- * Deterministic Raft core. Implements leader election (M1): Figure 2 "Rules for Servers",
- * RequestVote, and the term/heartbeat parts of AppendEntries.
+ * Deterministic Raft core: leader election (M1) and log replication (M2), following Figure 2
+ * ("State", "AppendEntries RPC", "RequestVote RPC", "Rules for Servers").
  *
  * <p>Each {@link #step} mutates in-memory state and returns a {@link Ready}. Per DESIGN.md E1 the
  * driver executes that Ready (persist + fsync first) before the next step, so the core may treat
@@ -22,26 +23,38 @@ public final class RaftNodeCore implements RaftCore {
     private final NodeId self;
     private final RandomGenerator rng;
     private final RaftLog log;
+    private final Set<ProtocolMutation> mutations;
 
     // Persistent state (Figure 2). Durable once the Ready that changed it is executed.
     private long currentTerm;
     private Optional<NodeId> votedFor;
 
-    // Volatile state.
+    // Volatile state (Figure 2). Both restart at 0 after a crash: the state machine is rebuilt by
+    // re-applying the log (until M3 snapshots).
+    private long commitIndex;
+    private long lastApplied;
     private RoleState role;
     private int electionElapsed;
     private int randomizedElectionTimeout;
     private int heartbeatElapsed;
 
-    // What the driver was last told, so each Ready carries only changes.
+    // Output being collected for the current step.
     private HardState lastEmittedHardState;
     private SoftState lastEmittedSoftState;
     private final List<Message> outbox = new ArrayList<>();
+    private final List<PersistOp> logOps = new ArrayList<>();
+    private final List<ClientNotice> notices = new ArrayList<>();
 
     public RaftNodeCore(RaftConfig config, PersistentState recovered, RandomGenerator rng) {
+        this(config, recovered, rng, Set.of());
+    }
+
+    private RaftNodeCore(RaftConfig config, PersistentState recovered, RandomGenerator rng,
+                         Set<ProtocolMutation> mutations) {
         this.config = Objects.requireNonNull(config);
         this.self = config.self();
         this.rng = Objects.requireNonNull(rng);
+        this.mutations = mutations.isEmpty() ? Set.of() : Set.copyOf(EnumSet.copyOf(mutations));
         this.log = new RaftLog(recovered.entries());
         this.currentTerm = recovered.hardState().currentTerm();
         this.votedFor = recovered.hardState().votedFor();
@@ -55,15 +68,22 @@ public final class RaftNodeCore implements RaftCore {
         this.lastEmittedSoftState = softState();
     }
 
+    /**
+     * A core that deliberately breaks the given protocol rules (DESIGN.md M2-C). For mutation tests
+     * only: they prove the simulator's checkers notice each bug.
+     */
+    public static RaftNodeCore withMutationsForTesting(RaftConfig config, PersistentState recovered,
+                                                       RandomGenerator rng, Set<ProtocolMutation> mutations) {
+        return new RaftNodeCore(config, recovered, rng, Objects.requireNonNull(mutations));
+    }
+
     @Override
     public Ready step(Event event) {
         Objects.requireNonNull(event);
-        outbox.clear();
         switch (event) {
             case Event.Tick t -> onTick();
             case Event.MessageReceived(Message m) -> onMessage(m);
-            case Event.ProposeCommand p ->
-                    throw new UnsupportedOperationException("client proposals arrive in M2: " + p);
+            case Event.ProposeCommand p -> onPropose(p);
             case Event.ReadRequested r ->
                     throw new UnsupportedOperationException("ReadIndex arrives in M4: " + r);
         }
@@ -72,7 +92,7 @@ public final class RaftNodeCore implements RaftCore {
 
     @Override
     public RaftStatus status() {
-        return new RaftStatus(self, softState(), hardState(), 0, 0);
+        return new RaftStatus(self, softState(), hardState(), commitIndex, lastApplied);
     }
 
     @Override
@@ -85,13 +105,23 @@ public final class RaftNodeCore implements RaftCore {
         return randomizedElectionTimeout;
     }
 
+    /** Visible for tests: the leader's progress for a peer; empty when not leader. */
+    Optional<Progress> progressOf(NodeId peer) {
+        return role instanceof RoleState.Leader l ? Optional.of(l.progress(peer)) : Optional.empty();
+    }
+
+    /** Visible for tests. */
+    Set<ProtocolMutation> mutations() {
+        return mutations;
+    }
+
     // ---------------------------------------------------------------- timers
 
     private void onTick() {
         switch (role) {
             case RoleState.Follower f -> tickElection();
             case RoleState.Candidate c -> tickElection();
-            case RoleState.Leader l -> tickHeartbeat();
+            case RoleState.Leader l -> tickHeartbeat(l);
         }
     }
 
@@ -103,12 +133,15 @@ public final class RaftNodeCore implements RaftCore {
         }
     }
 
-    /** Figure 2 Leaders: send empty AppendEntries during idle periods to prevent election timeouts (§5.2). */
-    private void tickHeartbeat() {
+    /**
+     * Figure 2 Leaders: send AppendEntries during idle periods to prevent election timeouts (§5.2).
+     * Per M2-A the same message also carries any entries a follower is missing.
+     */
+    private void tickHeartbeat(RoleState.Leader l) {
         heartbeatElapsed++;
         if (heartbeatElapsed >= config.heartbeatIntervalTicks()) {
             heartbeatElapsed = 0;
-            broadcastHeartbeat();
+            broadcastAppend(l);
         }
     }
 
@@ -146,12 +179,18 @@ public final class RaftNodeCore implements RaftCore {
         }
     }
 
-    /** Figure 2 Leaders: upon election, send initial empty AppendEntries to each server. */
+    /**
+     * Figure 2 Leaders, upon election: reinitialize nextIndex = lastIndex + 1 and matchIndex = 0, then
+     * append a no-op entry in the new term (§8) and send it at once. The no-op is what lets this leader
+     * commit the entries it inherited: it may only commit entries of its own term by counting replicas
+     * (Figure 8), and earlier entries then commit with it.
+     */
     private void becomeLeader() {
-        role = new RoleState.Leader();
+        RoleState.Leader l = new RoleState.Leader(config.peers(), log.lastIndex() + 1);
+        role = l;
         heartbeatElapsed = 0;
-        // SHORTCUT: (M1 only) no no-op entry in the new term (§8); added in M2. See DEVIATIONS.md P2.
-        broadcastHeartbeat();
+        appendAsLeader(new EntryPayload.Noop());
+        broadcastAppend(l);
     }
 
     /**
@@ -166,6 +205,31 @@ public final class RaftNodeCore implements RaftCore {
         votedFor = Optional.empty();
         role = new RoleState.Follower(Optional.empty());
         if (wasLeader) resetElectionTimer();
+    }
+
+    // ---------------------------------------------------------------- client proposals
+
+    /**
+     * §5.3: the leader appends the command to its own log and replicates it. The proposal is only
+     * accepted (placed at (index, term)), not committed; the driver learns the outcome at apply time.
+     * A non-leader rejects it with the leader it knows, so the client can redirect (thesis §6.2).
+     */
+    private void onPropose(Event.ProposeCommand p) {
+        if (role instanceof RoleState.Leader l) {
+            LogEntry e = appendAsLeader(new EntryPayload.Command(p.command()));
+            notices.add(new ClientNotice.ProposalAccepted(p.proposalId(), e.index(), e.term()));
+            broadcastAppend(l);
+        } else {
+            notices.add(new ClientNotice.ProposalRejected(p.proposalId(), softState().leader()));
+        }
+    }
+
+    /** Leader Append-Only: a leader only ever adds entries at the end of its log, in its own term. */
+    private LogEntry appendAsLeader(EntryPayload payload) {
+        LogEntry e = new LogEntry(log.lastIndex() + 1, currentTerm, payload);
+        log.append(List.of(e));
+        logOps.add(new PersistOp.AppendEntries(List.of(e)));
+        return e;
     }
 
     // ---------------------------------------------------------------- messages
@@ -197,7 +261,9 @@ public final class RaftNodeCore implements RaftCore {
         boolean grant = false;
         if (rv.term() == currentTerm) {
             boolean mayVote = votedFor.isEmpty() || votedFor.get().equals(rv.from());
-            if (mayVote && log.isAtLeastAsUpToDateAsMine(rv.lastLogIndex(), rv.lastLogTerm())) {
+            boolean upToDate = log.isAtLeastAsUpToDateAsMine(rv.lastLogIndex(), rv.lastLogTerm())
+                    || mutations.contains(ProtocolMutation.SKIP_UP_TO_DATE_CHECK);   // MUTATION (test only)
+            if (mayVote && upToDate) {
                 votedFor = Optional.of(rv.from());
                 resetElectionTimer();
                 grant = true;
@@ -219,14 +285,23 @@ public final class RaftNodeCore implements RaftCore {
     }
 
     /**
-     * Figure 2 AppendEntries receiver (M1 subset):
-     * 1. Reply false if term < currentTerm (no timer reset: not valid leader contact).
-     * Otherwise the sender is the leader of currentTerm: candidates step down (§5.2), the timer resets,
-     * and step 2 (prevLogIndex/prevLogTerm match) is checked. Entries and leaderCommit arrive in M2.
+     * Figure 2 AppendEntries receiver:
+     * <ol>
+     *   <li>Reply false if term < currentTerm (no timer reset: not valid leader contact).</li>
+     *   <li>Reply false if the log has no entry at prevLogIndex whose term is prevLogTerm.</li>
+     *   <li>If an existing entry conflicts with a new one (same index, different term), delete it and
+     *       all that follow. Only on a real conflict: a reordered old message whose entries already
+     *       match must not delete the newer entries after them (§5.3).</li>
+     *   <li>Append any new entries not already in the log.</li>
+     *   <li>If leaderCommit > commitIndex, commitIndex = min(leaderCommit, index of last new entry).
+     *       "Last new entry" is the last one this message verified, not our lastIndex: entries beyond
+     *       it may be stale leftovers from an older leader.</li>
+     * </ol>
+     * Otherwise the sender is the leader of currentTerm: candidates step down (§5.2) and the timer resets.
      */
     private void onAppendEntries(Message.AppendEntries ae) {
         if (ae.term() < currentTerm) {
-            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0));
+            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(), 0, 0));
             return;
         }
         switch (role) {
@@ -245,28 +320,161 @@ public final class RaftNodeCore implements RaftCore {
         resetElectionTimer();
 
         OptionalLong prevTerm = log.termAt(ae.prevLogIndex());
-        if (prevTerm.isEmpty() || prevTerm.getAsLong() != ae.prevLogTerm()) {
-            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0));
+        if (prevTerm.isEmpty()) {
+            // Fast backup hint: our log ends before prevLogIndex.
+            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(),
+                    0, log.lastIndex() + 1));
             return;
         }
+        if (prevTerm.getAsLong() != ae.prevLogTerm()) {
+            // Fast backup hint: the term we hold there and where our run of that term starts.
+            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(),
+                    prevTerm.getAsLong(), log.firstIndexOfTermAt(ae.prevLogIndex())));
+            return;
+        }
+
+        if (mutations.contains(ProtocolMutation.TRUNCATE_ON_MATCH)) {
+            truncateAfterPrevUnconditionally(ae);                    // MUTATION (test only)
+        } else {
+            mergeEntries(ae.entries());
+        }
+
+        long lastNewEntry = ae.prevLogIndex() + ae.entries().size();
+        if (ae.leaderCommit() > commitIndex) {
+            commitIndex = Math.max(commitIndex, Math.min(ae.leaderCommit(), lastNewEntry));
+        }
+        send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, true, lastNewEntry, 0, 0, 0));
+    }
+
+    /** Steps 3 and 4: skip entries we already have, truncate at the first real conflict, append the rest. */
+    private void mergeEntries(List<LogEntry> entries) {
+        int firstNew = entries.size();
+        for (int i = 0; i < entries.size(); i++) {
+            LogEntry e = entries.get(i);
+            OptionalLong existing = log.termAt(e.index());
+            if (existing.isEmpty()) {
+                firstNew = i;
+                break;
+            }
+            if (existing.getAsLong() != e.term()) {
+                if (e.index() <= commitIndex) {
+                    throw new IllegalStateException("State Machine Safety violated: " + self
+                            + " would delete committed entry " + e.index() + " (commitIndex " + commitIndex
+                            + ") for " + e);
+                }
+                log.truncateFrom(e.index());
+                logOps.add(new PersistOp.TruncateSuffix(e.index()));
+                firstNew = i;
+                break;
+            }
+        }
+        if (firstNew < entries.size()) {
+            List<LogEntry> rest = entries.subList(firstNew, entries.size());
+            log.append(rest);
+            logOps.add(new PersistOp.AppendEntries(rest));
+        }
+    }
+
+    /**
+     * MUTATION (test only): the classic bug of replacing everything after prevLogIndex with the
+     * message's entries. A reordered old message then deletes newer, possibly committed, entries.
+     * No committed-entry guard here: the simulator's checkers must catch the consequence.
+     */
+    private void truncateAfterPrevUnconditionally(Message.AppendEntries ae) {
+        if (log.lastIndex() > ae.prevLogIndex()) {
+            log.truncateFrom(ae.prevLogIndex() + 1);
+            logOps.add(new PersistOp.TruncateSuffix(ae.prevLogIndex() + 1));
+        }
         if (!ae.entries().isEmpty()) {
-            throw new UnsupportedOperationException("log replication arrives in M2: " + ae);
+            log.append(ae.entries());
+            logOps.add(new PersistOp.AppendEntries(ae.entries()));
         }
-        send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, true, ae.prevLogIndex()));
+        commitIndex = Math.min(commitIndex, log.lastIndex());
+        lastApplied = Math.min(lastApplied, commitIndex);
     }
 
-    /** M1: only the term rule applies (handled in onMessage). M2 updates matchIndex/nextIndex here. */
+    /**
+     * Figure 2 Leaders: on success, matchIndex = max(old, reply) and nextIndex = max(old, reply + 1);
+     * monotonic, so reordered and duplicated replies are harmless. On failure, back nextIndex up and
+     * retry, but only for a rejection of the latest probe (rejectedIndex == nextIndex - 1). Replies from
+     * other terms are ignored.
+     */
     private void onAppendEntriesResponse(Message.AppendEntriesResponse r) {
-        // Intentionally empty in M1.
+        if (!(role instanceof RoleState.Leader l) || r.term() != currentTerm) return;
+        Progress p = l.progress(r.from());
+        if (r.success()) {
+            if (r.matchIndex() > log.lastIndex())
+                throw new IllegalStateException("follower " + r.from() + " acked index " + r.matchIndex()
+                        + " beyond leader's last index " + log.lastIndex());
+            if (r.matchIndex() <= p.matchIndex()) return;           // stale or duplicate ack
+            Progress next = new Progress(Math.max(p.nextIndex(), r.matchIndex() + 1), r.matchIndex());
+            l.update(r.from(), next);
+            maybeAdvanceCommit(l);
+            if (next.nextIndex() <= log.lastIndex()) sendAppend(r.from(), next);
+        } else {
+            if (r.rejectedIndex() != p.nextIndex() - 1) return;     // answers an older probe
+            Progress next = new Progress(backedUpNextIndex(p, r), p.matchIndex());
+            l.update(r.from(), next);
+            sendAppend(r.from(), next);
+        }
     }
 
-    // SHORTCUT: (M1 only) heartbeats always use prevLogIndex = prevLogTerm = 0 because the leader does
-    // not yet track nextIndex. Valid per Figure 2 (index 0 always matches) but replicates nothing.
-    // Replaced in M2. Listed in DEVIATIONS.md.
-    private void broadcastHeartbeat() {
-        for (NodeId peer : config.peers()) {
-            send(new Message.AppendEntries(self, peer, currentTerm, 0, 0, List.of(), 0));
+    /**
+     * Fast log backup (thesis §5.3; the brief's conflictTerm/conflictIndex). One round trip per
+     * conflicting term instead of one per entry:
+     * <ul>
+     *   <li>conflictTerm = 0 (follower log too short): resume at conflictIndex = its lastIndex + 1.</li>
+     *   <li>the leader also has entries of conflictTerm: resume after the leader's last one, since
+     *       Log Matching says everything up to there may match.</li>
+     *   <li>otherwise skip the follower's whole run of conflictTerm: resume at conflictIndex.</li>
+     * </ul>
+     * Clamped to [matchIndex + 1, nextIndex - 1]: always progress, never re-probe known matches. A wrong
+     * hint can only cost round trips, never safety: the consistency check still guards every append.
+     */
+    private long backedUpNextIndex(Progress p, Message.AppendEntriesResponse r) {
+        long candidate = r.conflictIndex();
+        if (r.conflictTerm() > 0) {
+            long last = log.lastIndexOfTerm(r.conflictTerm());
+            if (last > 0) candidate = last + 1;
         }
+        return Math.max(p.matchIndex() + 1, Math.min(candidate, p.nextIndex() - 1));
+    }
+
+    /**
+     * Figure 2 Leaders / §5.4.2 (Figure 8): commitIndex = the largest N such that a majority (counting
+     * the leader, whose own entries are durable before anything is sent, E1) has matchIndex >= N and
+     * log[N].term == currentTerm. Older entries become committed indirectly through such an N.
+     */
+    private void maybeAdvanceCommit(RoleState.Leader l) {
+        for (long n = log.lastIndex(); n > commitIndex; n--) {
+            if (log.termAt(n).getAsLong() != currentTerm
+                    && !mutations.contains(ProtocolMutation.COMMIT_OLD_TERM_BY_COUNT)) {   // MUTATION (test only)
+                return;   // terms never increase going backwards, so no smaller N qualifies either
+            }
+            int replicas = 1;   // the leader itself
+            for (Progress p : l.all()) {
+                if (p.matchIndex() >= n) replicas++;
+            }
+            if (replicas >= config.quorum()) {
+                commitIndex = n;
+                return;
+            }
+        }
+    }
+
+    /** Figure 2 / M2-A: send each peer the entries from its nextIndex (possibly none: a heartbeat). */
+    private void broadcastAppend(RoleState.Leader l) {
+        for (NodeId peer : config.peers()) {
+            sendAppend(peer, l.progress(peer));
+        }
+    }
+
+    private void sendAppend(NodeId peer, Progress p) {
+        long prevIndex = p.nextIndex() - 1;
+        long prevTerm = log.termAt(prevIndex).orElseThrow(
+                () -> new IllegalStateException("nextIndex " + p.nextIndex() + " beyond log for " + peer));
+        List<LogEntry> entries = log.entriesFrom(p.nextIndex(), config.maxEntriesPerAppend());
+        send(new Message.AppendEntries(self, peer, currentTerm, prevIndex, prevTerm, entries, commitIndex));
     }
 
     // ---------------------------------------------------------------- output
@@ -288,18 +496,34 @@ public final class RaftNodeCore implements RaftCore {
         return new SoftState(role.role(), currentTerm, leader);
     }
 
+    /**
+     * Packages this step's effects. Persist order: hard state first, then log changes in the order
+     * they happened, so that every entry on disk has term <= the durable currentTerm. Committed
+     * entries not yet applied are handed out once, in index order (State Machine Safety relies on
+     * every node applying the same entries in the same order).
+     */
     private Ready drainReady() {
+        List<PersistOp> persist = new ArrayList<>();
         HardState hs = hardState();
-        List<PersistOp> persist = hs.equals(lastEmittedHardState)
-                ? List.of() : List.of(new PersistOp.SaveHardState(hs));
+        if (!hs.equals(lastEmittedHardState)) persist.add(new PersistOp.SaveHardState(hs));
         lastEmittedHardState = hs;
+        persist.addAll(logOps);
+
+        List<LogEntry> toApply = new ArrayList<>();
+        for (long i = lastApplied + 1; i <= commitIndex; i++) {
+            toApply.add(log.entryAt(i).orElseThrow(
+                    () -> new IllegalStateException("commitIndex " + commitIndex + " beyond log")));
+        }
+        lastApplied = Math.max(lastApplied, commitIndex);
 
         SoftState ss = softState();
         Optional<SoftState> soft = ss.equals(lastEmittedSoftState) ? Optional.empty() : Optional.of(ss);
         lastEmittedSoftState = ss;
 
-        Ready ready = new Ready(persist, outbox, List.of(), List.of(), soft);
+        Ready ready = new Ready(persist, outbox, toApply, notices, soft);
         outbox.clear();
+        logOps.clear();
+        notices.clear();
         return ready;
     }
 }

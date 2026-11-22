@@ -6,6 +6,11 @@ the original conversation. Each milestone gets its own section, added when that 
 Reference: *In Search of an Understandable Consensus Algorithm (Extended Version)*, Ongaro &
 Ousterhout, 2014 (written "§5.2" or "Figure 2" below), plus Ongaro's PhD thesis (written "thesis §6.4").
 
+**About the diagrams:** flow, sequence and state diagrams use [Mermaid](https://mermaid.js.org), which
+GitHub renders automatically. In IntelliJ, enable it under Settings → Languages & Frameworks → Markdown
+→ Markdown Extensions → Mermaid. Diagrams of logs (rows of entries) are plain text so the columns line
+up everywhere.
+
 ---
 
 # M1: Leader Election
@@ -239,6 +244,25 @@ the sender learns it's behind) or ignored.
 5. If it hears from a valid leader of its term, or sees a higher term, it becomes a follower.
 6. If its timer fires again with no winner (a **split vote**), it starts a new election in term + 1.
 
+**The same election as a message diagram** (3 nodes; n1's timer fires first):
+
+```mermaid
+sequenceDiagram
+    participant N1 as n1
+    participant N2 as n2
+    participant N3 as n3
+    Note over N1: election timeout fires<br/>term 1 → 2, votedFor = n1<br/>fsync, new random timeout
+    N1->>N2: RequestVote(term 2, lastLogIndex, lastLogTerm)
+    N1->>N3: RequestVote(term 2, lastLogIndex, lastLogTerm)
+    Note over N2: term 2 > 1 → adopt term 2<br/>log check OK, not voted yet<br/>votedFor = n1, fsync, reset timer
+    N2-->>N1: granted (term 2)
+    Note over N1: 2 votes of 3 (itself + n2)<br/>= majority → LEADER of term 2
+    N1->>N2: AppendEntries (heartbeat)
+    N1->>N3: AppendEntries (heartbeat)
+    N3-->>N1: granted (term 2), arrives late: ignored, already leader
+    Note over N2,N3: heartbeats every 20 ms keep resetting<br/>their timers, so no new election starts
+```
+
 ### 4.5 Voting rules (Figure 2, RequestVote receiver)
 A node grants its vote only if **all three** hold:
 1. **Term OK:** the request's term equals its `currentTerm` (after applying the term rule: a higher
@@ -441,6 +465,22 @@ for (m : r.messages()) transport.send(m);
   driver's persist-then-send order is actually tested.
 - **Seeds:** one seed is split into independent random streams for the network, the faults and the
   nodes. **Same seed means the identical run**, which is checked by comparing a hash over every event.
+
+**One simulated run, as a loop:**
+
+```mermaid
+flowchart LR
+    Q[("event queue<br/>ordered by (time, seq)")] -->|"pop the earliest"| E{"what kind<br/>of event?"}
+    E -->|"tick / message arrives"| D["NodeDriver.handle"]
+    E -->|"fault"| F["partition, heal,<br/>crash, restart, pause"]
+    D --> C["RaftNodeCore.step<br/>returns a Ready"]
+    C --> S[("InMemoryStorage<br/>persist + fsync")]
+    C --> N["simulated network<br/>delay, drop, duplicate"]
+    N -->|"schedule delivery<br/>at a later time"| Q
+    F -->|"schedule restart, next fault"| Q
+    D --> K["invariant checkers<br/>(after every event)"]
+    K -->|"violation"| X[["FAIL: print seed,<br/>replay command, last 300 events"]]
+```
 
 ### Network model (`NetworkConfig.chaotic()`)
 | Behaviour | Value |
@@ -701,3 +741,862 @@ deterministically (or restored from a snapshot from M3 on).
 | **invariant** | a property that must hold in every reachable state |
 | **mutation test** | deliberately break the system to prove the tests can detect it |
 | **liveness vs. safety** | liveness = something good eventually happens (a leader gets elected); safety = nothing bad ever happens (never two leaders). Raft's safety never depends on timing. |
+
+---
+
+# M2: Log Replication
+
+**Status:** done (gate passed 2026-11-22, accepted 2026-11-23). Invariants 1–5 held over 5,000 chaos
+seeds each on 3-node and 5-node clusters, with clients proposing commands the whole time. Every
+deliberately broken rule was caught.
+
+## Contents
+1. [What M2 adds, in one picture](#m2-1-what-m2-adds-in-one-picture)
+2. [The decisions you approved (M2-A to M2-E)](#m2-2-the-decisions-you-approved)
+3. [The four new invariants and why Raft guarantees them](#m2-3-the-four-new-invariants)
+4. [The follower side: AppendEntries receiver](#m2-4-the-follower-side)
+5. [The leader side: nextIndex, matchIndex, commit](#m2-5-the-leader-side)
+6. [Figure 8: why a leader can't commit old entries by counting](#m2-6-figure-8)
+7. [Fast log backup](#m2-7-fast-log-backup)
+8. [The apply path: state machine, codec, driver](#m2-8-the-apply-path)
+9. [Simulator changes: clients, log tracking, checkers](#m2-9-simulator-changes)
+10. [Mutation testing in M2](#m2-10-mutation-testing-in-m2)
+11. [Tests written](#m2-11-tests-written)
+12. [Results](#m2-12-results)
+13. [Shortcuts and what is left for later](#m2-13-shortcuts-and-what-is-left)
+14. [Study questions (with answers)](#m2-14-study-questions)
+15. [Glossary additions](#m2-15-glossary-additions)
+
+---
+
+<a id="m2-1-what-m2-adds-in-one-picture"></a>
+## 1. What M2 adds, in one picture
+
+In M1 a leader got elected and then did nothing. In M2 it does the job Raft exists for: it turns client
+commands into log entries, copies them to the followers, decides when an entry is **committed** (stored
+on a majority, so it can never be lost or replaced), and every node applies committed entries, in index
+order, to the key-value store. The goal: under all the chaos from M1, every node ends up with the same
+KV data.
+
+```
+client ──Propose(cmd)──► LEADER (term 3)
+                           1. append (index=8, term=3) to its own log
+                           2. persist + fsync               (E1: before anything is sent)
+                           3. AppendEntries(prevLogIndex=7, prevLogTerm=3, entries=[8], leaderCommit=7)
+                                                                           │ to each follower
+FOLLOWER                                                                   ▼
+  4. "do I have entry 7 with term 3?"
+       no  → reply fail + hint (the leader backs up and retries)
+       yes → append 8, persist + fsync, reply success(matchIndex=8)
+LEADER
+  5. matchIndex[f] = max(old, 8)
+  6. a majority has matchIndex ≥ 8 AND log[8].term == currentTerm  → commitIndex = 8
+  7. apply entry 8 to the KV store → answer the client
+  8. the next AppendEntries carries leaderCommit=8 → followers commit and apply 8 too
+```
+
+The same flow as a message diagram:
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant L as leader n1 (term 3)
+    participant F2 as follower n2
+    participant F3 as follower n3
+    C->>L: ProposeCommand(PUT k1=v1)
+    Note over L: append entry 8 (term 3)<br/>persist + fsync<br/>accepted, NOT committed yet
+    L->>F2: AppendEntries(prev 7/t3, [8], commit 7)
+    L->>F3: AppendEntries(prev 7/t3, [8], commit 7)
+    Note over F2: I have entry 7 with term 3 ✓<br/>append 8, fsync
+    F2-->>L: success, matchIndex 8
+    Note over L: n1 + n2 hold 8 = majority of 3<br/>entry 8 is from term 3 = current ✓<br/>commitIndex = 8 → apply → result
+    L-->>C: Committed (result: previous value)
+    F3-->>L: success, matchIndex 8 (late: commit already happened)
+    L->>F2: heartbeat (commit 8)
+    L->>F3: heartbeat (commit 8)
+    Note over F2,F3: commitIndex = 8 → apply entry 8
+```
+
+**Where the indexes sit**, for a 3-node cluster in the middle of replication:
+
+```
+index:          1     2     3     4     5     6     7     8
+leader n1     [t1]  [t1]  [t2]  [t2]  [t3]  [t3]  [t3]  [t3]    lastIndex = 8
+follower n2   [t1]  [t1]  [t2]  [t2]  [t3]  [t3]  [t3]  [t3]    matchIndex = 8, nextIndex = 9
+follower n3   [t1]  [t1]  [t2]  [t2]  [t3]                      matchIndex = 5, nextIndex = 6
+                                                          ▲
+                              commitIndex = 8 on n1: n1 + n2 = 2 of 3 have it
+              ◄──────────── applied to the KV store (lastApplied = 8) ────────────►
+```
+
+Two words you'll see everywhere:
+- **commitIndex**: the highest index known to be committed. Volatile: it restarts at 0 after a crash
+  and is relearned from the leader.
+- **lastApplied**: the highest index applied to the state machine. Also volatile. After a restart the KV
+  store is rebuilt by re-applying the log from index 1 (snapshots arrive in M3).
+
+---
+
+<a id="m2-2-the-decisions-you-approved"></a>
+## 2. The decisions you approved (M2-A to M2-E)
+
+They're recorded in `DESIGN.md`. In short:
+
+| # | Decision | Why | Rejected |
+|---|---|---|---|
+| M2-A | The leader sends AppendEntries **on every proposal and every heartbeat**. `nextIndex` moves **only when a reply arrives**. Up to `maxEntriesPerAppend` (64) entries per message. | Simple to reason about: there's no "in flight" state to rewind. | etcd-style pipelining: fast, but much more state and many edge cases. Heartbeat-only sending: adds up to 20 ms to every commit. |
+| M2-B | A **hand-written binary codec** for commands. | No dependencies, canonical (one value has exactly one byte encoding), and every byte is visible. | Protobuf now (build complexity, not guaranteed canonical); Java serialization (unsafe, fragile). |
+| M2-C | **Mutation hooks**: `RaftNodeCore.withMutationsForTesting(..., Set<ProtocolMutation>)`. | Each bug is one clearly marked `if` at the exact rule it breaks. | Subclass overrides (non-final classes, lint errors); PIT (slow, untargeted). |
+| M2-D | **Open-loop simulated clients**: send every 20–100 ms, follow leader hints, never retry. | M2 checks that replicas agree. Checking what clients see is M4's job. | Retrying clients: without M4's dedup, a retry can execute a command twice. |
+| M2-E | The **driver** matches proposals to results: it remembers `index → (proposalId, term)` and resolves the proposal when that index is applied. | The core stays pure, and the overwritten-proposal case is handled exactly. | Having the core track client futures. |
+
+---
+
+<a id="m2-3-the-four-new-invariants"></a>
+## 3. The four new invariants and why Raft guarantees them
+
+Invariant 1 (Election Safety) is from M1. M2 adds four more (Figure 3 of the paper):
+
+| # | Invariant | In plain words | Why it holds |
+|---|---|---|---|
+| 2 | **Leader Append-Only** | A leader never deletes or overwrites entries in its own log. | The code gives leaders no path to truncate: they only call `appendAsLeader` (`RaftNodeCore.java:228`). Only followers truncate. |
+| 3 | **Log Matching** | If two logs have an entry with the same index **and** term, the logs are identical up to that index. | (a) A leader creates at most one entry per index in its term, and terms are unique per leader (Election Safety). (b) The **consistency check**: a follower accepts entries only if its entry at `prevLogIndex` has `prevLogTerm`. By induction, accepting entry 8 means entries 1–7 already matched. |
+| 4 | **Leader Completeness** | A committed entry is in the log of **every** future leader. | Committed means it's on a majority. Winning an election needs votes from a majority. The two majorities overlap in at least one node, and that node only votes for a candidate whose log is at least as up to date (§5.4.1, the M1 election restriction). This argument only works because of the Figure 8 commit rule (section 6). |
+| 5 | **State Machine Safety** | No two nodes ever apply different entries at the same index. | Nodes apply only committed entries, in order. By 4, every later leader has the same committed prefix, and by 3 it copies that prefix exactly to everyone. |
+
+Why does invariant 4 need the election restriction from M1? Without it, a node with an old, short log
+could be elected and would then overwrite committed entries everywhere. The mutation test in section 10
+shows exactly this happening when the check is removed: 97 of 100 seeds broke.
+
+---
+
+<a id="m2-4-the-follower-side"></a>
+## 4. The follower side: AppendEntries receiver
+
+Code: `onAppendEntries` (`RaftNodeCore.java:302`) and `mergeEntries` (`RaftNodeCore.java:350`).
+Figure 2 lists five receiver steps:
+
+1. **Reply false if `term < currentTerm`.** The sender is a stale leader. No timer reset: that's not
+   valid leader contact (same as M1).
+2. **Reply false if the log has no entry at `prevLogIndex` with term `prevLogTerm`.** This is the
+   consistency check. A rejection still counts as leader contact (the timer resets and the follower
+   learns the leader), because the sender really is the current leader.
+3. **If an existing entry conflicts with a new one (same index, different term), delete it and
+   everything after it.**
+4. **Append any new entries not already in the log.**
+5. **If `leaderCommit > commitIndex`, set `commitIndex = min(leaderCommit, index of last new entry)`.**
+
+The whole receiver as a decision diagram:
+
+```mermaid
+flowchart TD
+    A["AppendEntries arrives<br/>(term, prevLogIndex, prevLogTerm, entries, leaderCommit)"] --> B{"term < currentTerm?"}
+    B -->|"yes"| R1["reply FAIL<br/>stale leader: timer NOT reset"]
+    B -->|"no"| C["the sender is the current leader:<br/>become follower, remember it,<br/>reset election timer"]
+    C --> D{"entry at prevLogIndex<br/>with term prevLogTerm?"}
+    D -->|"no: my log is too short"| R2["reply FAIL<br/>hint: conflictTerm 0,<br/>conflictIndex = lastIndex + 1"]
+    D -->|"no: different term there"| R3["reply FAIL<br/>hint: that term and the<br/>first index I hold with it"]
+    D -->|"yes"| E{"next incoming entry:<br/>what do I have at its index?"}
+    E -->|"same term: already have it"| G["skip it, write nothing"]
+    G --> E
+    E -->|"nothing: beyond my log"| H["append it and the rest"]
+    E -->|"different term: real conflict"| I["delete from this index on,<br/>append it and the rest"]
+    E -->|"no entries left"| J
+    H --> J["commitIndex = max(commitIndex,<br/>min(leaderCommit, prevLogIndex + len(entries)))"]
+    I --> J
+    J --> R4["reply SUCCESS<br/>matchIndex = prevLogIndex + len(entries)"]
+```
+
+### Rule 3's trap: truncate only on a real conflict
+A naive implementation does "delete everything after `prevLogIndex`, then append the message's entries".
+That's wrong, because messages can arrive **reordered**. Example:
+
+```
+follower log:       [1:t1, 2:t3, 3:t3, 4:t3]        (entries 2-4 arrived in one message)
+a late, OLD message: prevLogIndex=1, entries=[2:t3]  (sent earlier, delayed by the network)
+
+naive:   delete 2..4, append 2   →  [1:t1, 2:t3]       entries 3 and 4 are gone
+correct: entry 2 already matches (same index, same term), nothing new → log unchanged
+```
+
+If entries 3 and 4 were already committed (the leader counted this follower's earlier ack), the naive
+version just deleted committed data. As a timeline:
+
+```mermaid
+sequenceDiagram
+    participant L as leader
+    participant F as follower
+    L->>F: AE-1: prev 1, entries [2]
+    Note right of L: AE-1 gets stuck in the network
+    L->>F: AE-2: prev 1, entries [2, 3, 4]
+    F-->>L: success, matchIndex 4
+    Note over L: entries 2-4 on a majority → committed
+    Note over F: much later, the stale AE-1 finally arrives
+    alt correct (§5.3): truncate only on a real conflict
+        Note over F: entry 2 already matches → nothing to do<br/>log stays [1, 2, 3, 4] ✓
+    else bug (TRUNCATE_ON_MATCH): replace everything after prevLogIndex
+        Note over F: delete 2-4, append [2]<br/>committed entries 3 and 4 are GONE ✗
+    end
+``` `mergeEntries` walks the incoming entries: it skips each one that
+already matches, truncates only at the **first real conflict**, and appends the rest. A duplicated
+message therefore produces **no disk writes at all** (test: `duplicateAppendEntriesIsANoOp`).
+
+This bug is one of the three mutations (`TRUNCATE_ON_MATCH`), and the simulator caught it in 96 of 100
+seeds.
+
+### Rule 5's trap: "last new entry", not "my last index"
+```
+follower log: [1:t1, 2:t1, 3:t2, 4:t2]    entries 3-4 are leftovers from an old leader
+message:      prevLogIndex=2, entries=[], leaderCommit=4
+```
+The message only proves entries 1–2 match the leader. Entries 3–4 may be garbage that will be
+replaced. So `commitIndex = min(4, 2 + 0) = 2`, not 4 (test:
+`commitIndexIsCappedByTheLastEntryThisMessageVerified`).
+
+### The reply
+On success, the reply carries `matchIndex = prevLogIndex + entries.size()`: exactly what this message
+proved, never more. On failure it carries `rejectedIndex = prevLogIndex` plus the fast-backup hint
+(section 7).
+
+### A safety net
+If a conflict would ever delete an entry at or below `commitIndex`, the core throws
+`IllegalStateException("State Machine Safety violated ...")` instead of doing it (test:
+`conflictAtACommittedIndexIsAFatalSafetyViolation`). Correct Raft never reaches this. The gate never
+hit it.
+
+---
+
+<a id="m2-5-the-leader-side"></a>
+## 5. The leader side: nextIndex, matchIndex, commit
+
+### Per-follower progress
+`RoleState.Leader` now holds a `Progress(nextIndex, matchIndex)` for each peer (`Progress.java`):
+- **nextIndex**: the next entry to send. It's optimistic and may be too high.
+- **matchIndex**: the highest index *known* to match. It's pessimistic and only grows.
+- Invariant: `matchIndex < nextIndex`.
+
+Because changing role replaces the whole `RoleState` object (from M1), a new term always starts with
+fresh progress. Nothing leaks from an old term.
+
+### On election (`becomeLeader`, `RaftNodeCore.java:188`)
+1. `nextIndex = lastIndex + 1`, `matchIndex = 0` for every peer (Figure 2).
+2. Append a **no-op** entry in the new term (§8). This removed shortcut P2; section 6 explains why it
+   matters.
+3. Send it immediately. The first AppendEntries has `prevLogIndex` = the old last index and
+   `entries = [no-op]`.
+
+### On a proposal (`onPropose`, `RaftNodeCore.java:217`)
+- **Leader:** append `Command(bytes)` at `lastIndex + 1` in `currentTerm`, emit
+  `ProposalAccepted(proposalId, index, term)` (accepted is not committed!), and broadcast.
+- **Not leader:** emit `ProposalRejected(proposalId, leaderHint)`. The client redirects. We reject
+  instead of forwarding, because your brief puts redirection in the client (M4).
+
+### Sending (`sendAppend`, `RaftNodeCore.java:472`)
+```
+prevLogIndex = nextIndex - 1
+prevLogTerm  = log.termAt(prevLogIndex)
+entries      = up to 64 entries starting at nextIndex     (none = a heartbeat)
+leaderCommit = commitIndex
+```
+This replaced shortcut P1 (M1 always sent `prevLogIndex = 0`).
+
+### Replies (`onAppendEntriesResponse`, `RaftNodeCore.java:402`)
+Replies can be **duplicated, delayed and reordered**, so every update is written to be harmless if
+applied twice or late:
+
+| Reply | Action | Why it's safe |
+|---|---|---|
+| success(m) | `matchIndex = max(old, m)`, `nextIndex = max(old, m + 1)` | An old ack (smaller m) changes nothing. matchIndex never moves backwards (test: `reorderedAcksNeverMoveMatchIndexBackwards`). |
+| success that raised matchIndex | if the follower still lacks entries, send the next batch right away | It catches up quickly without waiting for a heartbeat. A duplicate ack doesn't raise matchIndex, so it can't trigger a message storm. |
+| failure with `rejectedIndex == nextIndex - 1` | back nextIndex up (section 7) and re-probe immediately | It answers our **latest** probe. |
+| failure with any other `rejectedIndex` | ignore | A delayed answer to an older probe. Acting on it would move nextIndex backwards for no reason (test: `staleRejectionIsIgnored`). |
+| any reply with `term != currentTerm` | ignore (a higher term already made us step down in `onMessage`) | Same rule as M1. |
+
+The reply handling as a decision diagram:
+
+```mermaid
+flowchart TD
+    A["AppendEntriesResponse from follower f"] --> B{"still leader,<br/>reply from my term?"}
+    B -->|"no"| X["ignore"]
+    B -->|"yes"| C{"success?"}
+    C -->|"yes"| D{"reply.matchIndex ><br/>matchIndex[f]?"}
+    D -->|"no: old or duplicate ack"| X
+    D -->|"yes"| E["matchIndex[f] = reply.matchIndex<br/>nextIndex[f] = matchIndex[f] + 1"]
+    E --> F["try to advance commitIndex<br/>(Figure 8 rule)"]
+    F --> G{"f still missing entries?"}
+    G -->|"yes"| H["send the next batch now"]
+    G -->|"no"| Y["done"]
+    C -->|"no"| I{"rejectedIndex == nextIndex[f] - 1?<br/>(answers my latest probe)"}
+    I -->|"no: answers an old probe"| X
+    I -->|"yes"| J["back nextIndex[f] up using the hint,<br/>clamped to [matchIndex+1, nextIndex-1]"]
+    J --> K["re-probe now"]
+```
+
+### Commit (`maybeAdvanceCommit`, `RaftNodeCore.java:448`)
+Find the largest N with:
+1. a majority with `matchIndex ≥ N`, counting the leader itself, and
+2. **`log[N].term == currentTerm`**.
+
+The leader counts itself as soon as it has appended. That's safe because of E1: its own fsync happens
+before any AppendEntries is sent, so before any ack can come back. Rule 2 is the Figure 8 rule. Once N
+commits, every entry before it commits too, including entries from older terms.
+
+Counting, on a 5-node example (leader n1 in term 4, majority = 3):
+
+```
+index:               1     2     3     4
+entry term:         t1    t2    t4    t4
+n1 (leader)          ●     ●     ●     ●     the leader always counts itself
+n2  matchIndex = 4   ●     ●     ●     ●
+n3  matchIndex = 2   ●     ●
+n4  matchIndex = 3   ●     ●     ●
+n5  matchIndex = 0
+replicas:            4     4     3     2
+                                 ▲
+   try N = 4: only 2 replicas                          → no
+   try N = 3: 3 replicas AND entry 3 is from term 4     → commitIndex = 3
+   (indexes 1 and 2 commit together with 3, even though index 2 is from term 2)
+```
+
+### Apply
+`drainReady` (`RaftNodeCore.java:505`) puts the entries `(lastApplied, commitIndex]` into
+`Ready.toApply`, exactly once and in order, and sets `lastApplied = commitIndex`.
+
+---
+
+<a id="m2-6-figure-8"></a>
+## 6. Figure 8: why a leader can't commit old entries by counting
+
+This is the most subtle rule in Raft. The paper's Figure 8, with 5 servers:
+
+```
+Each row is a server's log; each number is the TERM of the entry at that index. ★ = current leader.
+
+          (a)           (b)           (c)             (d) if S1 crashes    (e) instead: S1 first
+        idx 1 2       idx 1 2       idx 1 2 3       idx 1 2 3             replicates its term-4 entry
+  S1 ★      1 2   S1      1 2   S1 ★    1 2 4   S1      1 3           S1 ★    1 2 4
+  S2        1 2   S2      1 2   S2      1 2     S2      1 3           S2      1 2 4
+  S3        1     S3      1     S3      1 2     S3      1 3           S3      1 2 4
+  S4        1     S4      1     S4      1       S4      1 3           S4      1
+  S5        1     S5 ★    1 3   S5      1 3     S5 ★    1 3           S5      1 3
+                                         ▲                ▲                        ▲
+                     index 2 (term 2) is on       S5 wins term 5 and     index 3 (term 4) on a
+                     S1, S2, S3 = a majority...   OVERWRITES index 2     majority: S5 can no longer
+                     but NOT safe to commit       everywhere             win, index 2 is now safe
+```
+
+Step by step:
+
+```
+(a) S1 leads term 2, writes index 2 (term 2) to S1 and S2 only, then crashes.
+(b) S5 leads term 3 (votes from S3, S4, itself), writes index 2 (term 3) to itself only, crashes.
+(c) S1 leads term 4 again and copies its old index 2 (term 2) to S3.
+    Now index 2 (term 2) is on S1, S2, S3: a MAJORITY.
+    Is it committed? If S1 says yes and applies it...
+(d) S1 crashes. S5 can still win term 5: its last term is 3, which beats S2/S3/S4 (last term 2),
+    so S2, S3 and S4 vote for it. S5 then overwrites index 2 everywhere with its term-3 entry.
+    The "committed" entry is gone. State Machine Safety is broken.
+(e) The fix: S1 may only count replicas for entries of ITS OWN term (4). Once index 3 (term 4) is on
+    a majority, S5 can't win any more (its last term 3 < 4), so index 2 is safe and commits with it.
+```
+
+The test `Figure8Test` replays (c)–(e) on real cores: S1 gets acks for index 2 from S2 and S3 and still
+has `commitIndex = 0`. After acks for index 3 (its term-4 no-op) it jumps to 3, and entries 1–3 are
+applied together. Two more tests show S5's vote outcome in (d) and (e).
+
+**Why the no-op matters.** Without a no-op, a new leader whose clients send nothing would never have a
+current-term entry, so it could never commit the entries it inherited. Clients waiting on them would
+hang. The no-op gives every new leader a current-term entry immediately.
+
+**Why the mutation is rarely caught at batch size 64.** In our implementation, the new leader's first
+AppendEntries carries the old entries **and** the no-op together, so a follower that receives the old
+entry also receives the no-op, and the leader commits both legitimately. The dangerous window (old
+entry on a majority, no-op not yet) almost never opens: 0 catches in 200 seeds. With one entry per
+message the window opens and the checker catches it (11 in 1,000 seeds). A real example, seed 865:
+
+```
+Leader Completeness violated at t=3660ms: n1 is leader of term 18 but its log (last index 21) does not
+contain every entry committed in earlier terms, up to index 8
+```
+
+An entry at index 8 was "committed" by counting in an earlier term, and n1 still legally won term 18
+without it, exactly as S5 does in (d).
+
+---
+
+<a id="m2-7-fast-log-backup"></a>
+## 7. Fast log backup
+
+**The problem, measured.** The basic version backs nextIndex up by **one entry per round trip**. In
+chaos runs a node can hold hundreds of stale entries, for example written while it led a minority side
+of a partition. At ~10 ms per round trip, 400 entries take 4+ seconds. In the first 50-seed run, a
+5-node seed failed the liveness check: n4 had applied **nothing** 3 seconds after the faults healed,
+because it was still backing up one entry at a time. The basic version was *safe*: 0 failures over 500
+seeds × {3, 5} with a 20-second quiet period. It was just too slow.
+
+**The fix** (thesis §5.3, "conflictTerm/conflictIndex"). A rejection carries a hint:
+
+| Follower's situation | Hint |
+|---|---|
+| its log ends before `prevLogIndex` | `conflictTerm = 0`, `conflictIndex = lastIndex + 1` |
+| it has a different term T at `prevLogIndex` | `conflictTerm = T`, `conflictIndex` = the first index it holds with term T |
+
+The leader (`backedUpNextIndex`, `RaftNodeCore.java:434`):
+- `conflictTerm = 0` → `nextIndex = conflictIndex`
+- it also has entries of term T → `nextIndex` = its last index of term T, plus 1
+- it has no entries of term T → `nextIndex = conflictIndex` (skip the follower's whole term T)
+- always clamped to `[matchIndex + 1, nextIndex - 1]`, so it makes progress and never re-probes known
+  matches
+
+**A hint can only cost time, never safety.** Whatever nextIndex the leader picks, the consistency
+check still guards every append. A wrong hint just means another rejection.
+
+**Figure 7 with hints** (`Figure7Test.fastBackupConvergesInAFewRoundTrips`). The leader's log is
+`[1,1,1,4,4,5,5,6,6,6]` plus its no-op. Follower (f) holds `[1,1,1,2,2,2,3,3,3,3,3]`:
+
+```
+probe prev=10 (term 6)  → follower has term 3 at 10, its term-3 run starts at 7  → hint (3, 7)
+                          leader has no term 3                                    → nextIndex = 7
+probe prev=6  (term 5)  → follower has term 2 at 6, its term-2 run starts at 4   → hint (2, 4)
+                          leader has no term 2                                    → nextIndex = 4
+probe prev=3  (term 1)  → match → entries 4..11 appended, conflicting tail removed → done
+```
+
+That's 3 AppendEntries instead of 8 with decrement-by-one. All six Figure 7 followers converge in at
+most 3.
+
+The same exchange as a message diagram:
+
+```mermaid
+sequenceDiagram
+    participant L as leader (term 8)
+    participant F as follower (f)
+    Note over L: terms: 1 1 1 4 4 5 5 6 6 6, no-op 8
+    Note over F: terms: 1 1 1 2 2 2 3 3 3 3 3
+    L->>F: probe prev 10 (term 6)
+    F-->>L: FAIL, hint: term 3 starts at 7
+    Note over L: I have no term-3 entries<br/>→ skip all of them: nextIndex = 7
+    L->>F: probe prev 6 (term 5)
+    F-->>L: FAIL, hint: term 2 starts at 4
+    Note over L: no term-2 entries either → nextIndex = 4
+    L->>F: probe prev 3 (term 1) + entries 4..11
+    Note over F: entry 3 matches ✓<br/>conflict at 4 → delete 4..11, append leader's 4..11
+    F-->>L: SUCCESS, matchIndex 11
+```
+
+```
+round trips to repair follower (f):
+  decrement by one   ████████  8
+  fast backup        ███       3     (one per conflicting term, not one per entry)
+```
+
+
+1. LEADER (when it receives a rejection):
+   "Where should I probe next?"
+    - Has conflictTerm T?      -> nextIndex = (leader's last index of T) + 1
+    - Lacks conflictTerm T?    -> nextIndex = conflictIndex
+    - conflictTerm == 0?       -> nextIndex = conflictIndex
+      (No log truncation happens here—just picking the next prevLogIndex to test!)
+
+2. FOLLOWER (when the NEXT AppendEntries arrives):
+   Step A: Does my log match at prevLogIndex with prevLogTerm?
+   - NO  -> Reject again! Do NOT truncate anything.
+   - YES -> Proceed to Step B.
+
+   Step B: Walk incoming entries starting at prevLogIndex + 1:
+   - Same index, same term      -> Keep existing entry (no truncation).
+   - Same index, DIFFERENT term -> TRUNCATE here and everything after it,
+   then append the leader's entries!
+   - Index doesn't exist yet    -> Append the leader's entries.
+
+---
+
+<a id="m2-8-the-apply-path"></a>
+## 8. The apply path: state machine, codec, driver
+
+### `raft-statemachine`
+- `StateMachine { Bytes apply(long index, Bytes command); long lastAppliedIndex(); }`. It must be
+  **deterministic**: same state + same command → same result and same new state, with no clock, no
+  randomness and no I/O (E1a rule 4). That's what turns "same log" into "same state".
+- `KvCommand` (sealed): `Put(key, value)`, `Get(key)`, `Delete(key)`, `Cas(key, expected, newValue)`.
+- `KvRequest(clientId, seq, command)`. `clientId` and `seq` are in the format **now**, but only used
+  in M4 for exactly-once dedup. So M4 won't have to change the log format.
+- `KvResult` (sealed): `Value(previous or current)`, `CasOutcome(swapped, previous)`,
+  `Invalid(reason)`.
+- `KvStateMachine`: a `TreeMap` (sorted, so iteration order depends only on contents) plus a 64-bit
+  FNV-1a `stateHash()` over the sorted pairs. A malformed command returns `Invalid` instead of
+  throwing: every replica must react to garbage identically.
+
+### The codec (`KvCodec`)
+```
+request = version:u8(=1) clientId:i64 seq:i64 op
+op      = 1 key value | 2 key | 3 key | 4 key optional newValue
+string  = length:i32 utf8-bytes          optional = 0 | 1 string
+```
+**Canonical** means each value has exactly one encoding, and the decoder rejects everything else:
+unknown tags, flag bytes other than 0/1, invalid UTF-8, truncation and trailing bytes. A jqwik property
+feeds 2,000 random byte arrays to the decoder and asserts that anything it accepts re-encodes to the
+*same* bytes. That property is what will let M3 compare snapshots byte for byte.
+
+### The driver (`NodeDriver.handle`, `NodeDriver.java:73`)
+It runs the full E1 order now: **persist + fsync → send → apply → notify**.
+
+Proposal bookkeeping (M2-E):
+```
+ProposalAccepted(id=9, index=5, term=2)  → pending[5] = (9, term 2)
+... later, entry 5 is applied:
+   entry 5 has term 2  → Committed(9, index 5, result)     same index + term = our entry (Log Matching)
+   entry 5 has term 4  → Lost(9, index 5)                   another leader's entry won that index
+a new ProposalAccepted at index 5 while 9 is pending → Lost(9): our entry was truncated away
+```
+Every way a proposal can end:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Sent: client sends ProposeCommand
+    Sent --> Rejected: node is not the leader
+    Sent --> Pending: leader appends it at (index, term)
+    Pending --> Committed: index applied, SAME term
+    Pending --> Lost: index applied, DIFFERENT term
+    Pending --> Lost: new proposal accepted at the same index
+    Pending --> NoAnswer: node crashes first
+    Rejected --> [*]: client retries at the hinted leader
+    Committed --> [*]: client gets the KV result
+    Lost --> [*]: definitely not applied, safe to retry
+    NoAnswer --> [*]: unknown outcome, solved by M4 sessions
+```
+
+Why can an accepted proposal be **lost**? The leader appends it at index 5, then gets partitioned. A
+new leader commits a different entry at 5. When the old leader rejoins, it truncates its index 5 and
+applies the new one. `Lost` is a definite answer ("not applied, safe to retry").
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant N1 as n1 (leader, term 3)
+    participant N2 as n2
+    participant N3 as n3
+    C->>N1: ProposeCommand(X)
+    Note over N1: X appended at index 7, term 3<br/>pending[7] = (X, term 3)
+    Note over N1,N3: partition: n1 is cut off before X reaches anyone
+    Note over N2: times out, wins term 4 with n3's vote<br/>appends its no-op at index 7 (term 4)
+    N2->>N3: AppendEntries [7: t4]
+    N3-->>N2: success → index 7 committed with term 4
+    Note over N1,N3: partition heals
+    N2->>N1: AppendEntries (term 4, [7: t4], commit 7)
+    Note over N1: term 4 > 3 → step down<br/>index 7: t3 vs t4 = conflict → replace<br/>apply index 7: term 4 ≠ 3
+    N1-->>C: Lost (X was never applied, safe to retry)
+``` In the gate this
+happened ~127,000 times per cluster size, and every one was resolved correctly.
+
+`ProposalOutcome` is `Committed`, `Rejected` (with a leader hint) or `Lost`. A proposal on a node that
+crashes gets no answer at all. That's the "unknown outcome" case that M4's retries and sessions exist
+for.
+
+---
+
+<a id="m2-9-simulator-changes"></a>
+## 9. Simulator changes: clients, log tracking, checkers
+
+What runs inside one simulation in M2:
+
+```mermaid
+flowchart LR
+    CL["3 simulated clients<br/>PUT / DEL / CAS / GET<br/>every 20-100 ms"] -->|"ProposeCommand"| ND
+    subgraph NODE["each simulated node (3 or 5)"]
+        ND["NodeDriver"] --> CORE["RaftNodeCore"]
+        ND --> TS["TrackedStorage"] --> MEM[("InMemoryStorage<br/>loses unsynced data on crash")]
+        TS -.->|"first changed index"| TR["NodeLogTracker<br/>prefix hashes"]
+        ND --> SM["KvStateMachine"]
+    end
+    ND -->|"outcomes: Committed / Rejected / Lost"| CL
+    ND -->|"Raft messages"| NET["network<br/>delay, drop, duplicate,<br/>partitions"]
+    NET -->|"delivered later"| ND
+    TR --> CK["7 checkers, run after EVERY event"]
+    SM -->|"state hash"| CK
+    CORE -->|"status: role, term,<br/>commitIndex, lastApplied"| CK
+```
+
+### Clients (`ClientWorkload`, `WorkloadConfig.standard()`)
+- Three clients, each sending one command every 20–100 ms over 5 keys: Put 50%, Delete 15%, Cas 20%,
+  Get 15%.
+- Requests reach the target node after 1–5 ms, and are lost if it's down. This channel is reliable
+  (harness note H1 in DEVIATIONS.md).
+- On `Rejected(hint)` a client switches to the hinted leader. After 300 ms with no answer it picks a
+  random node.
+- Never retries: open loop.
+
+### Tracking logs cheaply (`NodeLogTracker`, `TrackedStorage`)
+Comparing every node's full log after every event would cost about 600 entries × 5 nodes × ~100k events
+per run, far too slow for 10,000 runs. Instead:
+- `TrackedStorage` wraps each node's `InMemoryStorage` and tells the tracker the first index each write
+  touches. Every log change the core makes goes through a `PersistOp`, and so through storage.
+- The tracker keeps a **prefix hash** per index: `hash(i) = mix(hash(i-1), term_i, payload_i)`. It
+  recomputes only from the first changed index.
+- Equal `hash(i)` on two nodes means identical entries 1..i (up to 64-bit collisions). So comparing
+  whole prefixes costs O(1).
+
+```
+entries:        [1: t1 PUT a]       [2: t1 DEL b]       [3: t2 PUT c]
+                      │                   │                   │
+hashes:   0 ──► h1 = mix(0, e1) ──► h2 = mix(h1, e2) ──► h3 = mix(h2, e3)
+
+n1 and n2 both have h3 at index 3  ⇒  entries 1, 2 and 3 are identical on both
+(one number compared instead of three entries; a change anywhere below changes every hash above it)
+```
+
+`InMemoryStorage.sync()` also stopped copying the whole log on every fsync. It now replays only the
+writes made since the last sync.
+
+### The checkers (each its own class with its own failure message)
+
+| Checker | Checks | How |
+|---|---|---|
+| `ElectionSafetyChecker` (M1) | invariant 1 | term → leader, over the whole history |
+| `VoteDurabilityChecker` (M1) | term never decreases; vote never changes within a term | per-node last hard state |
+| `LeaderAppendOnlyChecker` | invariant 2 | a node that stays leader of the same term between two observations must not have truncated or shrunk its log |
+| `LogMatchingChecker` | invariant 3 | every (index, term) any node ever holds is registered with its prefix hash; any later holder must have the same hash |
+| `LeaderCompletenessChecker` | invariant 4 | see below |
+| `StateMachineSafetyChecker` | invariant 5 | the first entry applied at each index is recorded; every later application (any node, after any restart) must be equal |
+| `ReplicaStateChecker` | end to end | two nodes at the same `lastApplied` must have the same `KvStateMachine.stateHash()`. It catches bugs in the apply path itself, which the log checkers can't see |
+
+**How Leader Completeness is checked.** The first time any node reports index i as committed, the
+checker records i's prefix hash and a **term bound**: the reporting node's `currentTerm`. Commitment
+happened in that term or earlier. Then every leader of term T must hold, with the same prefix hash,
+every committed index whose bound is **below** T. A match at the highest such index covers all lower
+ones (prefix hash). Using "bound below T" means a *stale* leader of an older term isn't blamed for
+missing entries committed later (test: `leaderCompletenessIgnoresEntriesCommittedInLaterTerms`).
+
+```
+time ─────────────────────────────────────────────────────────────────────►
+  n1 leader of term 3 commits index 8      →  record: index 8, hash h8, bound = term 3
+  ...
+  n2 becomes leader of term 5              →  3 < 5, so n2 must hold index 8 with hash h8
+                                              ✓ it does → fine
+                                              ✗ missing or different → "Leader Completeness violated"
+  n3, a stale leader of term 2, still      →  bound 3 is NOT below 2 → n3 is not required to have it
+  thinks it leads (partitioned)
+```
+
+### Liveness, strengthened
+At the end of each run, over the last 1,000 ms of the quiet period:
+1. a current-term leader exists (from M1);
+2. **at least one client command committed**;
+3. **every node has applied everything that was committed 1,000 ms before the end**, including nodes
+   that restarted and had to rebuild their KV store from index 1.
+
+Check 3 is what exposed the slow decrement-by-one backup (section 7).
+
+---
+
+<a id="m2-10-mutation-testing-in-m2"></a>
+## 10. Mutation testing in M2
+
+As in M1, a checker that never fires may be checking nothing. Each mutation breaks one rule through a
+single `// MUTATION (test only)` line, and `MutationSanityTest` measures what catches it:
+
+```mermaid
+flowchart LR
+    M1["SKIP_UP_TO_DATE_CHECK<br/>(vote for stale logs)"] --> LC["Leader Completeness"]
+    M2["COMMIT_OLD_TERM_BY_COUNT<br/>(Figure 8 bug)"] --> LC
+    M3["TRUNCATE_ON_MATCH<br/>(delete matching entries)"] --> LC
+    M3 --> RS["Replica state divergence"]
+    M4["lying disks<br/>(fsync does nothing)"] --> VD["Vote durability"]
+    M4 --> ES["Election Safety"]
+    M4 --> LC
+    M4 --> LM["Log Matching"]
+    M4 --> SMS["State Machine Safety"]
+```
+
+
+| Mutation | Rule broken | Seeds | Caught by |
+|---|---|---|---|
+| `SKIP_UP_TO_DATE_CHECK` | vote without the §5.4.1 log check | 100 | **Leader Completeness 97** |
+| `COMMIT_OLD_TERM_BY_COUNT`, batch 1 | Figure 8 | 1000 | **Leader Completeness 11** (+18 liveness misses from slow 1-entry catch-up, unrelated) |
+| `COMMIT_OLD_TERM_BY_COUNT`, batch 64 | Figure 8 | 200 | 0 (the no-op rides along; section 6) |
+| `TRUNCATE_ON_MATCH` | §5.3 step 3 | 100 | **Leader Completeness 49, replica state divergence 47**, `KvStateMachine` order guard 4 |
+| lying disks, vote checker on (M1) | fsync durability | 50 | Vote durability 50 |
+| lying disks, vote checker off | fsync durability | 300 | Leader Completeness 148, Election Safety 26, Log Matching 10, State Machine Safety 4 |
+| control: no mutation, batch 1 | (none) | 100 | 0 safety violations |
+
+What to take from it:
+- **Skipping the up-to-date check** breaks Leader Completeness almost immediately. A stale node wins,
+  and the next time it leads, committed entries are missing from its log.
+- **Lying disks now show more than two leaders.** Every disk lies, so every node that crashes comes
+  back with the empty log and term 0 it started with. Several such nodes can vote for each other (their
+  logs look equally up to date), and the leader they elect is missing entries that were committed
+  before. That's Leader Completeness, the most common catch.
+- **The control run matters.** It proves the batch-1 configuration alone causes no safety failures, so
+  the Figure 8 catches really come from the mutation.
+
+---
+
+<a id="m2-11-tests-written"></a>
+## 11. Tests written
+
+The build has 149 tests across modules (69 after M1).
+
+| Test class | What it covers |
+|---|---|
+| `AppendEntriesFollowerTest` (core) | receiver steps 2–5: append and ack, reject beyond the log / on term mismatch (with hints), truncate only at the first real conflict, duplicates write nothing, a reordered old message never truncates, the commitIndex cap, commit never decreases, rejected-but-current counts as leader contact, the committed-entry safety net, proposal rejected with a hint |
+| `LeaderReplicationTest` (core) | the no-op on election, proposal append/accept/broadcast, commit on a majority (3 and 5 nodes), matchIndex monotonic under reordering, rejection backs up and re-probes, stale rejection ignored, nextIndex ≥ matchIndex + 1, heartbeats carry missing entries in bounded batches, progressing ack sends the next batch, older-term replies ignored, the leader never truncates, four fast-backup cases |
+| `Figure7Test` (core) | followers (a)–(f) converge and commit; with hints each converges in ≤ 3 AppendEntries |
+| `Figure8Test` (core) | the old-term entry on a majority is not committed until the no-op is; S5's vote in (d) vs. (e); both mutation hooks really break their rule |
+| `MiniCluster` (core, helper) | a lossless synchronous message pump between real cores |
+| `KvCodecProperties` (statemachine, jqwik) | round-trips, canonical bytes, truncation rejected, trailing bytes and invalid UTF-8 rejected |
+| `KvStateMachineTest` | put/get/delete/cas semantics, malformed input answered `Invalid`, order enforced, hash depends only on contents |
+| `NodeDriverTest` (node) | E1 order persist → sync → send → apply; no-ops skipped; Committed / Lost (term mismatch) / Lost (index reused) / Rejected |
+| `ReplicationCheckersTest` (sim) | each new checker accepts a legal history and rejects the illegal one; the tracker recomputes only from the changed index |
+| `ChaosTest` (sim; renamed from `ElectionChaosTest`) | the gate: invariants 1–5 + liveness under chaos with clients |
+| `MutationSanityTest` (sim) | section 10 |
+
+---
+
+<a id="m2-12-results"></a>
+## 12. Results
+
+Gate: `./gradlew :raft-sim:test -Psim.seeds=5000`, about 90 s.
+
+| | 3 nodes | 5 nodes |
+|---|---|---|
+| seeds | 5,000 | 5,000 |
+| violations | **0** | **0** |
+| elections | 38,610 | 40,788 |
+| crashes / partitions / pauses | 27,975 / 56,270 / 26,250 | 28,148 / 56,238 / 27,422 |
+| client proposals | 3,242,412 | 3,243,694 |
+| committed | 1,973,784 | 2,388,818 |
+| lost (overwritten, answered `Lost`) | 129,136 | 125,599 |
+| rejected (not leader) | 523,723 | 433,109 |
+| longest log | 598 | 633 |
+
+5-node clusters commit more, most likely because a single crashed or partitioned node never costs them
+their majority (3 of 5 remain), while in a 3-node cluster it leaves no spare.
+
+---
+
+<a id="m2-13-shortcuts-and-what-is-left"></a>
+## 13. Shortcuts and what is left for later
+
+- P1, P2 and the M2 half of P3 are **gone**. `grep -rnE "M1 only|arrives? in M2" raft-*/src/main`
+  returns nothing, and no `// SHORTCUT:` remains in the code.
+- **P3 (rest):** `ReadRequested` still throws until M4 (ReadIndex). Until then a read is a
+  `KvCommand.Get` that goes through the log, which is linearizable but costs a log entry.
+- **H1:** client links in the simulator are reliable. Lossy client links matter only with retries and
+  dedup (M4).
+- **H2:** the mutation hooks live in production code, behind a test-only factory.
+- **The log grows forever** until M3 snapshots, and a restarted node re-applies everything from
+  index 1.
+
+---
+
+<a id="m2-14-study-questions"></a>
+## 14. Study questions (with answers)
+
+**Q1. A follower holds `[1:t1, 2:t2, 3:t2]`. It receives `prevLogIndex=1, prevLogTerm=1,
+entries=[2:t2]`. What does it do, and what does it reply?**
+<details><summary>Answer</summary>
+
+Entry 2 already matches (same index and term), and there are no new entries, so the log is unchanged
+and nothing is written to disk. Entry 3 is **not** deleted: no conflict was found. It replies success
+with `matchIndex = 1 + 1 = 2`, only what this message proved, even though the follower has 3 entries.
+</details>
+
+**Q2. Why does the follower set `commitIndex = min(leaderCommit, index of last new entry)` and not
+`min(leaderCommit, lastIndex)`?**
+<details><summary>Answer</summary>
+
+Entries past the last one this message verified may be stale leftovers from an older leader. They
+haven't been checked against the current leader's log and may be replaced. If the leader's commitIndex
+is higher, marking them committed would apply entries that are about to be overwritten: a State Machine
+Safety violation.
+</details>
+
+**Q3. The leader gets success(matchIndex=4) and then a delayed success(matchIndex=2) from the same
+follower. What happens? And what if a rejection arrives for `prevLogIndex=6` when nextIndex is 4?**
+<details><summary>Answer</summary>
+
+`matchIndex = max(4, 2) = 4`. The old ack changes nothing and sends nothing. The rejection answers an
+older probe (`rejectedIndex 6 ≠ nextIndex − 1 = 3`), so it is ignored. Both rules exist because the
+network reorders and duplicates messages.
+</details>
+
+**Q4. In Figure 8 (c), index 2 (term 2) is stored on 3 of 5 servers. Why isn't it committed?**
+<details><summary>Answer</summary>
+
+Because S5, whose last entry has term 3, can still win an election. S2, S3 and S4 have last term 2, so
+S5's log counts as more up to date, and it would then overwrite index 2. "On a majority" protects an
+entry only if that majority will refuse to elect anyone without it. That's guaranteed only once the
+leader has a **current-term** entry on a majority. So a leader commits by counting only for
+current-term entries; older ones commit indirectly.
+</details>
+
+**Q5. Why did the Figure 8 mutation go undetected at batch size 64, and what does that teach about
+testing?**
+<details><summary>Answer</summary>
+
+The new leader's first AppendEntries carries the old entries *and* its no-op, so a majority acks both
+at once and the commit is legitimate. The buggy rule never decides anything. Lessons: a bug can be
+present but unreachable under one configuration, so mutation tests must show the checker **can** catch
+it (batch size 1: 11/1000), and a control run (no mutation, same config) shows the catches come from the
+bug. Real systems batch differently under load, so the rule must be right regardless.
+</details>
+
+**Q6. A client's proposal was accepted at (index 7, term 3), but the driver answers `Lost`. Explain a
+concrete sequence.**
+<details><summary>Answer</summary>
+
+n1 (leader, term 3) appends the command at index 7 and emits `ProposalAccepted(7, 3)`. Before it
+replicates, n1 is partitioned away. n2 wins term 4, appends its no-op at index 7, and commits it with
+n3. The partition heals; n1 steps down, receives AppendEntries, finds a conflict at index 7 (term 3 vs.
+4), truncates, and appends n2's entry. When index 7 is applied on n1 it has term 4, which isn't the term
+the proposal was accepted at, so the driver answers `Lost`. That's a definite "not applied", so retrying
+is safe.
+</details>
+
+**Q7. With fast backup, could a wrong or malicious hint corrupt a follower's log?**
+<details><summary>Answer</summary>
+
+No. The hint only chooses which `prevLogIndex` the leader probes next. Every append still passes the
+consistency check: a follower appends only after its entry at `prevLogIndex` has `prevLogTerm`. A bad
+hint costs extra round trips, and the clamp `[matchIndex+1, nextIndex−1]` even guarantees progress.
+Safety never depends on the hint.
+</details>
+
+**Q8. Why does the simulator need `ReplicaStateChecker` when it already has State Machine Safety?**
+<details><summary>Answer</summary>
+
+State Machine Safety checks the **log entries** each node applies. A bug *after* that point (the driver
+applying an entry twice, skipping one, applying out of order, or a nondeterministic state machine)
+would leave the logs perfect while the KV data diverges. Comparing state hashes at equal `lastApplied`
+catches that end to end. In the `TRUNCATE_ON_MATCH` mutation it was the first checker to fire in 47 of
+100 seeds.
+</details>
+
+**Q9. Why does the new leader set `nextIndex = lastIndex + 1` *before* appending its no-op?**
+<details><summary>Answer</summary>
+
+Then the first AppendEntries has `prevLogIndex` = the old last index, which a caught-up follower
+already has, so it carries the no-op and is accepted in a single round trip. If nextIndex pointed past
+the no-op, the first probe would ask about an entry no follower has yet, and would always be rejected.
+</details>
+
+---
+
+<a id="m2-15-glossary-additions"></a>
+## 15. Glossary additions
+
+| Term | Meaning |
+|---|---|
+| **committed** | stored on a majority in a way no future leader can undo; safe to apply |
+| **commitIndex / lastApplied** | highest committed index / highest index applied to the state machine; both volatile |
+| **nextIndex / matchIndex** | leader's per-follower guess of the next entry to send / highest index known to match |
+| **consistency check** | the `prevLogIndex`/`prevLogTerm` test that makes Log Matching inductive |
+| **conflict** | same index, different term; the only reason a follower deletes entries |
+| **no-op entry** | an empty entry a new leader appends in its own term so it can commit inherited entries |
+| **Figure 8 rule** | commit by counting replicas only for entries of the current term |
+| **fast backup** | rejection hints (conflictTerm, conflictIndex) that let the leader skip a whole term per round trip |
+| **canonical encoding** | each value has exactly one byte representation |
+| **open-loop client** | sends on a schedule regardless of replies; never retries |
+| **lost proposal** | accepted at (index, term), but a different entry was committed at that index |
+| **prefix hash** | a chained hash where hash(i) covers entries 1..i; equal hashes mean equal prefixes |
+| **control run** | the same experiment without the mutation, to show the mutation causes the failures |

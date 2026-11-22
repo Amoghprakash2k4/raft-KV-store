@@ -10,10 +10,11 @@ consensus and end up with an interview-grade project. You act as a **senior dist
 
 ## Status (last updated 2026-11-22)
 - **M1 Leader Election: DONE.** Gate passed: 0 Election Safety violations over 5,000 seeds × {3, 5} nodes.
-- **M2 Log Replication: NOT STARTED.** The entry checklist is in `MILESTONES.md`.
-- **Git:** the owner committed M1 themselves as `b0420ae` and pushed it to `origin/main`. The docs
-  written after that (`CLAUDE.md`, `EXPLANATION.md`, `PROJECT_BRIEF.md`, the `MILESTONES.md` update)
-  were still uncommitted on 2026-11-22. Never commit or push without an explicit yes from the owner.
+- **M2 Log Replication: DONE** (accepted by the owner 2026-11-23). 0 violations of invariants 1–5 over
+  5,000 seeds × {3, 5} nodes; all mutation checks caught (rates in MILESTONES.md).
+- **M3 Durability: NOT STARTED.** Before coding, ask the owner the open M3 design questions (below).
+- **Git:** M1 `b0420ae`, docs `eb85e73`, M2 committed and pushed to `origin/main` on 2026-11-23 (the
+  owner asked for it). Never commit or push without an explicit yes from the owner.
 
 ## How the owner wants to work (learned from the conversation)
 1. **One milestone at a time.** Don't start the next one until the owner says the current one is done.
@@ -27,7 +28,8 @@ consensus and end up with an interview-grade project. You act as a **senior dist
    the owner thought "higher term steps down" meant two quorum winners comparing terms).
 4. **Measure, don't guess.** When stating a number, run it. Once I wrote "nearly every run", and the
    owner caught that it was unmeasured.
-5. **Keep `EXPLANATION.md` updated.** At the end of each milestone, append a section
+5. **Keep `EXPLANATION.md` updated, with diagrams.** The owner asked for neat, self-explanatory diagrams:
+   Mermaid for flows/sequences/states (GitHub renders them), aligned ASCII for log layouts. At the end of each milestone, append a section
    (`# M<n>: <title>`) explaining in detail everything taught in that phase: concepts, design, code
    walkthrough, tests, results, shortcuts, study questions with answers, glossary additions. The owner
    uses it to re-learn later.
@@ -47,18 +49,14 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   delays (10–50×) + 5% drop + 2% duplicate + directed (one-way) partitions.
 - **compose.yaml:** a 3-node cluster of our own nodes (target for M5). No external database: the Raft
   store is the database.
+- **M2 choices (approved):** M2-A send on proposal + heartbeat, nextIndex moves only on replies;
+  M2-B hand-written binary codec; M2-C test-only `Set<ProtocolMutation>`; M2-D open-loop sim clients
+  without retries; M2-E driver matches `ProposalAccepted(index, term)` at apply time. Fast backup is
+  added after the basic version passes.
 - **Leader Completeness** gets its own checker class in M2, not folded into `ElectionSafetyChecker`.
   The owner asked for it to be checked once logs are non-empty.
 
 ## Still open (ask at the named milestone)
-- **M2:** design questions to ask before coding, for example:
-  - per-peer progress structure;
-  - one AppendEntries in flight vs. pipelining;
-  - batch size;
-  - KV command encoding (custom binary vs. protobuf vs. other);
-  - the `StateMachine` apply/result interface;
-  - how the driver matches `ProposalAccepted(index, term)` to applied results;
-  - when to add fast backup.
 - **M3:** where snapshot bytes live while being sent (core vs. driver), chunked InstallSnapshot, and
   replacing the `SnapshotInstalled` event with `SnapshotCreated`.
 - **M4:** client session expiry (unbounded table vs. deterministic expiry, thesis §6.3).
@@ -70,17 +68,23 @@ settings.gradle.kts, gradle/libs.versions.toml, buildSrc/ (raft.java-conventions
 raft-core/          com.projects.raftkv.core       pure core: RaftNodeCore, RoleState, RaftLog, types
 raft-storage/       com.projects.raftkv.storage    Storage, InMemoryStorage, StorageException
 raft-transport/     com.projects.raftkv.transport  Transport
-raft-node/          com.projects.raftkv.node       NodeDriver, NodeHaltedException
-raft-statemachine/  (empty: M2)                    raft-client/ (empty: M4)
+raft-node/          com.projects.raftkv.node       NodeDriver (apply + pending proposals), ProposalOutcome,
+                                                   NodeHaltedException
+raft-statemachine/  com.projects.raftkv.statemachine StateMachine, KvStateMachine (TreeMap), KvCommand,
+                                                   KvRequest (clientId, seq), KvResult, KvCodec
+raft-client/        (empty: M4)
 raft-sim/           com.projects.raftkv.sim        Simulation, NetworkConfig, FaultConfig, SimConfig,
-                                                   ElectionSafetyChecker, VoteDurabilityChecker, Trace
+                                                   WorkloadConfig, ClientWorkload, Trace, NodeLogTracker,
+                                                   TrackedStorage, checkers: ElectionSafety, VoteDurability,
+                                                   LogMatching, LeaderAppendOnly, LeaderCompleteness,
+                                                   StateMachineSafety, ReplicaState
 compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md
 ```
 
 ## Commands
 ```
-./gradlew build                                   # all modules, 69 tests, 300 seeds per chaos test
-./gradlew :raft-sim:test -Psim.seeds=5000         # milestone gate (~20 s)
+./gradlew build                                   # all modules, 149 tests (~16 s), 300 seeds per chaos test
+./gradlew :raft-sim:test -Psim.seeds=5000         # milestone gate (~90 s)
 ./gradlew :raft-sim:test -Psim.seed=N             # replay one seed
 ```
 JDK 21 is installed at `/Users/amoghp/Library/Java/JavaVirtualMachines/ms-21.0.11` (the default `java`
@@ -88,9 +92,16 @@ is 25; the Gradle toolchain picks 21 automatically). Gradle 9.9.2 wrapper.
 
 ## Conventions and gotchas
 - Write tests first. Javadoc on each protocol rule cites the paper section or figure.
-- Shortcuts are marked `// SHORTCUT:` in code and listed in DEVIATIONS.md. M1 ones use
-  `SHORTCUT: (M1 only)`. The M2 exit check is that `grep -rnE "M1 only|arrives? in M2" raft-*/src/main`
-  returns nothing (it finds 6 lines today).
+- Shortcuts are marked `// SHORTCUT:` in code and listed in DEVIATIONS.md. After M2 there are none in
+  code; only P3 (`ReadRequested` throws until M4) and harness notes H1/H2 remain.
+- Mutation hooks: `RaftNodeCore.withMutationsForTesting` + `ProtocolMutation`; each hook is one
+  `// MUTATION (test only)` line. The Figure 8 mutation is only reachable with
+  `withMaxEntriesPerAppend(1)` (the no-op otherwise rides with the old entries).
+- The simulator's checkers see log changes through `TrackedStorage` → `NodeLogTracker` (prefix hashes,
+  recomputed only from the first changed index). Every core log change must go through a `PersistOp`,
+  or the checkers would miss it.
+- The basic decrement-by-one backup is safe but too slow for the 3 s quiet window; fast backup
+  (conflictTerm/conflictIndex) is what makes the commit-liveness check pass.
 - Unimplemented features **throw** (`UnsupportedOperationException`) rather than being silently ignored.
 - `-Werror` is on: records nested in an interface are implicitly public, so their compact constructors
   must be `public`. Make classes `final` to avoid the `this-escape` lint.

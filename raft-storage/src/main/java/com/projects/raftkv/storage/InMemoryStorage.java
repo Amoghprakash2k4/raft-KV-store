@@ -18,7 +18,9 @@ public final class InMemoryStorage implements Storage {
     private final List<LogEntry> workingEntries = new ArrayList<>();
 
     private HardState durableHardState = HardState.INITIAL;
-    private List<LogEntry> durableEntries = List.of();
+    private final List<LogEntry> durableEntries = new ArrayList<>();
+    // Log writes since the last sync, replayed onto the durable copy at sync: O(changes), not O(log).
+    private final List<Runnable> unsyncedLogWrites = new ArrayList<>();
 
     private boolean failNextSync;
     private boolean fsyncIsNoop;
@@ -36,6 +38,8 @@ public final class InMemoryStorage implements Storage {
                 throw new IllegalStateException("non-contiguous append: expected " + expected + ", got " + e);
             workingEntries.add(e);
         }
+        List<LogEntry> copy = List.copyOf(entries);
+        unsyncedLogWrites.add(() -> durableEntries.addAll(copy));
     }
 
     @Override
@@ -43,6 +47,7 @@ public final class InMemoryStorage implements Storage {
         if (fromIndex < 1 || fromIndex > workingEntries.size() + 1L)
             throw new IllegalStateException("truncateFrom " + fromIndex + " outside [1, " + (workingEntries.size() + 1) + "]");
         workingEntries.subList((int) (fromIndex - 1), workingEntries.size()).clear();
+        unsyncedLogWrites.add(() -> durableEntries.subList((int) (fromIndex - 1), durableEntries.size()).clear());
     }
 
     @Override
@@ -53,7 +58,8 @@ public final class InMemoryStorage implements Storage {
         }
         if (fsyncIsNoop) return;
         durableHardState = workingHardState;
-        durableEntries = List.copyOf(workingEntries);
+        for (Runnable w : unsyncedLogWrites) w.run();
+        unsyncedLogWrites.clear();
     }
 
     @Override
@@ -66,6 +72,7 @@ public final class InMemoryStorage implements Storage {
         workingHardState = durableHardState;
         workingEntries.clear();
         workingEntries.addAll(durableEntries);
+        unsyncedLogWrites.clear();
     }
 
     public void failNextSync() { failNextSync = true; }

@@ -77,6 +77,75 @@ final class CoreFixtures {
         return new Message.AppendEntries(from, to, term, 0, 0, List.of(), 0);
     }
 
+    /** Entries with the given terms starting at startIndex. Payload: a command naming its (index, term). */
+    static List<LogEntry> entries(long startIndex, long... terms) {
+        List<LogEntry> out = new ArrayList<>();
+        for (int i = 0; i < terms.length; i++) {
+            long index = startIndex + i;
+            out.add(new LogEntry(index, terms[i], cmd(index + "@" + terms[i])));
+        }
+        return out;
+    }
+
+    static EntryPayload.Command cmd(String s) {
+        return new EntryPayload.Command(Bytes.copyOf(s.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+    }
+
+    /** A recovered state whose log entries carry commands (unlike {@link #state}, which uses no-ops). */
+    static PersistentState stateWithLog(long term, long... entryTerms) {
+        return new PersistentState(new HardState(term, Optional.empty()), entries(1, entryTerms));
+    }
+
+    static Message.AppendEntries append(NodeId from, NodeId to, long term, long prevIndex, long prevTerm,
+                                        List<LogEntry> entries, long leaderCommit) {
+        return new Message.AppendEntries(from, to, term, prevIndex, prevTerm, entries, leaderCommit);
+    }
+
+    static Message.AppendEntriesResponse ok(NodeId from, NodeId to, long term, long matchIndex) {
+        return new Message.AppendEntriesResponse(from, to, term, true, matchIndex, 0, 0, 0);
+    }
+
+    /** A rejection without a useful hint: the leader just backs up by one (conflictIndex = rejectedIndex). */
+    static Message.AppendEntriesResponse reject(NodeId from, NodeId to, long term, long rejectedIndex) {
+        return new Message.AppendEntriesResponse(from, to, term, false, 0, rejectedIndex, 0, rejectedIndex);
+    }
+
+    /** A rejection carrying the fast-backup hint (conflictTerm, conflictIndex). */
+    static Message.AppendEntriesResponse reject(NodeId from, NodeId to, long term, long rejectedIndex,
+                                                long conflictTerm, long conflictIndex) {
+        return new Message.AppendEntriesResponse(from, to, term, false, 0, rejectedIndex, conflictTerm, conflictIndex);
+    }
+
+    /** The terms of every entry in the log, in order: compact for assertions. */
+    static List<Long> terms(LogView log) {
+        List<Long> out = new ArrayList<>();
+        for (long i = 1; i <= log.lastIndex(); i++) out.add(log.termAt(i).getAsLong());
+        return out;
+    }
+
+    static List<Long> termList(long... terms) {
+        return java.util.Arrays.stream(terms).boxed().toList();
+    }
+
+    /**
+     * Makes {@code self} leader of exactly {@code term}: recovers with currentTerm = term - 1 and the
+     * given log, times out, and receives votes from the given voters. Election messages are discarded.
+     */
+    static RaftNodeCore leaderAt(NodeId self, List<NodeId> members, long term, PersistentState log,
+                                 List<NodeId> voters) {
+        PersistentState s = new PersistentState(new HardState(term - 1, Optional.empty()), log.entries());
+        RaftNodeCore c = core(self, members, s, 42);
+        tickUntilElection(c);
+        for (NodeId v : voters) receive(c, new Message.RequestVoteResponse(v, self, term, true));
+        if (c.status().soft().role() != Role.LEADER || c.status().hard().currentTerm() != term)
+            throw new AssertionError("expected leader of term " + term + ", got " + c.status());
+        return c;
+    }
+
+    static List<Message.AppendEntries> appendsTo(Ready r, NodeId to) {
+        return ofType(r.messages(), Message.AppendEntries.class).stream().filter(m -> m.to().equals(to)).toList();
+    }
+
     static <M extends Message> List<M> ofType(List<Message> ms, Class<M> type) {
         return ms.stream().filter(type::isInstance).map(type::cast).toList();
     }

@@ -1,6 +1,9 @@
 package com.projects.raftkv.core;
 
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -33,8 +36,33 @@ sealed interface RoleState {
         @Override public Role role() { return Role.CANDIDATE; }
     }
 
-    /** Leader. M2 adds per-peer replication progress (nextIndex, matchIndex). */
-    record Leader() implements RoleState {
+    /**
+     * Leader with per-peer replication progress (Figure 2: nextIndex[], matchIndex[]). Progress is
+     * reinitialized after each election and changes only when replies arrive (DESIGN.md M2-A).
+     */
+    final class Leader implements RoleState {
+        private final Map<NodeId, Progress> progress = new LinkedHashMap<>();
+
+        /** Figure 2: nextIndex = leader last log index + 1 (before the no-op), matchIndex = 0. */
+        Leader(List<NodeId> peers, long nextIndex) {
+            for (NodeId p : peers) progress.put(p, new Progress(nextIndex, 0));
+        }
+
+        Progress progress(NodeId peer) {
+            Progress p = progress.get(peer);
+            if (p == null) throw new IllegalArgumentException("not a peer: " + peer);
+            return p;
+        }
+
+        void update(NodeId peer, Progress p) {
+            progress(peer);
+            progress.put(peer, p);
+        }
+
+        Iterable<Progress> all() { return progress.values(); }
+
         @Override public Role role() { return Role.LEADER; }
+
+        @Override public String toString() { return "Leader" + progress; }
     }
 }

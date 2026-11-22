@@ -1,14 +1,19 @@
 package com.projects.raftkv.sim;
 
+import com.projects.raftkv.core.Bytes;
 import com.projects.raftkv.core.Event;
 import com.projects.raftkv.core.Message;
 import com.projects.raftkv.core.NodeId;
 import com.projects.raftkv.core.RaftConfig;
+import com.projects.raftkv.core.RaftCore;
+import com.projects.raftkv.core.RaftNodeCore;
 import com.projects.raftkv.core.RaftStatus;
 import com.projects.raftkv.core.Role;
 import com.projects.raftkv.core.SoftState;
 import com.projects.raftkv.node.NodeDriver;
 import com.projects.raftkv.node.NodeHaltedException;
+import com.projects.raftkv.node.ProposalOutcome;
+import com.projects.raftkv.statemachine.KvStateMachine;
 import com.projects.raftkv.storage.InMemoryStorage;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,12 +23,16 @@ import java.util.stream.IntStream;
 
 /**
  * Deterministic discrete-event simulation of a cluster: virtual time, a seeded network, a seeded fault
- * schedule, and invariant checks after every event. Each node runs the real NodeDriver over an
- * InMemoryStorage that loses unsynced data on crash. Same (seed, config) gives the same run.
+ * schedule, simulated clients, and invariant checks after every event. Each node runs the real
+ * NodeDriver and KvStateMachine over an InMemoryStorage that loses unsynced data on crash.
+ * Same (seed, config) gives the same run.
  */
 public final class Simulation {
 
-    /** Liveness: after faults heal, a current-term leader must be seen within the last window. */
+    /**
+     * Liveness, checked over the last window of the quiet period: a current-term leader exists, client
+     * commands still commit, and every node has applied what was committed one window before the end.
+     */
     private static final long LIVENESS_WINDOW_MS = 1_000;
 
     private record Scheduled(long time, long seq, Runnable action) {}
@@ -31,10 +40,14 @@ public final class Simulation {
     private static final class SimNode {
         final NodeId id;
         final InMemoryStorage storage = new InMemoryStorage();
+        final NodeLogTracker tracker = new NodeLogTracker();
+        final TrackedStorage trackedStorage = new TrackedStorage(storage, tracker);
         NodeDriver driver;          // null while crashed
+        KvStateMachine stateMachine;
         int incarnation;
         long pausedUntil;
         SoftState lastSoft;
+        long lastAppliedSeen = -1;
 
         SimNode(NodeId id) { this.id = id; }
         boolean up() { return driver != null; }
@@ -46,6 +59,7 @@ public final class Simulation {
     private final SplittableRandom netRng;
     private final SplittableRandom faultRng;
     private final SplittableRandom nodeRng;
+    private final SplittableRandom clientRng;
     private final List<NodeId> members;
     private final List<SimNode> nodes = new ArrayList<>();
     private final boolean[][] blocked;      // blocked[from][to], 1-based ids
@@ -54,6 +68,12 @@ public final class Simulation {
     private final Trace trace = new Trace(300);
     private final ElectionSafetyChecker electionSafety = new ElectionSafetyChecker();
     private final VoteDurabilityChecker voteDurability = new VoteDurabilityChecker();
+    private final LogMatchingChecker logMatching = new LogMatchingChecker();
+    private final LeaderAppendOnlyChecker leaderAppendOnly = new LeaderAppendOnlyChecker();
+    private final StateMachineSafetyChecker stateMachineSafety = new StateMachineSafetyChecker();
+    private final ReplicaStateChecker replicaState = new ReplicaStateChecker();
+    private final LeaderCompletenessChecker leaderCompleteness = new LeaderCompletenessChecker();
+    private final ClientWorkload workload;
 
     private long now;
     private long seq;
@@ -64,6 +84,7 @@ public final class Simulation {
     private int crashes;
     private int partitions;
     private int pauses;
+    private long commitTargetForLiveness = -1;
 
     private Simulation(long seed, SimConfig cfg) {
         this.seed = seed;
@@ -72,9 +93,11 @@ public final class Simulation {
         this.netRng = root.split();
         this.faultRng = root.split();
         this.nodeRng = root.split();
+        this.clientRng = root.split();
         this.members = IntStream.rangeClosed(1, cfg.clusterSize()).mapToObj(NodeId::new).toList();
         this.blocked = new boolean[cfg.clusterSize() + 1][cfg.clusterSize() + 1];
         for (NodeId id : members) nodes.add(new SimNode(id));
+        this.workload = new ClientWorkload(cfg.workload(), members, clientRng, this::at, this::submit, () -> now);
     }
 
     public static SimResult run(long seed, SimConfig cfg) {
@@ -93,8 +116,10 @@ public final class Simulation {
         }
         if (cfg.faults().enabled()) scheduleNextFault();
         if (cfg.chaosMs() > 0) at(cfg.chaosMs(), this::endChaos);
+        workload.start();
 
         long end = cfg.chaosMs() + cfg.quietMs();
+        at(end - LIVENESS_WINDOW_MS, () -> commitTargetForLiveness = maxCommitIndex());
         while (!queue.isEmpty() && queue.peek().time <= end) {
             Scheduled s = queue.poll();
             now = s.time;
@@ -106,10 +131,34 @@ public final class Simulation {
             throw new InvariantViolation("Liveness: no current-term leader in the last " + LIVENESS_WINDOW_MS
                     + "ms of the quiet period (last seen at " + lastCurrentLeaderSeenAt + "ms)");
         }
+        if (cfg.workload().clients() > 0) checkCommitLiveness(end);
         long maxTerm = nodes.stream().filter(SimNode::up)
                 .mapToLong(n -> n.driver.status().hard().currentTerm()).max().orElse(0);
         return new SimResult(seed, events, trace.hash(), electionSafety.leadersElected(), maxTerm,
-                firstLeaderAt, lastNewLeaderAt, crashes, partitions, pauses);
+                firstLeaderAt, lastNewLeaderAt, crashes, partitions, pauses,
+                workload.proposals, workload.committed, workload.lost, workload.rejected, maxCommitIndex());
+    }
+
+    /** Commands keep committing after the faults heal, and every node catches up (restarted ones included). */
+    private void checkCommitLiveness(long end) {
+        if (workload.lastCommitAt < end - LIVENESS_WINDOW_MS) {
+            throw new InvariantViolation("Liveness: no client command committed in the last " + LIVENESS_WINDOW_MS
+                    + "ms of the quiet period (last commit at " + workload.lastCommitAt + "ms)");
+        }
+        for (SimNode n : nodes) {
+            long applied = n.driver.status().lastApplied();
+            if (applied < commitTargetForLiveness) {
+                throw new InvariantViolation("Liveness: " + n.name() + " applied only up to " + applied
+                        + " but index " + commitTargetForLiveness + " was committed " + LIVENESS_WINDOW_MS
+                        + "ms before the end");
+            }
+        }
+    }
+
+    private long maxCommitIndex() {
+        long max = 0;
+        for (SimNode n : nodes) if (n.up()) max = Math.max(max, n.driver.status().commitIndex());
+        return max;
     }
 
     // ---------------------------------------------------------------- scheduling
@@ -126,9 +175,16 @@ public final class Simulation {
 
     private void start(SimNode n) {
         n.incarnation++;
-        RaftConfig rc = new RaftConfig(n.id, members, cfg.electionTimeoutTicks(), cfg.heartbeatTicks(), 64);
-        n.driver = NodeDriver.recover(rc, n.storage, this::onSend, nodeRng.split());
+        RaftConfig rc = new RaftConfig(n.id, members, cfg.electionTimeoutTicks(), cfg.heartbeatTicks(),
+                cfg.maxEntriesPerAppend());
+        RaftCore core = cfg.mutations().isEmpty()
+                ? new RaftNodeCore(rc, n.storage.loadAll(), nodeRng.split())
+                : RaftNodeCore.withMutationsForTesting(rc, n.storage.loadAll(), nodeRng.split(), cfg.mutations());
+        n.tracker.reset();
+        n.stateMachine = new KvStateMachine();   // rebuilt by re-applying the log (no snapshots until M3)
+        n.driver = NodeDriver.create(core, n.trackedStorage, this::onSend, n.stateMachine, this::onOutcome);
         n.lastSoft = null;
+        n.lastAppliedSeen = -1;
         trace.add(now, n.name(), "start #" + n.incarnation + " " + n.driver.status().hard());
         observe(n);
         int incarnation = n.incarnation;
@@ -159,10 +215,20 @@ public final class Simulation {
         observe(n);
     }
 
+    /** Runs every invariant checker against this node's state right after it handled an event. */
     private void observe(SimNode n) {
         RaftStatus s = n.driver.status();
+        NodeLogTracker.Change change = n.tracker.refresh(n.driver.log());
         electionSafety.observe(now, s);
         if (cfg.checkVoteDurability()) voteDurability.observe(now, s);
+        leaderAppendOnly.observe(now, s, n.tracker.lastIndex(), change.truncated());
+        logMatching.observe(now, s.id(), n.driver.log(), n.tracker, change.fromIndex());
+        stateMachineSafety.observe(now, s, n.driver.log());
+        leaderCompleteness.observe(now, s, n.tracker);
+        if (s.lastApplied() != n.lastAppliedSeen) {
+            replicaState.observe(now, s.id(), s.lastApplied(), n.stateMachine.stateHash());
+            n.lastAppliedSeen = s.lastApplied();
+        }
 
         if (!s.soft().equals(n.lastSoft)) {
             trace.add(now, n.name(), "-> " + s.soft().role().name() + " term=" + s.soft().term()
@@ -182,6 +248,29 @@ public final class Simulation {
         long max = 0;
         for (SimNode n : nodes) if (n.up()) max = Math.max(max, n.driver.status().hard().currentTerm());
         return max;
+    }
+
+    // ---------------------------------------------------------------- clients
+
+    /** A client request reaches its target after 1-5 ms; it is lost if the node is down. */
+    private void submit(String client, NodeId target, long proposalId, Bytes command) {
+        trace.add(now, client, "propose #" + proposalId + " -> " + target);
+        at(now + between(clientRng, 1, 5), () -> arriveProposal(target, proposalId, command));
+    }
+
+    private void arriveProposal(NodeId target, long proposalId, Bytes command) {
+        SimNode n = nodes.get(target.value() - 1);
+        if (!n.up()) return;
+        if (now < n.pausedUntil) {
+            at(n.pausedUntil, () -> arriveProposal(target, proposalId, command));
+            return;
+        }
+        deliver(n, new Event.ProposeCommand(proposalId, command));
+    }
+
+    private void onOutcome(ProposalOutcome o) {
+        trace.add(now, "cli", o);
+        workload.onOutcome(o);
     }
 
     // ---------------------------------------------------------------- network

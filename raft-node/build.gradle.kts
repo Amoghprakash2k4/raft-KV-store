@@ -6,5 +6,5 @@ dependencies {
     api(project(":raft-core"))
     implementation(project(":raft-storage"))
     implementation(project(":raft-transport"))
-    implementation(project(":raft-statemachine"))
+    api(project(":raft-statemachine"))   // NodeDriver's API takes a StateMachine
 }
