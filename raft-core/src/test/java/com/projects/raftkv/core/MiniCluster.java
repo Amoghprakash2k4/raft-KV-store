@@ -2,8 +2,11 @@ package com.projects.raftkv.core;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -16,6 +19,7 @@ final class MiniCluster {
     private final Set<NodeId> isolated = new HashSet<>();
     private final Deque<Message> inFlight = new ArrayDeque<>();
     private int appendEntriesDelivered;
+    private final Map<NodeId, List<Ready>> readies = new HashMap<>();
 
     MiniCluster add(RaftNodeCore core) {
         nodes.put(core.status().id(), core);
@@ -34,7 +38,16 @@ final class MiniCluster {
 
     void enqueue(Ready r) { inFlight.addAll(r.messages()); }
 
-    void step(NodeId id, Event e) { enqueue(nodes.get(id).step(e)); }
+    /** Every Ready a node produced inside this cluster, in order. */
+    List<Ready> readiesOf(NodeId id) { return readies.getOrDefault(id, List.of()); }
+
+    private void stepAndRecord(NodeId id, Event e) {
+        Ready r = nodes.get(id).step(e);
+        readies.computeIfAbsent(id, k -> new ArrayList<>()).add(r);
+        enqueue(r);
+    }
+
+    void step(NodeId id, Event e) { stepAndRecord(id, e); }
 
     /** Delivers messages until none are left. Fails if that takes absurdly long (a livelock). */
     void deliverAll() {
@@ -44,7 +57,7 @@ final class MiniCluster {
             Message m = inFlight.removeFirst();
             if (isolated.contains(m.from()) || isolated.contains(m.to()) || !nodes.containsKey(m.to())) continue;
             if (m instanceof Message.AppendEntries) appendEntriesDelivered++;
-            enqueue(nodes.get(m.to()).step(new Event.MessageReceived(m)));
+            stepAndRecord(m.to(), new Event.MessageReceived(m));
         }
     }
 

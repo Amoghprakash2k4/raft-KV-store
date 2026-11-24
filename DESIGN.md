@@ -125,3 +125,49 @@ term)`. When the entry at `index` is applied: same term means the proposal commi
 machine's result; a different term means it was overwritten by another leader and is answered
 "lost, retry" (thesis §6.3). The command envelope carries `clientId` and `seq` from day one so that M4's
 dedup does not change the log format.
+
+## M3. Durability decisions (approved 2026-11-24)
+
+### M3-A. One write-ahead log with typed records
+Each node has one WAL: segment files `wal-<seq>.log` holding records
+`[length u32][crc32c u32][type u8][payload]` of type HARD_STATE, ENTRIES, TRUNCATE, SNAPSHOT_MARK and
+RESET (the first record of a checkpoint segment). Hard state lives in the same log as entries, so the
+one fsync per `Ready` (E1) covers everything. Truncation is a logical record; bytes are never rewritten
+in place, except to cut a torn tail. Recovery replays all segments: a bad record in the **last**
+segment is a torn tail (cut it, fsync, stop); a bad record anywhere else is corruption (fail-stop).
+After a snapshot, a checkpoint segment (RESET + HARD_STATE + retained entries) is written to a temp
+file, fsynced, renamed, and the directory fsynced; only then are older segments deleted.
+**Rejected:** a separate hard-state file (two fsyncs and a directory fsync per Ready); an embedded
+database (hides what we are learning).
+
+### M3-B. Crash testing: the real WAL on a simulated disk
+`Disk` is a small file API (append, read, truncate, fsync, rename, delete, list, fsyncDir).
+`RealDisk` uses `FileChannel`; `SimDisk` models a page cache: unsynced bytes are lost on crash, or a
+random prefix of them survives (a torn write); a file name created, renamed or deleted becomes durable
+only after `fsyncDir`; "crash during fsync" persists a random prefix of the pending bytes and fails.
+The simulator runs the real `FileWalStorage` on `SimDisk`, so every seed exercises recovery.
+**Rejected (for now):** only real files and kill -9 (slow and nondeterministic; that is M5's compose
+test).
+
+### M3-C. The core holds the latest snapshot's bytes
+The core receives snapshot bytes through `SnapshotCreated`, a completed InstallSnapshot, or recovery,
+and builds InstallSnapshot chunks from them. Pure and deterministic; the cost is one snapshot copy in
+memory (a scale limit, listed in DEVIATIONS.md).
+**Rejected:** the driver reading the snapshot file on demand (scales better, but message building leaks
+into the driver).
+
+### M3-D. Chunked InstallSnapshot (Figure 13)
+Chunks carry `offset`, `data`, `done`; one chunk is in flight per follower and the reply carries how
+many bytes the follower holds. 64 KB chunks in production, 64 bytes in the simulator so every install
+is multi-chunk. The follower assembles chunks in volatile memory and restarts on an offset mismatch.
+
+### M3-E. Snapshot every N applied entries, decided by the driver
+Between two `Ready`s, when `lastApplied - snapshotIndex >= snapshotEvery`, the driver serializes the
+state machine at exactly `lastApplied`, saves the snapshot file atomically (tmp, fsync, rename, fsync
+dir), and only then tells the core (`SnapshotCreated`), which compacts its log and emits `CompactLog`.
+Production 10,000; simulator 30-100.
+
+### M3-F. Mutations that must be caught
+Lying fsync (on the WAL now), recovery that does not cut the torn tail, a snapshot renamed into place
+without fsyncing its data first, and a naive follower InstallSnapshot (no stale check, always discards
+the log). Each one must be caught by a checker, with measured rates and a clean control run.

@@ -77,3 +77,55 @@ Replay: `./gradlew :raft-sim:test -Psim.seeds=5000` (gate), `-Psim.seed=N` (one 
 
 ### Carried to M4
 - [ ] `ReadRequested` / ReadIndex (P3 remainder). Client retries, sessions and dedup; lossy client links (H1).
+
+---
+
+## M3: Durability ✅ done (gate passed and accepted by the owner 2026-11-24)
+
+**Exit criterion:** invariant 6 (Durability) holds under random crash loops, including crashes in the
+middle of a write; invariants 1–5 keep holding.
+
+**Built:** a segmented WAL with CRC32C records, torn-tail cut and checkpoints (`FileWalStorage`) on a
+`Disk` abstraction (`RealDisk`, and `SimDisk` with a page-cache crash model); atomic snapshot files
+(`SnapshotStore`); a log base in the core (D1a rules 1–5); driver-triggered snapshots
+(`SnapshotCreated`); chunked InstallSnapshot (Figure 13); recovery from snapshot + WAL. Every simulated
+node now runs the real WAL on a `SimDisk`, and every restart runs real recovery.
+
+**Result:** 5,000 seeds × {3, 5} nodes × {chaos, crash loop} with 0 violations of invariants 1–6, vote
+durability, replica-state agreement and liveness. Runtime 2 min 31 s.
+
+| Config | Crashes | mid-fsync | Torn tails cut | Restarts checked | Snapshots | Installs | Max log in memory |
+|---|---|---|---|---|---|---|---|
+| chaos, 3 | 44,904 | 22,326 | 8,619 | 59,904 | 71,782 | 14,167 | 189 |
+| chaos, 5 | 46,656 | 23,194 | 8,966 | 71,656 | 153,018 | 35,673 | 190 |
+| crash loop, 3 | 301,100 | 140,956 | 53,392 | 316,100 | 43,782 | 5,631 | 120 |
+| crash loop, 5 | 324,898 | 159,198 | 61,240 | 349,898 | 115,943 | 25,879 | 137 |
+
+The first gate run failed on one seed (crash loop, 5 nodes, seed 327). It was a false positive in the
+new committed-entry check: it also flagged a node still in an older term, which Raft allows to lose an
+entry committed later without it (Figure 8). The check now applies only to nodes at or past the commit
+term (EXPLANATION.md M3 §11).
+
+Mutation checks (measured rates):
+
+| Mutation | Config, seeds | Caught by |
+|---|---|---|
+| Lying fsync (on the real WAL) | chaos, 50 | Durability 50 |
+| Same, durability checkers off | chaos, 300 | Leader Completeness 212, Election Safety 43, Log Matching 18, State Machine Safety 2 (passed 20, liveness 5) |
+| Recovery keeps the torn tail | crash loop, 100 | Durability 100 |
+| Snapshot renamed before its data is fsynced | crash loop, 100 | Durability 59 (needs a crash that loses some of the unsynced bytes) |
+| Follower installs stale snapshots / always discards its log | chaos, 100 | Durability (c) 98, RaftLog guard 1 |
+| M2 truncate on match (re-measured) | chaos, 100 | Durability (c) 100 |
+| Controls (batch 1; crash loop) | 100 + 100 | no safety violations |
+
+`./gradlew build`: 250 tests, ~20 s.
+
+### Checklist
+- [x] `Disk`, `RealDisk`, `SimDisk` (crash model tested on its own)
+- [x] WAL: records + CRC32C, segments, torn-tail cut, fail-stop on older-segment corruption, every-offset property test
+- [x] Simulator on the real WAL; crash-during-fsync faults; crash-loop config; `DurabilityChecker` (a), (b), (c)
+- [x] Snapshots: canonical KV snapshot, atomic `SnapshotStore`, log base, `SnapshotCreated` / `CompactLog`, checkpoints, recovery merge
+- [x] InstallSnapshot: chunks, offsets, retransmit on heartbeat, stale-install guard, keep vs discard
+- [x] Mutations M3-F caught, with control runs
+- [x] Gate over 5,000 seeds
+- [x] Docs: DESIGN, DEVIATIONS, CLAUDE.md, EXPLANATION.md `# M3`

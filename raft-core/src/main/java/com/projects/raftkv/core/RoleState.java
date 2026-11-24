@@ -41,7 +41,11 @@ sealed interface RoleState {
      * reinitialized after each election and changes only when replies arrive (DESIGN.md M2-A).
      */
     final class Leader implements RoleState {
+        /** A snapshot being streamed to one follower, one chunk in flight (DESIGN.md M3-D). */
+        record Transfer(long index, long term, long offset) {}
+
         private final Map<NodeId, Progress> progress = new LinkedHashMap<>();
+        private final Map<NodeId, Transfer> transfers = new LinkedHashMap<>();
 
         /** Figure 2: nextIndex = leader last log index + 1 (before the no-op), matchIndex = 0. */
         Leader(List<NodeId> peers, long nextIndex) {
@@ -60,6 +64,12 @@ sealed interface RoleState {
         }
 
         Iterable<Progress> all() { return progress.values(); }
+
+        Optional<Transfer> transfer(NodeId peer) { return Optional.ofNullable(transfers.get(peer)); }
+
+        void setTransfer(NodeId peer, Transfer t) { transfers.put(peer, t); }
+
+        void endTransfer(NodeId peer) { transfers.remove(peer); }
 
         @Override public Role role() { return Role.LEADER; }
 

@@ -10,8 +10,9 @@ import java.util.Set;
 import java.util.random.RandomGenerator;
 
 /**
- * Deterministic Raft core: leader election (M1) and log replication (M2), following Figure 2
- * ("State", "AppendEntries RPC", "RequestVote RPC", "Rules for Servers").
+ * Deterministic Raft core: leader election (M1), log replication (M2) and log compaction with
+ * InstallSnapshot (M3), following Figure 2 ("State", "AppendEntries RPC", "RequestVote RPC", "Rules for
+ * Servers"), Figure 13 (InstallSnapshot) and the snapshot boundary rules in DESIGN.md D1a.
  *
  * <p>Each {@link #step} mutates in-memory state and returns a {@link Ready}. Per DESIGN.md E1 the
  * driver executes that Ready (persist + fsync first) before the next step, so the core may treat
@@ -29,8 +30,14 @@ public final class RaftNodeCore implements RaftCore {
     private long currentTerm;
     private Optional<NodeId> votedFor;
 
-    // Volatile state (Figure 2). Both restart at 0 after a crash: the state machine is rebuilt by
-    // re-applying the log (until M3 snapshots).
+    // The latest snapshot's bytes (DESIGN.md M3-C): sent to followers whose nextIndex falls into it.
+    private Optional<Snapshot> snapshot;
+    // Follower side: an InstallSnapshot being assembled from chunks. Volatile; lost on restart.
+    private Optional<Incoming> incoming = Optional.empty();
+    private Optional<Snapshot> snapshotToRestore = Optional.empty();
+
+    // Volatile state (Figure 2). After a crash both restart at the snapshot index (0 without one): the
+    // state machine is restored from the snapshot and the rest is re-applied from the log.
     private long commitIndex;
     private long lastApplied;
     private RoleState role;
@@ -45,6 +52,9 @@ public final class RaftNodeCore implements RaftCore {
     private final List<PersistOp> logOps = new ArrayList<>();
     private final List<ClientNotice> notices = new ArrayList<>();
 
+    /** Chunks of one snapshot received so far, contiguous from offset 0. */
+    private record Incoming(long index, long term, java.io.ByteArrayOutputStream bytes) {}
+
     public RaftNodeCore(RaftConfig config, PersistentState recovered, RandomGenerator rng) {
         this(config, recovered, rng, Set.of());
     }
@@ -55,7 +65,11 @@ public final class RaftNodeCore implements RaftCore {
         this.self = config.self();
         this.rng = Objects.requireNonNull(rng);
         this.mutations = mutations.isEmpty() ? Set.of() : Set.copyOf(EnumSet.copyOf(mutations));
-        this.log = new RaftLog(recovered.entries());
+        this.snapshot = recovered.snapshot();
+        this.log = new RaftLog(snapshot.map(Snapshot::index).orElse(0L), snapshot.map(Snapshot::term).orElse(0L),
+                recovered.entries());
+        this.commitIndex = log.snapshotIndex();   // a snapshot holds committed, applied state only
+        this.lastApplied = log.snapshotIndex();
         this.currentTerm = recovered.hardState().currentTerm();
         this.votedFor = recovered.hardState().votedFor();
         votedFor.ifPresent(v -> {
@@ -84,6 +98,7 @@ public final class RaftNodeCore implements RaftCore {
             case Event.Tick t -> onTick();
             case Event.MessageReceived(Message m) -> onMessage(m);
             case Event.ProposeCommand p -> onPropose(p);
+            case Event.SnapshotCreated sc -> onSnapshotCreated(sc);
             case Event.ReadRequested r ->
                     throw new UnsupportedOperationException("ReadIndex arrives in M4: " + r);
         }
@@ -108,6 +123,11 @@ public final class RaftNodeCore implements RaftCore {
     /** Visible for tests: the leader's progress for a peer; empty when not leader. */
     Optional<Progress> progressOf(NodeId peer) {
         return role instanceof RoleState.Leader l ? Optional.of(l.progress(peer)) : Optional.empty();
+    }
+
+    /** Visible for tests: the snapshot this core holds (its own or an installed one). */
+    Optional<Snapshot> snapshot() {
+        return snapshot;
     }
 
     /** Visible for tests. */
@@ -232,6 +252,24 @@ public final class RaftNodeCore implements RaftCore {
         return e;
     }
 
+    // ---------------------------------------------------------------- snapshots (§7)
+
+    /**
+     * The driver saved a snapshot at index (DESIGN.md M3-E). Compact only what has been applied
+     * (D1a rule 1), so nothing compacted can ever be needed for a consistency check. A snapshot that is
+     * not newer than the current base (an installed one overtook it) is ignored.
+     */
+    private void onSnapshotCreated(Event.SnapshotCreated sc) {
+        if (sc.index() <= log.snapshotIndex()) return;
+        if (sc.index() > lastApplied)
+            throw new IllegalArgumentException("snapshot at " + sc.index() + " beyond lastApplied " + lastApplied);
+        if (log.termAt(sc.index()).orElseThrow() != sc.term())
+            throw new IllegalArgumentException("snapshot term " + sc.term() + " does not match the log at " + sc.index());
+        log.resetBase(sc.index(), sc.term());
+        snapshot = Optional.of(new Snapshot(sc.index(), sc.term(), sc.data()));
+        logOps.add(new PersistOp.CompactLog(sc.index(), sc.term()));
+    }
+
     // ---------------------------------------------------------------- messages
 
     private void onMessage(Message m) {
@@ -248,6 +286,8 @@ public final class RaftNodeCore implements RaftCore {
             case Message.RequestVoteResponse r -> onRequestVoteResponse(r);
             case Message.AppendEntries ae -> onAppendEntries(ae);
             case Message.AppendEntriesResponse r -> onAppendEntriesResponse(r);
+            case Message.InstallSnapshot is -> onInstallSnapshot(is);
+            case Message.InstallSnapshotResponse r -> onInstallSnapshotResponse(r);
         }
     }
 
@@ -304,21 +344,11 @@ public final class RaftNodeCore implements RaftCore {
             send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(), 0, 0));
             return;
         }
-        switch (role) {
-            case RoleState.Leader l -> throw new IllegalStateException(
-                    "Election Safety violated: " + self + " is leader of term " + currentTerm
-                            + " but received AppendEntries from " + ae.from() + " for the same term");
-            case RoleState.Candidate c -> role = new RoleState.Follower(Optional.of(ae.from()));
-            case RoleState.Follower f -> {
-                if (f.leader().isPresent() && !f.leader().get().equals(ae.from())) {
-                    throw new IllegalStateException("Election Safety violated: " + self + " saw leaders "
-                            + f.leader().get() + " and " + ae.from() + " in term " + currentTerm);
-                }
-                role = new RoleState.Follower(Optional.of(ae.from()));
-            }
-        }
-        resetElectionTimer();
+        followLeader(ae.from(), "AppendEntries");
 
+        if (ae.prevLogIndex() < log.snapshotIndex()) {
+            ae = skipCompactedEntries(ae);
+        }
         OptionalLong prevTerm = log.termAt(ae.prevLogIndex());
         if (prevTerm.isEmpty()) {
             // Fast backup hint: our log ends before prevLogIndex.
@@ -339,11 +369,45 @@ public final class RaftNodeCore implements RaftCore {
             mergeEntries(ae.entries());
         }
 
-        long lastNewEntry = ae.prevLogIndex() + ae.entries().size();
+        long lastNewEntry = ae.prevLogIndex() + ae.entries().size();   // >= snapshotIndex after the skip
         if (ae.leaderCommit() > commitIndex) {
             commitIndex = Math.max(commitIndex, Math.min(ae.leaderCommit(), lastNewEntry));
         }
         send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, true, lastNewEntry, 0, 0, 0));
+    }
+
+    /**
+     * The sender of a valid AppendEntries or InstallSnapshot in our term is its leader: candidates step
+     * down (§5.2), and the election timer resets. Two different senders in one term would break
+     * Election Safety.
+     */
+    private void followLeader(NodeId leader, String what) {
+        switch (role) {
+            case RoleState.Leader l -> throw new IllegalStateException(
+                    "Election Safety violated: " + self + " is leader of term " + currentTerm
+                            + " but received " + what + " from " + leader + " for the same term");
+            case RoleState.Candidate c -> role = new RoleState.Follower(Optional.of(leader));
+            case RoleState.Follower f -> {
+                if (f.leader().isPresent() && !f.leader().get().equals(leader)) {
+                    throw new IllegalStateException("Election Safety violated: " + self + " saw leaders "
+                            + f.leader().get() + " and " + leader + " in term " + currentTerm);
+                }
+                role = new RoleState.Follower(Optional.of(leader));
+            }
+        }
+        resetElectionTimer();
+    }
+
+    /**
+     * D1a rule 3: prevLogIndex lies inside our snapshot, so this is a stale or reordered message, not a
+     * conflict. Entries up to snapshotIndex are committed and already in the snapshot (and in this
+     * leader's log, by Leader Completeness), so drop them and treat the message as if it started at the
+     * snapshot boundary, whose term we know.
+     */
+    private Message.AppendEntries skipCompactedEntries(Message.AppendEntries ae) {
+        long base = log.snapshotIndex();
+        List<LogEntry> rest = ae.entries().stream().filter(e -> e.index() > base).toList();
+        return new Message.AppendEntries(ae.from(), ae.to(), ae.term(), base, log.snapshotTerm(), rest, ae.leaderCommit());
     }
 
     /** Steps 3 and 4: skip entries we already have, truncate at the first real conflict, append the rest. */
@@ -462,7 +526,11 @@ public final class RaftNodeCore implements RaftCore {
         }
     }
 
-    /** Figure 2 / M2-A: send each peer the entries from its nextIndex (possibly none: a heartbeat). */
+    /**
+     * Figure 2 / M2-A: send each peer the entries from its nextIndex (possibly none: a heartbeat). A peer
+     * receiving a snapshot gets its current chunk again instead, which doubles as the heartbeat and
+     * retransmits a lost chunk or reply.
+     */
     private void broadcastAppend(RoleState.Leader l) {
         for (NodeId peer : config.peers()) {
             sendAppend(peer, l.progress(peer));
@@ -470,11 +538,123 @@ public final class RaftNodeCore implements RaftCore {
     }
 
     private void sendAppend(NodeId peer, Progress p) {
+        if (p.nextIndex() <= log.snapshotIndex()) {      // D1a rule 4: those entries are compacted away
+            sendSnapshotChunk((RoleState.Leader) role, peer);
+            return;
+        }
         long prevIndex = p.nextIndex() - 1;
         long prevTerm = log.termAt(prevIndex).orElseThrow(
                 () -> new IllegalStateException("nextIndex " + p.nextIndex() + " beyond log for " + peer));
         List<LogEntry> entries = log.entriesFrom(p.nextIndex(), config.maxEntriesPerAppend());
         send(new Message.AppendEntries(self, peer, currentTerm, prevIndex, prevTerm, entries, commitIndex));
+    }
+
+    // ---------------------------------------------------------------- InstallSnapshot (§7, Figure 13)
+
+    /**
+     * Leader: send the chunk at the follower's acknowledged offset. A transfer of an older snapshot
+     * (this leader has compacted again since) restarts from offset 0 with the latest one.
+     */
+    private void sendSnapshotChunk(RoleState.Leader l, NodeId peer) {
+        Snapshot s = snapshot.orElseThrow(() -> new IllegalStateException("log compacted without a snapshot"));
+        RoleState.Leader.Transfer t = l.transfer(peer).filter(x -> x.index() == s.index())
+                .orElseGet(() -> new RoleState.Leader.Transfer(s.index(), s.term(), 0));
+        l.setTransfer(peer, t);
+        byte[] all = s.data().toByteArray();
+        int from = (int) t.offset();
+        int to = Math.min(all.length, from + config.snapshotChunkBytes());
+        send(new Message.InstallSnapshot(self, peer, currentTerm, s.index(), s.term(), from,
+                Bytes.copyOf(java.util.Arrays.copyOfRange(all, from, to)), to == all.length));
+    }
+
+    /**
+     * Figure 13 receiver:
+     * <ol>
+     *   <li>Reply immediately if term &lt; currentTerm.</li>
+     *   <li>(chunks) Create a new buffer at offset 0; write data at offset; reply and wait for more
+     *       unless done. A chunk at the wrong offset is answered with the offset we need.</li>
+     *   <li>When complete: if lastIncludedIndex &lt;= commitIndex we already have everything it holds:
+     *       reply and change nothing (D1a rule 5). Otherwise install it: keep the log suffix after
+     *       (lastIncludedIndex, lastIncludedTerm) if we hold that entry, else discard the log; persist;
+     *       reset the state machine from the snapshot.</li>
+     * </ol>
+     */
+    private void onInstallSnapshot(Message.InstallSnapshot m) {
+        if (m.term() < currentTerm) {
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, false));
+            return;
+        }
+        followLeader(m.from(), "InstallSnapshot");
+        boolean naive = mutations.contains(ProtocolMutation.NAIVE_INSTALL_SNAPSHOT);   // MUTATION (test only)
+        if (m.lastIncludedIndex() <= commitIndex && !naive) {
+            incoming = Optional.empty();
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, true));
+            return;
+        }
+        Incoming in = incoming.filter(x -> x.index() == m.lastIncludedIndex() && x.term() == m.lastIncludedTerm())
+                .orElse(null);
+        if (in == null) {
+            if (m.offset() != 0) {
+                send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, false));
+                return;
+            }
+            in = new Incoming(m.lastIncludedIndex(), m.lastIncludedTerm(), new java.io.ByteArrayOutputStream());
+            incoming = Optional.of(in);
+        }
+        if (m.offset() != in.bytes().size()) {
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), in.bytes().size(), false));
+            return;
+        }
+        in.bytes().writeBytes(m.data().toByteArray());
+        if (!m.done()) {
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), in.bytes().size(), false));
+            return;
+        }
+        incoming = Optional.empty();
+        installSnapshot(new Snapshot(m.lastIncludedIndex(), m.lastIncludedTerm(), Bytes.copyOf(in.bytes().toByteArray())), naive);
+        send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, true));
+    }
+
+    private void installSnapshot(Snapshot s, boolean naive) {
+        if (naive && log.lastIndex() > log.snapshotIndex()) {
+            log.truncateFrom(log.snapshotIndex() + 1);                          // MUTATION (test only)
+            logOps.add(new PersistOp.TruncateSuffix(log.snapshotIndex() + 1));
+        }
+        log.resetBase(s.index(), s.term());
+        snapshot = Optional.of(s);
+        logOps.add(new PersistOp.InstallSnapshot(s));
+        if (naive) {
+            commitIndex = s.index();                                             // MUTATION (test only)
+        } else {
+            commitIndex = Math.max(commitIndex, s.index());
+        }
+        lastApplied = s.index();
+        snapshotToRestore = Optional.of(s);
+    }
+
+    /**
+     * Leader: with one chunk in flight, a reply that moves the follower's offset forward triggers the
+     * next chunk. A reply with a smaller offset (the follower restarted and lost its buffer, or an old
+     * reply) resets the offset; the next heartbeat resends from there, so duplicated replies cannot
+     * multiply the chunks in flight. When done, the follower holds everything through lastIncludedIndex.
+     */
+    private void onInstallSnapshotResponse(Message.InstallSnapshotResponse r) {
+        if (!(role instanceof RoleState.Leader l) || r.term() != currentTerm) return;
+        Optional<RoleState.Leader.Transfer> t = l.transfer(r.from()).filter(x -> x.index() == r.lastIncludedIndex());
+        if (t.isEmpty()) return;                                            // answers an older transfer
+        if (r.done()) {
+            l.endTransfer(r.from());
+            Progress p = l.progress(r.from());
+            Progress next = new Progress(Math.max(p.nextIndex(), r.lastIncludedIndex() + 1),
+                    Math.max(p.matchIndex(), r.lastIncludedIndex()));
+            l.update(r.from(), next);
+            maybeAdvanceCommit(l);
+            if (next.nextIndex() <= log.lastIndex()) sendAppend(r.from(), next);
+            return;
+        }
+        long offset = t.get().offset();
+        l.setTransfer(r.from(), new RoleState.Leader.Transfer(t.get().index(), t.get().term(), r.nextOffset()));
+        if (r.nextOffset() > offset) sendSnapshotChunk(l, r.from());
     }
 
     // ---------------------------------------------------------------- output
@@ -520,7 +700,8 @@ public final class RaftNodeCore implements RaftCore {
         Optional<SoftState> soft = ss.equals(lastEmittedSoftState) ? Optional.empty() : Optional.of(ss);
         lastEmittedSoftState = ss;
 
-        Ready ready = new Ready(persist, outbox, toApply, notices, soft);
+        Ready ready = new Ready(persist, outbox, toApply, notices, soft, snapshotToRestore);
+        snapshotToRestore = Optional.empty();
         outbox.clear();
         logOps.clear();
         notices.clear();

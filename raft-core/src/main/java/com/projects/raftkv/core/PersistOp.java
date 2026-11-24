@@ -1,6 +1,7 @@
 package com.projects.raftkv.core;
 
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Durable writes, executed IN LIST ORDER, then fsynced once, before anything else in the Ready.
@@ -21,5 +22,23 @@ public sealed interface PersistOp {
             entries = List.copyOf(entries);
             if (entries.isEmpty()) throw new IllegalArgumentException("empty append");
         }
+    }
+
+    /**
+     * Local compaction (§7): the snapshot through (index, term) is already durable; drop the log entries
+     * up to index. Storage must never apply this before the snapshot it depends on is on disk.
+     */
+    record CompactLog(long index, long term) implements PersistOp {
+        public CompactLog {
+            if (index < 1 || term < 1) throw new IllegalArgumentException("bad compaction point " + index + "/" + term);
+        }
+    }
+
+    /**
+     * Figure 13 receiver, steps 5-7: save the leader's snapshot durably, then move the log base to it,
+     * keeping the suffix after (index, term) if the log holds that entry, else discarding the log.
+     */
+    record InstallSnapshot(Snapshot snapshot) implements PersistOp {
+        public InstallSnapshot { Objects.requireNonNull(snapshot); }
     }
 }

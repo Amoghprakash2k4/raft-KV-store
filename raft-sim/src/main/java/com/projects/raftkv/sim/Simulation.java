@@ -14,7 +14,11 @@ import com.projects.raftkv.node.NodeDriver;
 import com.projects.raftkv.node.NodeHaltedException;
 import com.projects.raftkv.node.ProposalOutcome;
 import com.projects.raftkv.statemachine.KvStateMachine;
-import com.projects.raftkv.storage.InMemoryStorage;
+import com.projects.raftkv.core.PersistentState;
+import com.projects.raftkv.storage.StorageException;
+import com.projects.raftkv.storage.disk.SimDisk;
+import com.projects.raftkv.storage.wal.FileWalStorage;
+import com.projects.raftkv.storage.wal.WalOptions;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.PriorityQueue;
@@ -24,7 +28,8 @@ import java.util.stream.IntStream;
 /**
  * Deterministic discrete-event simulation of a cluster: virtual time, a seeded network, a seeded fault
  * schedule, simulated clients, and invariant checks after every event. Each node runs the real
- * NodeDriver and KvStateMachine over an InMemoryStorage that loses unsynced data on crash.
+ * NodeDriver and KvStateMachine over the real write-ahead log (FileWalStorage) on a SimDisk, which loses or
+ * tears unsynced data on a crash; every restart runs the real WAL recovery.
  * Same (seed, config) gives the same run.
  */
 public final class Simulation {
@@ -39,9 +44,11 @@ public final class Simulation {
 
     private static final class SimNode {
         final NodeId id;
-        final InMemoryStorage storage = new InMemoryStorage();
-        final NodeLogTracker tracker = new NodeLogTracker();
-        final TrackedStorage trackedStorage = new TrackedStorage(storage, tracker);
+        final SimDisk disk;
+        final NodeLogTracker tracker;
+        final long snapshotEvery;
+        TrackedStorage trackedStorage;   // wraps this incarnation's WAL
+        boolean midWriteCrashArmed;
         NodeDriver driver;          // null while crashed
         KvStateMachine stateMachine;
         int incarnation;
@@ -49,7 +56,12 @@ public final class Simulation {
         SoftState lastSoft;
         long lastAppliedSeen = -1;
 
-        SimNode(NodeId id) { this.id = id; }
+        SimNode(NodeId id, SplittableRandom diskRng, NodeLogTracker tracker, long snapshotEvery) {
+            this.id = id;
+            this.disk = new SimDisk(diskRng);
+            this.tracker = tracker;
+            this.snapshotEvery = snapshotEvery;
+        }
         boolean up() { return driver != null; }
         String name() { return id.toString(); }
     }
@@ -73,6 +85,7 @@ public final class Simulation {
     private final StateMachineSafetyChecker stateMachineSafety = new StateMachineSafetyChecker();
     private final ReplicaStateChecker replicaState = new ReplicaStateChecker();
     private final LeaderCompletenessChecker leaderCompleteness = new LeaderCompletenessChecker();
+    private final DurabilityChecker durability;
     private final ClientWorkload workload;
 
     private long now;
@@ -84,6 +97,11 @@ public final class Simulation {
     private int crashes;
     private int partitions;
     private int pauses;
+    private int midWriteCrashes;
+    private int tornTailsCut;
+    private long snapshotsTaken;
+    private long snapshotsInstalled;
+    private long maxLogEntries;
     private long commitTargetForLiveness = -1;
 
     private Simulation(long seed, SimConfig cfg) {
@@ -94,9 +112,16 @@ public final class Simulation {
         this.faultRng = root.split();
         this.nodeRng = root.split();
         this.clientRng = root.split();
+        SplittableRandom diskRng = root.split();
         this.members = IntStream.rangeClosed(1, cfg.clusterSize()).mapToObj(NodeId::new).toList();
         this.blocked = new boolean[cfg.clusterSize() + 1][cfg.clusterSize() + 1];
-        for (NodeId id : members) nodes.add(new SimNode(id));
+        int every = cfg.storage().snapshotEvery();
+        for (NodeId id : members) {
+            SplittableRandom r = diskRng.split();
+            long snapshotEvery = every == 0 ? 0 : every + r.nextInt(every);
+            nodes.add(new SimNode(id, r, new NodeLogTracker(leaderCompleteness::committedHashAt), snapshotEvery));
+        }
+        this.durability = new DurabilityChecker(members, cfg.checkDurability());
         this.workload = new ClientWorkload(cfg.workload(), members, clientRng, this::at, this::submit, () -> now);
     }
 
@@ -111,7 +136,7 @@ public final class Simulation {
 
     private SimResult execute() {
         for (SimNode n : nodes) {
-            n.storage.setFsyncIsNoop(cfg.lyingDisks());
+            n.disk.setFsyncIsNoop(cfg.lyingDisks());
             start(n);
         }
         if (cfg.faults().enabled()) scheduleNextFault();
@@ -132,11 +157,14 @@ public final class Simulation {
                     + "ms of the quiet period (last seen at " + lastCurrentLeaderSeenAt + "ms)");
         }
         if (cfg.workload().clients() > 0) checkCommitLiveness(end);
+        for (SimNode n : nodes) if (n.up()) countSnapshots(n);
         long maxTerm = nodes.stream().filter(SimNode::up)
                 .mapToLong(n -> n.driver.status().hard().currentTerm()).max().orElse(0);
         return new SimResult(seed, events, trace.hash(), electionSafety.leadersElected(), maxTerm,
                 firstLeaderAt, lastNewLeaderAt, crashes, partitions, pauses,
-                workload.proposals, workload.committed, workload.lost, workload.rejected, maxCommitIndex());
+                workload.proposals, workload.committed, workload.lost, workload.rejected, workload.unknown,
+                maxCommitIndex(), midWriteCrashes, tornTailsCut, durability.restartsChecked(),
+                snapshotsTaken, snapshotsInstalled, maxLogEntries);
     }
 
     /** Commands keep committing after the faults heal, and every node catches up (restarted ones included). */
@@ -176,13 +204,29 @@ public final class Simulation {
     private void start(SimNode n) {
         n.incarnation++;
         RaftConfig rc = new RaftConfig(n.id, members, cfg.electionTimeoutTicks(), cfg.heartbeatTicks(),
-                cfg.maxEntriesPerAppend());
+                cfg.maxEntriesPerAppend(), cfg.storage().snapshotChunkBytes());
+        FileWalStorage wal;
+        try {
+            wal = FileWalStorage.open(n.disk, new WalOptions(cfg.storage().walSegmentBytes(), cfg.storage().mutations()));
+        } catch (StorageException e) {
+            throw new InvariantViolation("Durability violated at t=" + now + "ms: " + n.name()
+                    + " cannot recover its WAL: " + e.getMessage());
+        }
+        if (wal.tornBytesCut() > 0) {
+            tornTailsCut++;
+            trace.add(now, n.name(), "WAL recovery cut a torn tail of " + wal.tornBytesCut() + " bytes");
+        }
+        PersistentState recovered = wal.loadAll();
+        durability.onRecover(now, n.id, recovered);
+        n.trackedStorage = new TrackedStorage(wal, n.tracker, durability, n.id);
         RaftCore core = cfg.mutations().isEmpty()
-                ? new RaftNodeCore(rc, n.storage.loadAll(), nodeRng.split())
-                : RaftNodeCore.withMutationsForTesting(rc, n.storage.loadAll(), nodeRng.split(), cfg.mutations());
-        n.tracker.reset();
-        n.stateMachine = new KvStateMachine();   // rebuilt by re-applying the log (no snapshots until M3)
-        n.driver = NodeDriver.create(core, n.trackedStorage, this::onSend, n.stateMachine, this::onOutcome);
+                ? new RaftNodeCore(rc, recovered, nodeRng.split())
+                : RaftNodeCore.withMutationsForTesting(rc, recovered, nodeRng.split(), cfg.mutations());
+        n.tracker.restart(recovered);
+        stateMachineSafety.onRestart(n.id);
+        n.stateMachine = new KvStateMachine();
+        NodeDriver.restoreFrom(recovered, n.stateMachine);   // the snapshot; the rest is re-applied from the log
+        n.driver = NodeDriver.create(core, n.trackedStorage, this::onSend, n.stateMachine, this::onOutcome, n.snapshotEvery);
         n.lastSoft = null;
         n.lastAppliedSeen = -1;
         trace.add(now, n.name(), "start #" + n.incarnation + " " + n.driver.status().hard());
@@ -192,10 +236,17 @@ public final class Simulation {
     }
 
     private void crash(SimNode n, String why) {
-        n.storage.crash();
+        countSnapshots(n);
+        n.disk.crash();
+        n.midWriteCrashArmed = false;
         n.driver = null;
         crashes++;
         trace.add(now, n.name(), "CRASH (" + why + ")");
+    }
+
+    private void countSnapshots(SimNode n) {
+        snapshotsTaken += n.driver.snapshotsTaken();
+        snapshotsInstalled += n.driver.snapshotsInstalled();
     }
 
     private void tick(SimNode n, int incarnation) {
@@ -209,7 +260,10 @@ public final class Simulation {
         try {
             n.driver.handle(event);
         } catch (NodeHaltedException e) {
+            if (n.midWriteCrashArmed) midWriteCrashes++;
             crash(n, "halted: " + e.getMessage());
+            FaultConfig f = cfg.faults();
+            at(now + between(faultRng, f.minDownMs(), f.maxDownMs()), () -> restart(n));
             return;
         }
         observe(n);
@@ -220,11 +274,13 @@ public final class Simulation {
         RaftStatus s = n.driver.status();
         NodeLogTracker.Change change = n.tracker.refresh(n.driver.log());
         electionSafety.observe(now, s);
-        if (cfg.checkVoteDurability()) voteDurability.observe(now, s);
+        if (cfg.checkDurability()) voteDurability.observe(now, s);
+        maxLogEntries = Math.max(maxLogEntries, n.driver.log().lastIndex() - n.driver.log().snapshotIndex());
         leaderAppendOnly.observe(now, s, n.tracker.lastIndex(), change.truncated());
         logMatching.observe(now, s.id(), n.driver.log(), n.tracker, change.fromIndex());
         stateMachineSafety.observe(now, s, n.driver.log());
         leaderCompleteness.observe(now, s, n.tracker);
+        durability.observeCommit(now, s, n.driver.log());
         if (s.lastApplied() != n.lastAppliedSeen) {
             replicaState.observe(now, s.id(), s.lastApplied(), n.stateMachine.stateHash());
             n.lastAppliedSeen = s.lastApplied();
@@ -322,7 +378,8 @@ public final class Simulation {
 
     private void injectFault() {
         FaultConfig f = cfg.faults();
-        switch (faultRng.nextInt(5)) {
+        int kind = f.crashLoop() && faultRng.nextInt(10) < 7 ? (faultRng.nextBoolean() ? 3 : 5) : faultRng.nextInt(6);
+        switch (kind) {
             case 0 -> partitionSymmetric();
             case 1 -> partitionOneWay();
             case 2 -> {
@@ -338,6 +395,13 @@ public final class Simulation {
                 n.pausedUntil = now + between(faultRng, f.minPauseMs(), f.maxPauseMs());
                 pauses++;
                 trace.add(now, n.name(), "PAUSE until " + n.pausedUntil + "ms");
+            });
+            case 5 -> randomUpNode().filter(n -> !n.midWriteCrashArmed).ifPresent(n -> {
+                // Crash during the node's next fsync: it dies with that batch written but not synced,
+                // so the disk keeps none, all or a torn prefix of it (SimDisk crash model).
+                n.disk.failNextFsync();
+                n.midWriteCrashArmed = true;
+                trace.add(now, n.name(), "ARM crash during next fsync");
             });
             default -> throw new IllegalStateException("unreachable");
         }
@@ -395,6 +459,10 @@ public final class Simulation {
         for (SimNode n : nodes) {
             n.pausedUntil = Math.min(n.pausedUntil, now);
             restart(n);
+            if (n.midWriteCrashArmed) {
+                n.disk.clearFailNextFsync();
+                n.midWriteCrashArmed = false;
+            }
         }
         trace.add(now, "sim", "END CHAOS: links healed, all nodes up and running");
     }

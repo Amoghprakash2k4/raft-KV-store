@@ -25,6 +25,7 @@ import com.projects.raftkv.core.NodeId;
 import com.projects.raftkv.core.PersistentState;
 import com.projects.raftkv.core.RaftConfig;
 import com.projects.raftkv.core.Role;
+import com.projects.raftkv.core.Snapshot;
 import com.projects.raftkv.storage.InMemoryStorage;
 import com.projects.raftkv.storage.Storage;
 import java.util.ArrayList;
@@ -99,6 +100,8 @@ class NodeDriverTest {
         StateMachine sm = new StateMachine() {
             @Override public Bytes apply(long index, Bytes command) { ops.add("apply " + index); return Bytes.EMPTY; }
             @Override public long lastAppliedIndex() { return 0; }
+            @Override public Bytes snapshot() { throw new UnsupportedOperationException(); }
+            @Override public void restore(long index, Bytes snapshot) { throw new UnsupportedOperationException(); }
         };
         NodeDriver d = NodeDriver.create(new ScriptedCore(ready(List.of(new PersistOp.AppendEntries(List.of(e))),
                 List.of(msg), List.of(e), List.of())), new RecordingStorage(ops), m -> ops.add("send"), sm, o -> {});
@@ -201,8 +204,81 @@ class NodeDriverTest {
         @Override public void saveHardState(HardState state) { ops.add("saveHardState"); }
         @Override public void append(List<LogEntry> entries) { ops.add("append"); }
         @Override public void truncateFrom(long fromIndex) { ops.add("truncateFrom"); }
+        @Override public void saveSnapshot(Snapshot snapshot) { ops.add("saveSnapshot@" + snapshot.index()); }
+        @Override public void compactLog(long index, long term) { ops.add("compactLog@" + index); }
         @Override public void sync() { ops.add("sync"); }
         @Override public PersistentState loadAll() { return PersistentState.EMPTY; }
     }
 
+
+    // ---------------------------------------------------------------- M3: snapshots
+
+    private static Message.AppendEntries appendFromLeader(long count, long leaderCommit) {
+        List<LogEntry> es = new ArrayList<>();
+        for (long i = 1; i <= count; i++) {
+            es.add(command(i, 1, KvCodec.encode(new KvRequest(1, i, new KvCommand.Put("k" + i, "v" + i)))));
+        }
+        return new Message.AppendEntries(new NodeId(2), N1, 1, 0, 0, es, leaderCommit);
+    }
+
+    /** M3-E: the snapshot is durable before the compaction record that depends on it is written. */
+    @Test
+    void takesASnapshotEveryNAppliedEntriesAndSavesItBeforeCompacting() {
+        List<String> ops = new ArrayList<>();
+        KvStateMachine sm = new KvStateMachine();
+        NodeDriver d = NodeDriver.recover(CONFIG, new RecordingStorage(ops), m -> {}, sm, o -> {}, new SplittableRandom(1), 3);
+
+        d.handle(new Event.MessageReceived(appendFromLeader(5, 4)));
+
+        assertThat(ops).containsSubsequence("append", "sync", "saveSnapshot@4", "compactLog@4", "sync");
+        assertThat(ops.indexOf("saveSnapshot@4")).isLessThan(ops.indexOf("compactLog@4"));
+        assertThat(d.log().snapshotIndex()).isEqualTo(4);
+        assertThat(d.snapshotsTaken()).isEqualTo(1);
+    }
+
+    @Test
+    void aNodeRecoversItsStateMachineFromTheSnapshot() {
+        InMemoryStorage storage = new InMemoryStorage();
+        NodeDriver first = NodeDriver.recover(CONFIG, storage, m -> {}, new KvStateMachine(), o -> {}, new SplittableRandom(1), 3);
+        first.handle(new Event.MessageReceived(appendFromLeader(5, 5)));
+        storage.crash();
+
+        KvStateMachine sm = new KvStateMachine();
+        NodeDriver second = NodeDriver.recover(CONFIG, storage, m -> {}, sm, o -> {}, new SplittableRandom(1), 3);
+
+        assertThat(second.log().snapshotIndex()).isEqualTo(5);
+        assertThat(second.status().lastApplied()).isEqualTo(5);
+        assertThat(sm.view()).containsEntry("k1", "v1").containsEntry("k5", "v5");
+    }
+
+    @Test
+    void anInstalledSnapshotReplacesTheStateMachine() {
+        KvStateMachine leaderState = new KvStateMachine();
+        leaderState.apply(1, KvCodec.encode(new KvRequest(1, 1, new KvCommand.Put("x", "from leader"))));
+        Snapshot s = new Snapshot(9, 1, leaderState.snapshot());
+        KvStateMachine sm = new KvStateMachine();
+        NodeDriver d = NodeDriver.recover(CONFIG, new InMemoryStorage(), m -> {}, sm, o -> {}, new SplittableRandom(1), 0);
+
+        d.handle(new Event.MessageReceived(new Message.InstallSnapshot(new NodeId(2), N1, 1, 9, 1, 0, s.data(), true)));
+
+        assertThat(sm.view()).containsExactlyEntriesOf(java.util.Map.of("x", "from leader"));
+        assertThat(sm.lastAppliedIndex()).isEqualTo(9);
+        assertThat(d.snapshotsInstalled()).isEqualTo(1);
+    }
+
+    @Test
+    void proposalsCoveredByAnInstalledSnapshotEndAsUnknown() {
+        List<ProposalOutcome> outcomes = new ArrayList<>();
+        KvStateMachine sm = new KvStateMachine();
+        Ready accepted = ready(List.of(), List.of(), List.of(), List.of(new ClientNotice.ProposalAccepted(7, 3, 1)));
+        Ready install = new Ready(List.of(), List.of(), List.of(), List.of(), Optional.empty(),
+                Optional.of(new Snapshot(5, 2, new KvStateMachine().snapshot())));
+        NodeDriver d = NodeDriver.create(new ScriptedCore(accepted, install), new InMemoryStorage(), m -> {}, sm, outcomes::add);
+
+        d.handle(new Event.Tick());
+        d.handle(new Event.Tick());
+
+        assertThat(outcomes).containsExactly(new ProposalOutcome.Unknown(7, 3));
+        assertThat(d.pendingProposals()).isZero();
+    }
 }

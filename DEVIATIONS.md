@@ -26,10 +26,19 @@ AppendEntries are handled). `grep -rnE "M1 only|arrives? in M2" raft-*/src/main`
 | # | What | Why it is acceptable now | Revisit |
 |---|------|--------------------------|---------|
 | H1 | Simulated client requests reach nodes over a reliable 1–5 ms channel (no drops or duplicates); only node crashes and pauses affect them. Outcomes are delivered back directly. | M2 checks replica agreement, not client-observed behaviour. Lossy client links only matter together with retries and dedup. | M4 (sessions, retries, linearizability checker) |
-| H2 | `RaftNodeCore.withMutationsForTesting` puts three test-only `if`s into production code (DESIGN.md M2-C). | The public constructor always uses no mutations; each `if` is marked `// MUTATION (test only)`. | Kept |
+| H2 | `RaftNodeCore.withMutationsForTesting` puts test-only `if`s into production code (DESIGN.md M2-C), now four; `WalOptions`/`StorageMutation` add two in storage (M3-F). | Production paths always use no mutations; each `if` is marked `// MUTATION (test only)`. | Kept |
+| H3 | `SimDisk` models one directory, whole-byte torn writes and a simple page cache; no reordering of writes *within* a file beyond "a prefix survives". | Matches what ext4/xfs with `data=ordered` give for appends; the WAL relies only on prefix survival plus CRCs. | M5 (real `kill -9` on Docker) |
+
+## Durability limits (M3)
+
+| # | What | Why it is acceptable now | Revisit |
+|---|------|--------------------------|---------|
+| S1 | On macOS, `FileChannel.force` is `fsync(2)`, which doesn't flush the drive's write cache (`F_FULLFSYNC` does), and `RealDisk.fsyncDir` silently does nothing if the directory can't be opened as a channel. | Linux in Docker is the deployment target; the simulator tests the protocol's use of fsync independently. | M5 |
+| S2 | Memory: the core holds the latest snapshot's bytes (M3-C), and `FileWalStorage` keeps its own copy of the log after the base (`LogImage`, for checkpoints). | The KV store lives in RAM anyway; both copies are bounded by snapshotting. | Kept (a production system would stream snapshots from disk) |
+| S3 | Serializing a snapshot runs on the driver thread and blocks the event loop. | Fine at this size; etcd/TiKV use copy-on-write state and background snapshots. | Later, if measured to matter |
+| S4 | `ProposalOutcome.Unknown`: a pending proposal covered by an installed snapshot can't be resolved, and the client must retry. | Retries become safe with M4 sessions and dedup. | M4 |
 
 ## Open (to decide at the named milestone)
 
-- **M3:** replace the `SnapshotInstalled` event with `SnapshotCreated` (local compaction); decide where snapshot bytes live and whether InstallSnapshot is chunked.
 - **M5:** `compose.yaml` is written but can't run yet. The node `main` and `raft-node/Dockerfile` must honour its env contract (`RAFT_NODE_ID`, `RAFT_PEERS`, `RAFT_PEER_PORT`, `RAFT_CLIENT_PORT`, `RAFT_DATA_DIR`).
 - **M4:** client sessions never expire (unbounded table) vs. deterministic expiry (thesis §6.3).

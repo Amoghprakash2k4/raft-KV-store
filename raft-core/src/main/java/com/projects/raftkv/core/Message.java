@@ -1,6 +1,7 @@
 package com.projects.raftkv.core;
 
 import java.util.List;
+import java.util.Objects;
 
 /** Peer-to-peer RPCs. Requests and responses are separate one-way messages (no RPC futures in the core). */
 public sealed interface Message {
@@ -42,6 +43,32 @@ public sealed interface Message {
         public AppendEntriesResponse {
             if (matchIndex < 0 || rejectedIndex < 0 || conflictTerm < 0 || conflictIndex < 0)
                 throw new IllegalArgumentException("negative index or term");
+        }
+    }
+
+    /**
+     * Figure 13 InstallSnapshot arguments (§7): one chunk of the leader's snapshot through
+     * (lastIncludedIndex, lastIncludedTerm), starting at byte {@code offset}. leaderId == from.
+     */
+    record InstallSnapshot(NodeId from, NodeId to, long term, long lastIncludedIndex, long lastIncludedTerm,
+                           long offset, Bytes data, boolean done) implements Message {
+        public InstallSnapshot {
+            Objects.requireNonNull(data);
+            if (lastIncludedIndex < 1 || lastIncludedTerm < 1 || offset < 0)
+                throw new IllegalArgumentException("bad InstallSnapshot header");
+        }
+    }
+
+    /**
+     * Figure 13 InstallSnapshot results (just {@code term} in the paper), plus what the leader needs
+     * with one chunk in flight (DESIGN.md M3-D): which snapshot this answers, how many bytes of it the
+     * follower holds ({@code nextOffset}: send from there), and {@code done} once it is installed, or
+     * was not needed because the follower had already committed past it.
+     */
+    record InstallSnapshotResponse(NodeId from, NodeId to, long term, long lastIncludedIndex, long nextOffset,
+                                   boolean done) implements Message {
+        public InstallSnapshotResponse {
+            if (lastIncludedIndex < 0 || nextOffset < 0) throw new IllegalArgumentException("negative field");
         }
     }
 }

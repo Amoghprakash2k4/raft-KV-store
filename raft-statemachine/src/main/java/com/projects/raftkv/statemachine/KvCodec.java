@@ -13,6 +13,9 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.SortedMap;
+import java.util.Map;
 
 /**
  * Hand-written binary codec (DESIGN.md M2-B). Layout, big-endian:
@@ -96,6 +99,44 @@ public final class KvCodec {
                 case INVALID -> new KvResult.Invalid(readString(in));
                 default -> throw new IllegalArgumentException("unknown result tag " + tag);
             };
+        });
+    }
+
+    // ---------------------------------------------------------------- snapshots
+
+    /**
+     * Snapshot of the whole map: {@code version u8, count i32, (key, value)*} with keys in strictly
+     * ascending order, so equal maps encode to identical bytes.
+     */
+    public static Bytes encodeSnapshot(SortedMap<String, String> data) {
+        if (data.comparator() != null) throw new IllegalArgumentException("natural key order required");
+        return write(out -> {
+            out.writeByte(VERSION);
+            out.writeInt(data.size());
+            for (Map.Entry<String, String> e : data.entrySet()) {
+                writeString(out, e.getKey());
+                writeString(out, e.getValue());
+            }
+        });
+    }
+
+    /** Strict inverse of {@link #encodeSnapshot}: rejects anything that is not exactly canonical. */
+    public static TreeMap<String, String> decodeSnapshot(Bytes b) {
+        return read(b, in -> {
+            readVersion(in);
+            int n = in.readInt();
+            if (n < 0 || n > in.available()) throw new IllegalArgumentException("bad entry count " + n);
+            TreeMap<String, String> m = new TreeMap<>();
+            String prev = null;
+            for (int i = 0; i < n; i++) {
+                String k = readString(in);
+                String v = readString(in);
+                if (prev != null && prev.compareTo(k) >= 0)
+                    throw new IllegalArgumentException("snapshot keys out of order: " + prev + " then " + k);
+                m.put(k, v);
+                prev = k;
+            }
+            return m;
         });
     }
 

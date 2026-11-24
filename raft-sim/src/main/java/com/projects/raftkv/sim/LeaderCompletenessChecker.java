@@ -60,4 +60,11 @@ public final class LeaderCompletenessChecker {
     }
 
     public int committedEntries() { return committed.size(); }
+
+    /** Prefix hash of committed index i, as first reported (seeds the trackers of installed snapshots). */
+    long committedHashAt(long index) {
+        if (index < 1 || index > committed.size())
+            throw new IllegalStateException("index " + index + " is not known to be committed (" + committed.size() + " are)");
+        return committed.get((int) index - 1).prefixHash();
+    }
 }

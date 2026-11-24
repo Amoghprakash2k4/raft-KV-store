@@ -16,6 +16,19 @@ public interface StateMachine {
     /** Applies the command committed at {@code index} and returns the encoded result for the client. */
     Bytes apply(long index, Bytes command);
 
-    /** The index of the last command applied (0 if none). */
+    /** The index of the last entry applied, or of the snapshot restored (0 if none). */
     long lastAppliedIndex();
+
+    /**
+     * The whole current state in a canonical encoding: equal states give byte-identical snapshots, so
+     * a snapshot depends only on the applied prefix of the log (DESIGN.md E1a rule 4, M3-E).
+     */
+    Bytes snapshot();
+
+    /**
+     * Replaces the whole state with {@code snapshot}, taken after applying index {@code index}
+     * (Figure 13 step 8, or recovery). The next apply must be for an index above {@code index}.
+     * @throws IllegalArgumentException if the bytes are not a valid snapshot
+     */
+    void restore(long index, Bytes snapshot);
 }

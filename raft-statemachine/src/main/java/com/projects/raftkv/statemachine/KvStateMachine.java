@@ -10,12 +10,12 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 
 /**
- * The key-value store. A TreeMap keeps iteration order sorted, so the state hash (and M3's snapshot
- * bytes) depend only on contents, never on insertion history (DESIGN.md E1a rule 4).
+ * The key-value store. A TreeMap keeps iteration order sorted, so the state hash and the snapshot
+ * bytes depend only on contents, never on insertion history (DESIGN.md E1a rule 4).
  * M4 adds the client session table for exactly-once semantics.
  */
 public final class KvStateMachine implements StateMachine {
-    private final TreeMap<String, String> data = new TreeMap<>();
+    private TreeMap<String, String> data = new TreeMap<>();
     private long lastApplied;
 
     @Override
@@ -49,6 +49,16 @@ public final class KvStateMachine implements StateMachine {
 
     @Override
     public long lastAppliedIndex() { return lastApplied; }
+
+    @Override
+    public Bytes snapshot() { return KvCodec.encodeSnapshot(data); }
+
+    @Override
+    public void restore(long index, Bytes snapshot) {
+        if (index < 0) throw new IllegalArgumentException("negative snapshot index");
+        data = KvCodec.decodeSnapshot(snapshot);
+        lastApplied = index;
+    }
 
     /** Read-only, sorted view of the contents (tests and the simulator). */
     public SortedMap<String, String> view() { return Collections.unmodifiableSortedMap(data); }

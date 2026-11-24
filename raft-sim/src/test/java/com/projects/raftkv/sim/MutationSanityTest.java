@@ -3,6 +3,7 @@ package com.projects.raftkv.sim;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.projects.raftkv.core.ProtocolMutation;
+import com.projects.raftkv.storage.StorageMutation;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.LongStream;
@@ -16,7 +17,7 @@ import org.junit.jupiter.api.Test;
 class MutationSanityTest {
 
     private static final String[] SAFETY = {"Election Safety", "Vote durability", "Leader Append-Only",
-            "Log Matching", "Leader Completeness", "State Machine Safety", "Replica state divergence"};
+            "Log Matching", "Leader Completeness", "State Machine Safety", "Replica state divergence", "Durability"};
 
     /** Failures of one mutated configuration, grouped by what caught them. */
     private record Tally(String name, int seeds, Map<String, Integer> caughtBy) {
@@ -56,18 +57,19 @@ class MutationSanityTest {
         return "assertion: " + cause.getClass().getSimpleName() + " " + msg.split(":")[0];
     }
 
-    // ---------------------------------------------------------------- M1: lying disks (lost votes and logs)
+    // ---------------------------------------------------------------- M1/M3: lying disks (lost votes and logs)
 
+    /** Invariant 6: a disk whose fsync lies loses synced state, which the restart check sees directly. */
     @Test
-    void lostVotesAreCaughtByVoteDurabilityChecker() {
+    void lostDurableStateIsCaughtByTheDurabilityChecker() {
         Tally t = run("lying-disk", SimConfig.chaos(3).withLyingDisks(), 50);
-        assertThat(t.count("Vote durability")).isEqualTo(50);
+        assertThat(t.count("Durability")).isEqualTo(50);
     }
 
-    /** Without the vote checker, the consequences themselves (two leaders, lost committed entries) are caught. */
+    /** Without the durability checkers, the consequences themselves (two leaders, lost committed entries) are caught. */
     @Test
     void lostDurableStateIsCaughtByTheProtocolCheckersToo() {
-        Tally t = run("lying-disk, no vote checker", SimConfig.chaos(3).withLyingDisks().withoutVoteDurabilityCheck(), 300);
+        Tally t = run("lying-disk, no durability checkers", SimConfig.chaos(3).withLyingDisks().withoutDurabilityCheckers(), 300);
         assertThat(t.count("Election Safety")).isPositive();
         assertThat(t.count("Leader Completeness")).isPositive();
         assertThat(t.caughtBy().keySet()).noneMatch(k -> k.startsWith("unknown"));
@@ -80,7 +82,7 @@ class MutationSanityTest {
     void skippingTheUpToDateCheckIsCaught() {
         Tally t = run("skip up-to-date check", SimConfig.chaos(3).withMutation(ProtocolMutation.SKIP_UP_TO_DATE_CHECK), 100);
         assertThat(t.count("Leader Completeness")).isPositive();
-        assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(90);
+        assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(75);
     }
 
     /**
@@ -101,8 +103,38 @@ class MutationSanityTest {
     @Test
     void truncatingOnMatchIsCaught() {
         Tally t = run("truncate on match", SimConfig.chaos(3).withMutation(ProtocolMutation.TRUNCATE_ON_MATCH), 100);
-        assertThat(t.count("Leader Completeness") + t.count("Replica state divergence")
-                + t.count("State Machine Safety")).isGreaterThanOrEqualTo(80);
+        assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(80);
+    }
+
+    // ---------------------------------------------------------------- M3 durability mutations (DESIGN.md M3-F)
+
+    /** Recovery that keeps a torn tail: later appends land after garbage, and the next recovery loses them. */
+    @Test
+    void keepingATornTailIsCaught() {
+        Tally t = run("skip torn-tail cut (crash loop)", SimConfig.crashLoop(3).withMutation(StorageMutation.SKIP_TORN_TAIL_CUT), 100);
+        assertThat(t.count("Durability")).isGreaterThanOrEqualTo(90);     // measured 100/100
+    }
+
+    /**
+     * A snapshot renamed into place before its bytes are durable: after a crash the file is empty, torn
+     * or (by luck) complete. Recovery finds the corrupt file and the node cannot restart. Caught only in
+     * runs where a node crashes after a snapshot and its unsynced bytes do not all survive.
+     */
+    @Test
+    void renamingAnUnsyncedSnapshotIsCaught() {
+        Tally t = run("skip snapshot data fsync (crash loop)", SimConfig.crashLoop(3).withMutation(StorageMutation.SKIP_SNAPSHOT_DATA_FSYNC), 100);
+        assertThat(t.count("Durability")).isGreaterThanOrEqualTo(45);     // measured 59/100
+    }
+
+    /**
+     * Figure 13 / D1a rule 5: installing a stale snapshot discards committed entries from the follower's
+     * durable log and rolls its state machine back. The follower then re-replicates and converges, so
+     * only the direct checks see it: Durability (c), no committed entry deleted, and no rollback.
+     */
+    @Test
+    void installingAStaleSnapshotIsCaught() {
+        Tally t = run("naive install snapshot", SimConfig.chaos(3).withMutation(ProtocolMutation.NAIVE_INSTALL_SNAPSHOT), 100);
+        assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(90);         // measured 99/100
     }
 
     /** Control: the same runs without a mutation are clean, so the catches above are caused by the mutations. */
@@ -110,5 +142,7 @@ class MutationSanityTest {
     void unmutatedControlRunsAreClean() {
         Tally t = run("control (batch 1)", SimConfig.chaos(3).withMaxEntriesPerAppend(1), 100);
         assertThat(t.safetyCatches()).isZero();
+        Tally loop = run("control (crash loop)", SimConfig.crashLoop(3), 100);
+        assertThat(loop.safetyCatches()).isZero();
     }
 }

@@ -12,12 +12,15 @@ import com.projects.raftkv.core.RaftConfig;
 import com.projects.raftkv.core.RaftCore;
 import com.projects.raftkv.core.RaftNodeCore;
 import com.projects.raftkv.core.RaftStatus;
+import com.projects.raftkv.core.PersistentState;
 import com.projects.raftkv.core.Ready;
+import com.projects.raftkv.core.Snapshot;
 import com.projects.raftkv.statemachine.StateMachine;
 import com.projects.raftkv.storage.Storage;
 import com.projects.raftkv.storage.StorageException;
 import com.projects.raftkv.transport.Transport;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -25,7 +28,8 @@ import java.util.random.RandomGenerator;
 
 /**
  * Executes the core's effects in the order required by DESIGN.md E1:
- * persist all ops, fsync, send messages, apply committed entries, then report client outcomes.
+ * persist all ops, fsync, send messages, apply committed entries (or restore an installed snapshot),
+ * then report client outcomes. Between two events it may take a snapshot (DESIGN.md M3-E).
  *
  * <p>Synchronous and not thread-safe: exactly one thread calls {@link #handle}. The simulator calls it
  * directly; the real node (M5) wraps it in a single-threaded event loop with an inbound queue.
@@ -40,34 +44,67 @@ public final class NodeDriver {
     private final Transport transport;
     private final StateMachine stateMachine;
     private final Consumer<ProposalOutcome> outcomes;
+    /** Production default for M3-E: snapshot once this many entries were applied since the last one. */
+    public static final long DEFAULT_SNAPSHOT_EVERY = 10_000;
+
     private final Map<Long, Pending> pendingByIndex = new HashMap<>();
+    private final long snapshotEvery;
     private boolean halted;
+    private long snapshotsTaken;
+    private long snapshotsInstalled;
 
     private NodeDriver(RaftCore core, Storage storage, Transport transport, StateMachine stateMachine,
-                       Consumer<ProposalOutcome> outcomes) {
+                       Consumer<ProposalOutcome> outcomes, long snapshotEvery) {
         this.core = Objects.requireNonNull(core);
         this.storage = Objects.requireNonNull(storage);
         this.transport = Objects.requireNonNull(transport);
         this.stateMachine = Objects.requireNonNull(stateMachine);
         this.outcomes = Objects.requireNonNull(outcomes);
+        if (snapshotEvery < 0) throw new IllegalArgumentException("snapshotEvery < 0");
+        this.snapshotEvery = snapshotEvery;
     }
 
     /**
      * Builds a node from whatever is durable in {@code storage} (fresh start or crash recovery).
-     * {@code stateMachine} must be empty: it is rebuilt by re-applying the committed log (M3 adds
-     * snapshots).
+     * {@code stateMachine} must be empty: it is restored from the snapshot, if any, and the committed
+     * entries after it are re-applied as the node learns its commit index again.
      */
     public static NodeDriver recover(RaftConfig config, Storage storage, Transport transport,
                                      StateMachine stateMachine, Consumer<ProposalOutcome> outcomes,
-                                     RandomGenerator rng) {
-        RaftCore core = new RaftNodeCore(config, storage.loadAll(), rng);
-        return new NodeDriver(core, storage, transport, stateMachine, outcomes);
+                                     RandomGenerator rng, long snapshotEvery) {
+        PersistentState state = storage.loadAll();
+        restoreFrom(state, stateMachine);
+        RaftCore core = new RaftNodeCore(config, state, rng);
+        return new NodeDriver(core, storage, transport, stateMachine, outcomes, snapshotEvery);
     }
 
-    /** Wraps an already-built core (the simulator's mutation runs, and driver tests). */
+    public static NodeDriver recover(RaftConfig config, Storage storage, Transport transport,
+                                     StateMachine stateMachine, Consumer<ProposalOutcome> outcomes,
+                                     RandomGenerator rng) {
+        return recover(config, storage, transport, stateMachine, outcomes, rng, DEFAULT_SNAPSHOT_EVERY);
+    }
+
+    /** Puts the recovered snapshot (if any) into an empty state machine, before the core is built from the same state. */
+    public static void restoreFrom(PersistentState state, StateMachine stateMachine) {
+        if (stateMachine.lastAppliedIndex() != 0) throw new IllegalArgumentException("state machine is not empty");
+        state.snapshot().ifPresent(s -> stateMachine.restore(s.index(), s.data()));
+    }
+
+    /**
+     * Wraps an already-built core (the simulator, and driver tests). The caller has restored
+     * {@code stateMachine} from the same recovered state ({@link #restoreFrom}). {@code snapshotEvery}
+     * 0 never snapshots.
+     */
+    public static NodeDriver create(RaftCore core, Storage storage, Transport transport,
+                                    StateMachine stateMachine, Consumer<ProposalOutcome> outcomes,
+                                    long snapshotEvery) {
+        return new NodeDriver(core, storage, transport, stateMachine, outcomes, snapshotEvery);
+    }
+
+    /** As above, without snapshots. */
     public static NodeDriver create(RaftCore core, Storage storage, Transport transport,
                                     StateMachine stateMachine, Consumer<ProposalOutcome> outcomes) {
-        return new NodeDriver(core, storage, transport, stateMachine, outcomes);
+        return create(core, storage, transport, stateMachine, outcomes, 0);
     }
 
     public void handle(Event event) {
@@ -92,7 +129,8 @@ public final class NodeDriver {
         for (ClientNotice n : ready.notices()) {
             if (n instanceof ClientNotice.ProposalAccepted a) track(a);
         }
-        // 3. Apply, in index order.
+        // 3. Apply: an installed snapshot first (it replaces the state), then entries in index order.
+        ready.snapshotToRestore().ifPresent(this::restore);
         for (LogEntry e : ready.toApply()) {
             apply(e);
         }
@@ -105,9 +143,52 @@ public final class NodeDriver {
                 case ClientNotice.ReadRejected r -> throw new IllegalStateException("ReadIndex arrives in M4: " + r);
             }
         }
+        // Between two events: maybe take a snapshot.
+        maybeSnapshot();
+    }
+
+    /**
+     * DESIGN.md M3-E: once snapshotEvery entries were applied since the last snapshot, serialize the state
+     * machine, which is exactly at lastApplied now (E1a rule 5), save it durably, and only then tell the
+     * core, whose compaction record must never reach the disk before the snapshot it depends on.
+     */
+    private void maybeSnapshot() {
+        if (snapshotEvery == 0) return;
+        long applied = core.status().lastApplied();
+        if (applied - core.log().snapshotIndex() < snapshotEvery) return;
+        long term = core.log().termAt(applied).orElseThrow();
+        Snapshot s = new Snapshot(applied, term, stateMachine.snapshot());
+        try {
+            storage.saveSnapshot(s);
+        } catch (StorageException e) {
+            halted = true;
+            throw new NodeHaltedException("saving a snapshot failed; halting", e);
+        }
+        snapshotsTaken++;
+        handle(new Event.SnapshotCreated(s.index(), s.term(), s.data()));
+    }
+
+    /**
+     * Figure 13 step 8: reset the state machine from the leader's snapshot. Proposals waiting on an index
+     * the snapshot covers can no longer be matched to an applied entry, so their outcome is unknown.
+     */
+    private void restore(Snapshot s) {
+        stateMachine.restore(s.index(), s.data());
+        snapshotsInstalled++;
+        for (Iterator<Map.Entry<Long, Pending>> it = pendingByIndex.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<Long, Pending> p = it.next();
+            if (p.getKey() <= s.index()) {
+                it.remove();
+                outcomes.accept(new ProposalOutcome.Unknown(p.getValue().proposalId(), p.getKey()));
+            }
+        }
     }
 
     public boolean isHalted() { return halted; }
+
+    public long snapshotsTaken() { return snapshotsTaken; }
+
+    public long snapshotsInstalled() { return snapshotsInstalled; }
 
     public RaftStatus status() { return core.status(); }
 
@@ -149,6 +230,11 @@ public final class NodeDriver {
             case PersistOp.SaveHardState s -> storage.saveHardState(s.state());
             case PersistOp.TruncateSuffix t -> storage.truncateFrom(t.fromIndex());
             case PersistOp.AppendEntries a -> storage.append(a.entries());
+            case PersistOp.CompactLog c -> storage.compactLog(c.index(), c.term());
+            case PersistOp.InstallSnapshot is -> {
+                storage.saveSnapshot(is.snapshot());              // durable first ...
+                storage.compactLog(is.snapshot().index(), is.snapshot().term());   // ... then the log moves onto it
+            }
         }
     }
 }

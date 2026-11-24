@@ -24,4 +24,11 @@ public sealed interface ProposalOutcome {
      * overwrote it (thesis §6.3). Definitely not applied, so retrying is safe.
      */
     record Lost(long proposalId, long index) implements ProposalOutcome {}
+
+    /**
+     * The entry was placed at {@code index}, and this node then replaced its state with a leader's
+     * snapshot covering that index (Figure 13). The snapshot does not say which entry was committed
+     * there, so the outcome is unknown: the client must retry, which is safe only with M4's sessions.
+     */
+    record Unknown(long proposalId, long index) implements ProposalOutcome {}
 }

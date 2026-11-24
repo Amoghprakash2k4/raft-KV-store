@@ -16,9 +16,12 @@ public final class LogMatchingChecker {
 
     private final Map<Key, Seen> seen = new HashMap<>();
 
-    /** Registers this node's entries from {@code fromIndex} to its last index (the ones that changed). */
+    /**
+     * Registers this node's entries from {@code fromIndex} to its last index (the ones that changed).
+     * Entries inside its snapshot are committed and were registered when the node or the leader held them.
+     */
     void observe(long now, NodeId node, LogView log, NodeLogTracker tracker, long fromIndex) {
-        for (long i = fromIndex; i <= tracker.lastIndex(); i++) {
+        for (long i = Math.max(fromIndex, log.snapshotIndex() + 1); i <= tracker.lastIndex(); i++) {
             Key k = new Key(i, log.termAt(i).getAsLong());
             long h = tracker.hashAt(i);
             Seen first = seen.putIfAbsent(k, new Seen(h, node, now));

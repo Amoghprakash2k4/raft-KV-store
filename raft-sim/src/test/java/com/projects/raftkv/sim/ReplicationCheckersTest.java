@@ -76,8 +76,18 @@ class ReplicationCheckersTest {
     void stateMachineSafetyHandlesRestarts() {
         StateMachineSafetyChecker c = new StateMachineSafetyChecker();
         c.observe(0, status(1, Role.FOLLOWER, 2, 2, 2), log("x", 1, 1));
+        c.onRestart(N1);
         c.observe(1, status(1, Role.FOLLOWER, 2, 0, 0), log("x", 1, 1));
         assertThatCode(() -> c.observe(2, status(1, Role.FOLLOWER, 2, 2, 2), log("x", 1, 1))).doesNotThrowAnyException();
+    }
+
+    /** M3: within one incarnation the applied state never goes back (a stale snapshot install would). */
+    @Test
+    void stateMachineSafetyRejectsARollbackWithoutARestart() {
+        StateMachineSafetyChecker c = new StateMachineSafetyChecker();
+        c.observe(0, status(1, Role.FOLLOWER, 2, 2, 2), log("x", 1, 1));
+        assertThatThrownBy(() -> c.observe(1, status(1, Role.FOLLOWER, 2, 1, 1), log("x", 1, 1)))
+                .isInstanceOf(InvariantViolation.class).hasMessageContaining("rolled");
     }
 
     @Test
@@ -134,7 +144,7 @@ class ReplicationCheckersTest {
         l.entries.remove(2);
         l.entries.add(log("y", 1, 1, 3).entries.get(2));
         t.onTruncate(3);
-        t.onAppend(3);
+        t.onAppend(java.util.List.of(l.entries.get(2)));
 
         NodeLogTracker.Change ch = t.refresh(l);
 
@@ -142,5 +152,34 @@ class ReplicationCheckersTest {
         assertThat(ch.truncated()).isTrue();
         assertThat(t.hashAt(2)).isEqualTo(h2);
         assertThat(t.hashAt(3)).isNotEqualTo(tracked(log("x", 1, 1, 2)).hashAt(3));
+    }
+
+    /** M3: hashes are computed when entries are written, so compaction and restarts do not lose them. */
+    @Test
+    void trackerKeepsHashesBelowTheSnapshotAcrossARestart() {
+        ListLog l = log("x", 1, 1, 2, 2);
+        NodeLogTracker t = tracked(l);
+        long h3 = t.hashAt(3);
+        t.onRebase(3, 2);                                       // local compaction: (3, 2) is in the log
+        t.restart(new com.projects.raftkv.core.PersistentState(
+                new com.projects.raftkv.core.HardState(2, java.util.Optional.empty()),
+                java.util.Optional.of(new com.projects.raftkv.core.Snapshot(3, 2, com.projects.raftkv.core.Bytes.EMPTY)),
+                java.util.List.of(l.entries.get(3))));
+        assertThat(t.lastIndex()).isEqualTo(4);
+        assertThat(t.hashAt(3)).isEqualTo(h3);
+        assertThat(t.hashAt(4)).isEqualTo(tracked(l).hashAt(4));
+    }
+
+    /** An installed snapshot replaces a divergent log: prefix hashes come from the committed registry. */
+    @Test
+    void trackerSeedsAnInstalledSnapshotFromTheCommittedRegistry() {
+        ListLog committed = log("x", 1, 1, 2);
+        NodeLogTracker leader = tracked(committed);
+        NodeLogTracker t = new NodeLogTracker(leader::hashAt);
+        t.onAppend(log("y", 1, 1).entries);                    // a divergent, uncommitted log
+        t.onRebase(3, 2);                                       // install the leader's snapshot through (3, 2)
+        assertThat(t.lastIndex()).isEqualTo(3);
+        assertThat(t.hashAt(3)).isEqualTo(leader.hashAt(3));
+        assertThat(t.hashAt(1)).isEqualTo(leader.hashAt(1));
     }
 }

@@ -3,51 +3,61 @@ package com.projects.raftkv.storage;
 import com.projects.raftkv.core.HardState;
 import com.projects.raftkv.core.LogEntry;
 import com.projects.raftkv.core.PersistentState;
+import com.projects.raftkv.core.Snapshot;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Consumer;
 
 /**
- * Storage for simulation. Keeps a "working" copy (written, not yet synced) and a "durable" copy.
- * {@link #crash()} discards the working copy, modelling a power loss with only fsynced data on disk.
+ * Storage for unit tests. Keeps a "working" image (written, not yet synced) and a "durable" one.
+ * {@link #crash()} discards the working image, modelling a power loss with only fsynced data on disk.
+ * Snapshots are durable as soon as they are saved, as {@link Storage#saveSnapshot} requires.
  * Fault hooks: {@link #failNextSync()} and {@link #setFsyncIsNoop(boolean)} (a disk whose fsync lies).
  */
 public final class InMemoryStorage implements Storage {
 
-    private HardState workingHardState = HardState.INITIAL;
-    private final List<LogEntry> workingEntries = new ArrayList<>();
-
-    private HardState durableHardState = HardState.INITIAL;
-    private final List<LogEntry> durableEntries = new ArrayList<>();
-    // Log writes since the last sync, replayed onto the durable copy at sync: O(changes), not O(log).
-    private final List<Runnable> unsyncedLogWrites = new ArrayList<>();
+    private LogImage working = new LogImage();
+    private final LogImage durable = new LogImage();
+    // Writes since the last sync, replayed onto the durable image at sync: O(changes), not O(log).
+    private final List<Consumer<LogImage>> unsynced = new ArrayList<>();
+    private Optional<Snapshot> snapshot = Optional.empty();
 
     private boolean failNextSync;
     private boolean fsyncIsNoop;
 
     @Override
     public void saveHardState(HardState state) {
-        workingHardState = Objects.requireNonNull(state);
+        Objects.requireNonNull(state);
+        record(img -> img.saveHardState(state));
     }
 
     @Override
     public void append(List<LogEntry> entries) {
-        for (LogEntry e : entries) {
-            long expected = workingEntries.size() + 1L;
-            if (e.index() != expected)
-                throw new IllegalStateException("non-contiguous append: expected " + expected + ", got " + e);
-            workingEntries.add(e);
-        }
         List<LogEntry> copy = List.copyOf(entries);
-        unsyncedLogWrites.add(() -> durableEntries.addAll(copy));
+        record(img -> img.append(copy));
     }
 
     @Override
     public void truncateFrom(long fromIndex) {
-        if (fromIndex < 1 || fromIndex > workingEntries.size() + 1L)
-            throw new IllegalStateException("truncateFrom " + fromIndex + " outside [1, " + (workingEntries.size() + 1) + "]");
-        workingEntries.subList((int) (fromIndex - 1), workingEntries.size()).clear();
-        unsyncedLogWrites.add(() -> durableEntries.subList((int) (fromIndex - 1), durableEntries.size()).clear());
+        record(img -> img.truncateFrom(fromIndex));
+    }
+
+    @Override
+    public void saveSnapshot(Snapshot s) {
+        snapshot = Optional.of(Objects.requireNonNull(s));
+    }
+
+    @Override
+    public void compactLog(long index, long term) {
+        record(img -> img.rebase(index, term));
+    }
+
+    /** Applies the write to the working image now (so invalid writes fail at once) and queues it for sync. */
+    private void record(Consumer<LogImage> write) {
+        write.accept(working);
+        unsynced.add(write);
     }
 
     @Override
@@ -57,22 +67,26 @@ public final class InMemoryStorage implements Storage {
             throw new StorageException("injected fsync failure");
         }
         if (fsyncIsNoop) return;
-        durableHardState = workingHardState;
-        for (Runnable w : unsyncedLogWrites) w.run();
-        unsyncedLogWrites.clear();
+        for (Consumer<LogImage> w : unsynced) w.accept(durable);
+        unsynced.clear();
     }
 
     @Override
     public PersistentState loadAll() {
-        return new PersistentState(durableHardState, durableEntries);
+        LogImage img = durable.copy();
+        try {
+            img.alignWith(snapshot);
+        } catch (IllegalStateException e) {
+            throw new StorageException("inconsistent storage: " + e.getMessage(), e);
+        }
+        return img.toPersistentState(snapshot);
     }
 
     /** Power loss: everything not fsynced is gone. */
     public void crash() {
-        workingHardState = durableHardState;
-        workingEntries.clear();
-        workingEntries.addAll(durableEntries);
-        unsyncedLogWrites.clear();
+        durable.alignWith(snapshot);
+        working = durable.copy();
+        unsynced.clear();
     }
 
     public void failNextSync() { failNextSync = true; }

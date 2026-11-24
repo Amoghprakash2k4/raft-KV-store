@@ -8,13 +8,15 @@ A Raft-based replicated key-value store in plain Java 21, built from scratch as 
 for the owner: a new grad with about 6 months of Java/Spring experience who wants to deeply understand
 consensus and end up with an interview-grade project. You act as a **senior distributed-systems mentor**.
 
-## Status (last updated 2026-11-22)
+## Status (last updated 2026-11-24)
 - **M1 Leader Election: DONE.** Gate passed: 0 Election Safety violations over 5,000 seeds × {3, 5} nodes.
 - **M2 Log Replication: DONE** (accepted by the owner 2026-11-23). 0 violations of invariants 1–5 over
   5,000 seeds × {3, 5} nodes; all mutation checks caught (rates in MILESTONES.md).
-- **M3 Durability: NOT STARTED.** Before coding, ask the owner the open M3 design questions (below).
-- **Git:** M1 `b0420ae`, docs `eb85e73`, M2 committed and pushed to `origin/main` on 2026-11-23 (the
-  owner asked for it). Never commit or push without an explicit yes from the owner.
+- **M3 Durability: DONE** (accepted by the owner 2026-11-24). 0 violations of invariants 1–6 over
+  5,000 seeds × {3, 5} × {chaos, crash loop}; all M3-F mutations caught (rates in MILESTONES.md).
+- **M4: next**, on branch `m4`. Start by asking about client session expiry (below).
+- **Git:** M1 `b0420ae`, docs `eb85e73`, M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
+  2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 
 ## How the owner wants to work (learned from the conversation)
 1. **One milestone at a time.** Don't start the next one until the owner says the current one is done.
@@ -53,20 +55,26 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   M2-B hand-written binary codec; M2-C test-only `Set<ProtocolMutation>`; M2-D open-loop sim clients
   without retries; M2-E driver matches `ProposalAccepted(index, term)` at apply time. Fast backup is
   added after the basic version passes.
+- **M3 choices (approved):** M3-A one WAL with typed records + CRC32C, torn-tail cut, checkpoint
+  segments; M3-B real WAL on `SimDisk` in the simulator; M3-C core holds the latest snapshot bytes;
+  M3-D Figure 13 chunks (64 B in sim); M3-E driver snapshots every N applied entries
+  (`SnapshotCreated` replaces the brief's `SnapshotInstalled`); M3-F four mutations.
 - **Leader Completeness** gets its own checker class in M2, not folded into `ElectionSafetyChecker`.
   The owner asked for it to be checked once logs are non-empty.
 
 ## Still open (ask at the named milestone)
-- **M3:** where snapshot bytes live while being sent (core vs. driver), chunked InstallSnapshot, and
-  replacing the `SnapshotInstalled` event with `SnapshotCreated`.
 - **M4:** client session expiry (unbounded table vs. deterministic expiry, thesis §6.3).
 
 ## Layout
 ```
 settings.gradle.kts, gradle/libs.versions.toml, buildSrc/ (raft.java-conventions: Java 21 toolchain,
   -Werror -Xlint:all, JUnit 5 + jqwik + AssertJ)
-raft-core/          com.projects.raftkv.core       pure core: RaftNodeCore, RoleState, RaftLog, types
-raft-storage/       com.projects.raftkv.storage    Storage, InMemoryStorage, StorageException
+raft-core/          com.projects.raftkv.core       pure core: RaftNodeCore, RoleState, RaftLog (with snapshot
+                                                   base), Snapshot, types
+raft-storage/       com.projects.raftkv.storage    Storage, InMemoryStorage (unit tests), StorageException,
+                                                   LogImage, SnapshotStore, StorageMutation
+                    ...storage.disk                Disk, RealDisk, SimDisk (page-cache crash model)
+                    ...storage.wal                 FileWalStorage, WalRecord, WalCodec, WalOptions
 raft-transport/     com.projects.raftkv.transport  Transport
 raft-node/          com.projects.raftkv.node       NodeDriver (apply + pending proposals), ProposalOutcome,
                                                    NodeHaltedException
@@ -74,17 +82,18 @@ raft-statemachine/  com.projects.raftkv.statemachine StateMachine, KvStateMachin
                                                    KvRequest (clientId, seq), KvResult, KvCodec
 raft-client/        (empty: M4)
 raft-sim/           com.projects.raftkv.sim        Simulation, NetworkConfig, FaultConfig, SimConfig,
-                                                   WorkloadConfig, ClientWorkload, Trace, NodeLogTracker,
-                                                   TrackedStorage, checkers: ElectionSafety, VoteDurability,
-                                                   LogMatching, LeaderAppendOnly, LeaderCompleteness,
-                                                   StateMachineSafety, ReplicaState
+                                                   WorkloadConfig, StorageConfig, ClientWorkload, Trace,
+                                                   NodeLogTracker, TrackedStorage, checkers: ElectionSafety,
+                                                   VoteDurability, LogMatching, LeaderAppendOnly,
+                                                   LeaderCompleteness, StateMachineSafety, ReplicaState,
+                                                   Durability
 compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md
 ```
 
 ## Commands
 ```
-./gradlew build                                   # all modules, 149 tests (~16 s), 300 seeds per chaos test
-./gradlew :raft-sim:test -Psim.seeds=5000         # milestone gate (~90 s)
+./gradlew build                                   # all modules, 250 tests (~20 s), 300 seeds per chaos test
+./gradlew :raft-sim:test -Psim.seeds=5000         # milestone gate (~2.5 min: chaos + crash loop × {3, 5})
 ./gradlew :raft-sim:test -Psim.seed=N             # replay one seed
 ```
 JDK 21 is installed at `/Users/amoghp/Library/Java/JavaVirtualMachines/ms-21.0.11` (the default `java`
@@ -107,8 +116,16 @@ is 25; the Gradle toolchain picks 21 automatically). Gradle 9.9.2 wrapper.
   must be `public`. Make classes `final` to avoid the `this-escape` lint.
 - Record `hashCode` is deterministic for our types, which `Trace` hashing relies on. Don't put enums or
   identity-hashed objects in trace payloads.
-- The simulator observes node state **after** the driver's fsync. `InMemoryStorage.crash()` keeps only
-  synced data. `setFsyncIsNoop(true)` is the lying-disk mutation.
+- The simulator observes node state **after** the driver's fsync. Sim nodes run `FileWalStorage` on a
+  `SimDisk`; `SimDisk.crash()` keeps synced data and tears unsynced data. `setFsyncIsNoop(true)` is the
+  lying-disk mutation; `failNextFsync()` is a crash mid-write.
+- `NodeLogTracker` hashes entries **at write time** (via `TrackedStorage`), not by reading the log:
+  entries can be appended and compacted within one event. Installed snapshots seed hashes from
+  `LeaderCompletenessChecker.committedHashAt`.
+- Checker assumptions that broke in M3: applied indexes aren't contiguous from 1 (snapshots), and
+  "committed entry never deleted" holds only for nodes at or past the commit term (Figure 8; seed 327).
+- WAL segments roll only right after a successful sync; that's what makes "bad bytes in the last
+  segment = torn tail, elsewhere = corruption" valid. Snapshot file must be durable before `CompactLog`.
 - Git: the project repo is this folder (remote `origin` = GitHub `Distributed-Raft-based-KV-store`).
   `/Users/amoghp` also contains a stray `~/.git`; the owner was warned. Never run git from the home
   directory.

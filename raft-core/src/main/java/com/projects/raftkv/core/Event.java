@@ -16,6 +16,15 @@ public sealed interface Event {
         public ProposeCommand { Objects.requireNonNull(command); }
     }
 
+    /**
+     * The driver has durably saved a snapshot of the state machine at {@code index} (term {@code term}),
+     * which must be &lt;= lastApplied (DESIGN.md M3-E). The core compacts its log through index and keeps
+     * the bytes to send to followers that fall behind (M3-C).
+     */
+    record SnapshotCreated(long index, long term, Bytes data) implements Event {
+        public SnapshotCreated { Objects.requireNonNull(data); }
+    }
+
     /** Start a ReadIndex read (thesis §6.4). Answered by ReadReady or ReadRejected. */
     record ReadRequested(long readId) implements Event {}
 }

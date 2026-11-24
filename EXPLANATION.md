@@ -937,7 +937,9 @@ sequenceDiagram
     else bug (TRUNCATE_ON_MATCH): replace everything after prevLogIndex
         Note over F: delete 2-4, append [2]<br/>committed entries 3 and 4 are GONE ✗
     end
-``` `mergeEntries` walks the incoming entries: it skips each one that
+```
+
+`mergeEntries` walks the incoming entries: it skips each one that
 already matches, truncates only at the **first real conflict**, and appends the rest. A duplicated
 message therefore produces **no disk writes at all** (test: `duplicateAppendEntriesIsANoOp`).
 
@@ -1286,7 +1288,9 @@ sequenceDiagram
     N2->>N1: AppendEntries (term 4, [7: t4], commit 7)
     Note over N1: term 4 > 3 → step down<br/>index 7: t3 vs t4 = conflict → replace<br/>apply index 7: term 4 ≠ 3
     N1-->>C: Lost (X was never applied, safe to retry)
-``` In the gate this
+```
+
+In the gate this
 happened ~127,000 times per cluster size, and every one was resolved correctly.
 
 `ProposalOutcome` is `Committed`, `Rejected` (with a leader hint) or `Lost`. A proposal on a node that
@@ -1600,3 +1604,782 @@ the no-op, the first probe would ask about an entry no follower has yet, and wou
 | **lost proposal** | accepted at (index, term), but a different entry was committed at that index |
 | **prefix hash** | a chained hash where hash(i) covers entries 1..i; equal hashes mean equal prefixes |
 | **control run** | the same experiment without the mutation, to show the mutation causes the failures |
+
+---
+
+# M3: Durability (WAL, crash recovery, snapshots, InstallSnapshot)
+
+**Status:** done (gate passed and accepted 2026-11-24; see [Results](#m3-14-results)).
+Every node now keeps its state in a real write-ahead log on disk, survives crashes at any point
+(including in the middle of a write), compacts its log with snapshots, and brings far-behind followers
+up to date with chunked InstallSnapshot. Invariants 1–6 held over 5,000 seeds each on 3- and 5-node
+clusters, under the M2 chaos and under crash loops.
+
+## Contents
+1. [What M3 adds, in one picture](#m3-1-what-m3-adds)
+2. [The decisions you approved (M3-A to M3-F)](#m3-2-decisions)
+3. [Invariant 6: Durability, and what a crash really loses](#m3-3-durability)
+4. [The disk model: `Disk`, `RealDisk`, `SimDisk`](#m3-4-disk)
+5. [The write-ahead log](#m3-5-wal)
+6. [Snapshots and log compaction](#m3-6-snapshots)
+7. [Saving a snapshot atomically, and WAL checkpoints](#m3-7-atomic)
+8. [Recovery: putting a node back together](#m3-8-recovery)
+9. [InstallSnapshot (Figure 13)](#m3-9-installsnapshot)
+10. [The driver: when to snapshot, restoring, `Unknown` outcomes](#m3-10-driver)
+11. [Simulator changes: real WAL, crash mid-write, shadow model](#m3-11-simulator)
+12. [Mutation testing in M3](#m3-12-mutations)
+13. [Tests written](#m3-13-tests)
+14. [Results](#m3-14-results)
+15. [Shortcuts and what is left for later](#m3-15-shortcuts)
+16. [Study questions (with answers)](#m3-16-study-questions)
+17. [Glossary additions](#m3-17-glossary)
+
+---
+
+<a id="m3-1-what-m3-adds"></a>
+## 1. What M3 adds, in one picture
+
+Until M2, "persist" meant writing into a Java `ArrayList` that pretended to be a disk. M3 makes it real
+and adds the two things every production Raft needs once it runs for more than a few minutes:
+
+1. **A write-ahead log (WAL) on disk.** Every hard-state change and every log change is appended as a
+   checksummed record, and one `fsync` per `Ready` makes the batch durable before anything is sent (E1).
+   After a crash the node replays the WAL and is exactly where it was at its last successful fsync.
+2. **Snapshots.** Without them the log grows forever and a restart replays every command since the
+   beginning of time. A snapshot is the state machine's state at some applied index; everything up to
+   that index can be deleted from the log. A follower so far behind that the leader has already deleted
+   the entries it needs gets the snapshot itself (InstallSnapshot).
+
+```mermaid
+flowchart TB
+    subgraph node["one node (raft-node)"]
+        core["RaftNodeCore<br/>(pure: log with a snapshot base,<br/>holds the latest snapshot bytes)"]
+        driver["NodeDriver<br/>persist + fsync → send → restore/apply → notify<br/>+ snapshot policy (every N applied entries)"]
+        sm["KvStateMachine<br/>snapshot() / restore()"]
+        core -- Ready --> driver
+        driver -- Event --> core
+        driver --> sm
+    end
+    subgraph storage["raft-storage"]
+        wal["FileWalStorage<br/>segments wal-000…1.log, wal-000…2.log<br/>records + CRC32C, checkpoints"]
+        snap["SnapshotStore<br/>snapshot.snap<br/>(tmp → fsync → rename → fsync dir)"]
+        disk["Disk interface"]
+        real["RealDisk<br/>(FileChannel.force)"]
+        sim["SimDisk<br/>(page-cache model:<br/>loses / tears unsynced bytes)"]
+        wal --> disk
+        snap --> disk
+        disk --> real
+        disk --> sim
+    end
+    driver -- "PersistOps, one fsync per Ready" --> wal
+    driver -- "saveSnapshot (durable on return)" --> snap
+```
+
+What a node's disk looks like after a while:
+
+```
+/data
+├── snapshot.snap                 state machine at index 412 (term 7), CRC-protected
+└── wal-0000000000000009.log      checkpoint segment:
+        RESET | HARD_STATE(term 9, voted n2) | SNAPSHOT_MARK(412, t7) | ENTRIES(413..430)
+        | ENTRIES(431) | HARD_STATE(term 10, -) | ENTRIES(432..433) | ...     ← appends continue here
+```
+
+---
+
+<a id="m3-2-decisions"></a>
+## 2. The decisions you approved (M3-A to M3-F)
+
+| # | Decision | Why | Rejected |
+|---|---|---|---|
+| M3-A | **One WAL with typed records** (hard state, entries, truncate, snapshot mark, reset), CRC32C per record, segment files, torn-tail cut, checkpoint segments. | One fsync covers everything a `Ready` wrote. | A separate hard-state file (two fsyncs plus a directory fsync per `Ready`); an embedded DB (hides what we are learning). |
+| M3-B | **The real WAL code runs on `SimDisk` inside the simulator.** | Thousands of seeds of crashes at every possible point, deterministic and replayable. | Only real files and `kill -9` (slow, not reproducible; that is M5's compose test). |
+| M3-C | **The core holds the latest snapshot's bytes.** | The core stays pure: it builds InstallSnapshot chunks itself. | The driver reading the file on demand (scales better, but message building leaks into the driver). |
+| M3-D | **Figure 13 chunks**, one in flight per follower, 64 KB (64 bytes in the simulator, so every install is multi-chunk). | It's what the paper specifies, and it exercises offsets, retransmits and restarts. | One message with the whole snapshot. |
+| M3-E | **The driver snapshots every N applied entries** and tells the core with `SnapshotCreated` (replacing the brief's `SnapshotInstalled`). | The snapshot must be durable *before* the log is compacted; only the driver can order that. | A byte-size trigger (fine for production, harder to reason about in tests). |
+| M3-F | **Four mutations must be caught**: lying fsync, recovery that keeps a torn tail, a snapshot renamed before its data is fsynced, a follower that installs stale snapshots. | Proof that the new checkers see the bugs they exist for. | |
+
+---
+
+<a id="m3-3-durability"></a>
+## 3. Invariant 6: Durability, and what a crash really loses
+
+**Invariant 6 (Durability):** after a crash and restart with only fsynced data, no state the node ever
+acknowledged is lost, and no committed entry is ever lost from the cluster.
+
+Why is this hard? Because `write()` does not put bytes on the disk. It puts them in the operating
+system's **page cache** (RAM). The kernel writes them to the device later, in whatever order it likes.
+Only `fsync` waits until they are on stable storage. A power cut loses everything that was not
+fsynced, and it may lose it **partially**:
+
+```
+file on disk:   [ synced bytes ............ ][ written, NOT synced ...................... ]
+                                             ▲
+                                   last successful fsync
+
+after a power cut, the unsynced part is one of:
+  (a) gone entirely            [ synced ............ ]
+  (b) all there                [ synced ............ ][ written, not synced ............ ]
+  (c) a prefix (torn write)    [ synced ............ ][ written, not s ]
+  (d) a prefix with junk       [ synced ............ ][ writ\0\0\0\0\0 ]   ← size grew, blocks not written
+```
+
+Raft's correctness depends on durability in two places:
+- **Votes** (M1): a node that forgets it voted in term 5 can vote twice in term 5 → two leaders.
+- **Log entries** (M2): a follower acknowledges an entry only after it is durable; the leader counts
+  that acknowledgement towards a majority. If the follower then loses the entry, the "majority" that
+  made it committed may no longer exist, and a new leader can be elected without it.
+
+Directory entries are a separate trap. A file's **name** lives in its directory, which is a different
+object with its own cache. `fsync(file)` makes the bytes durable but not necessarily the name; creating,
+renaming or deleting a file is durable only after `fsync(directory)`. Forgetting this is a classic
+production bug (see the PostgreSQL "fsyncgate" discussions and the ALICE paper, OSDI 2014).
+
+---
+
+<a id="m3-4-disk"></a>
+## 4. The disk model: `Disk`, `RealDisk`, `SimDisk`
+
+Everything the WAL and the snapshot store do to files goes through one small interface
+(`raft-storage/.../disk/Disk.java`): `list`, `exists`, `size`, `read`, `append`, `truncate`, `fsync`,
+`rename`, `delete`, `fsyncDir`. Two implementations:
+
+- **`RealDisk`**: a real directory, `FileChannel.force(true)` for fsync, and a channel opened on the
+  directory itself for `fsyncDir` (works on Linux).
+- **`SimDisk`**: an in-memory disk that models the page cache precisely enough that a simulated crash
+  produces every outcome a real one can. Its rules (`SimDisk.java:105`, `crash()`):
+
+| What happened since the last fsync | What survives a crash |
+|---|---|
+| bytes appended to a file | none, all, or a random prefix (`survivingBytes`, `SimDisk.java:150`); in 1 of 4 crashes part of the surviving region becomes zeros or garbage (`scribble`, `:160`) |
+| the file was truncated | the truncate is undone |
+| a file was created, renamed or deleted, but no `fsyncDir` since | undone: the directory reverts to its last synced version |
+| a file was fsynced but its directory was not | the data is safe, but the **name** may be gone |
+
+All randomness comes from a seeded generator, so a crash is exactly reproducible. Two fault hooks:
+`failFsyncAfter(n)` (the n+1-th fsync throws: "crash during fsync") and `setFsyncIsNoop(true)` (the
+lying disk).
+
+The model is tested on its own (`SimDiskCrashTest`, 14 tests) before anything is built on it, and
+`DiskContractTest` runs the same non-crash behaviour against both `RealDisk` and `SimDisk`.
+
+---
+
+<a id="m3-5-wal"></a>
+## 5. The write-ahead log
+
+### Records
+
+Every write the core asks for becomes one record (`WalCodec.java`):
+
+```
+ 0         4         8    9
+ ┌─────────┬─────────┬────┬───────────────────────────────┐
+ │ length  │ crc32c  │type│ payload                       │
+ │  u32    │  u32    │ u8 │ (length - 1 bytes)            │
+ └─────────┴─────────┴────┴───────────────────────────────┘
+                      └──────── crc covers these ────────┘
+
+ type 1 HARD_STATE      term u64, votedFor i32 (-1 = none)
+ type 2 ENTRIES         count u32, then per entry: index u64, term u64, kind u8, [len u32, bytes]
+ type 3 TRUNCATE        fromIndex u64                    (logical: old bytes are never rewritten)
+ type 4 SNAPSHOT_MARK   index u64, term u64              (the log base moves here)
+ type 5 RESET           (none)                            (first record of a checkpoint)
+```
+
+The CRC is what makes a torn write detectable. A torn record is either too short (the length field
+points past the end of the file) or has the wrong checksum. CRC32C has a dedicated CPU instruction, and
+a random corruption passes it with probability 2⁻³².
+
+### Segments, and why a segment rolls only after a sync
+
+Records go into `wal-<seq>.log`. When a segment reaches `maxSegmentBytes` (64 MB, 4 KB in the
+simulator), the next write starts a new one. The key rule: **a segment is closed only right after a
+successful sync.** Here is the bug this prevents:
+
+```mermaid
+sequenceDiagram
+    participant D as driver
+    participant W as WAL
+    Note over W: segment 1 is full
+    D->>W: append ENTRIES(41) → goes to segment 1 (not synced)
+    Note over W: BAD: roll now, in the middle of a Ready
+    D->>W: append ENTRIES(42) → goes to segment 2 (not synced)
+    D->>W: sync → fsync(segment 2) ... CRASH before it returns
+    Note over W: after the crash: segment 1 ends in a TORN record,<br/>and segment 1 is not the last segment.<br/>Recovery must call that corruption → the node never restarts.
+```
+
+With the rule, every segment except the last is fully durable. That gives recovery a clean distinction
+(`FileWalStorage.recover`, `FileWalStorage.java:75`):
+
+```mermaid
+flowchart TD
+    A[read segments in order] --> B{record complete<br/>and CRC matches?}
+    B -- yes --> C[replay it] --> A
+    B -- no --> D{in the LAST segment?}
+    D -- yes --> E["torn tail: an unacknowledged write.<br/>truncate the file there, fsync, stop"]
+    D -- no --> F["corruption of synced data:<br/>throw (fail-stop). Never guess."]
+```
+
+Why cut the torn tail instead of just skipping it? Because the next append goes **after** it. Without
+the cut, the new records sit behind garbage, and the next recovery stops at the garbage and loses them.
+That is exactly mutation M3-F(2), and the simulator catches it in 100 of 100 seeds.
+
+A new segment also needs its **name** to be durable: the sync that first fsyncs a new segment also
+calls `fsyncDir` (`dirNeedsSync`).
+
+### One fsync per `Ready`
+
+The driver writes every `PersistOp` of a `Ready` as records, then calls `sync()` once
+(`FileWalStorage.java:176`). Hard state and entries are in the same file, so a vote and the entries
+written with it become durable together. That's the main reason for M3-A.
+
+---
+
+<a id="m3-6-snapshots"></a>
+## 6. Snapshots and log compaction
+
+### The log base
+
+The core's log is now `(snapshotIndex, snapshotTerm, entries after it)` (`RaftLog.java`). Entries up
+to `snapshotIndex` are gone; the boundary itself still has a term:
+
+```
+                 compacted (in the snapshot)        │ in the log
+index:     1    2    3    4    5    6    7    8     │   9   10   11   12
+                                                     │
+termAt:    ∅    ∅    ∅    ∅    ∅    ∅    ∅    3     │   3    4    4    4
+entryAt:   ∅    ∅    ∅    ∅    ∅    ∅    ∅    ∅     │   ✓    ✓    ✓    ✓
+                                              ▲
+                              snapshotIndex = 8, snapshotTerm = 3
+```
+
+`termAt(8) = 3` matters: an AppendEntries with `prevLogIndex = 8, prevLogTerm = 3` must still pass the
+consistency check (D1a rule 2). Asking for `termAt(5)` returns empty: compacted, not "missing".
+
+### The four boundary rules (DESIGN.md D1a)
+
+1. **Compact only what has been applied** (`onSnapshotCreated`, `RaftNodeCore.java:262`). Applied means
+   committed, and committed entries can never be needed for a conflict check, so nothing deleted can be
+   missed.
+2. **The boundary keeps its term** (above).
+3. **An AppendEntries that starts inside the snapshot is stale, not a conflict**
+   (`skipCompactedEntries`, `RaftNodeCore.java:407`). Drop the entries at or below `snapshotIndex`
+   (committed, already in the snapshot) and process the rest as if the message started at the boundary.
+   Never truncate below the snapshot.
+   ```
+   follower: snapshot through 5 (term 1), log empty after it
+   message:  prevLogIndex=3, prevLogTerm=1, entries [4 5 6 7], leaderCommit 7
+   → treat as prevLogIndex=5 (term 1 ✓), entries [6 7]  → append 6, 7; reply success matchIndex 7
+   ```
+4. **A leader whose `nextIndex[p]` is at or below its `snapshotIndex` can't send entries** (they're
+   gone), so it sends InstallSnapshot instead (`sendAppend`, `RaftNodeCore.java:540`).
+
+### Taking a snapshot: the order matters
+
+```mermaid
+sequenceDiagram
+    participant D as NodeDriver
+    participant SM as KvStateMachine
+    participant S as Storage
+    participant C as RaftNodeCore
+    Note over D: after handling an event:<br/>lastApplied − snapshotIndex ≥ N ?
+    D->>SM: snapshot()  (state at exactly lastApplied)
+    SM-->>D: canonical bytes
+    D->>S: saveSnapshot(index, term, bytes)
+    Note over S: tmp → fsync → rename → fsync dir<br/>DURABLE when this returns
+    D->>C: step(SnapshotCreated(index, term, bytes))
+    Note over C: log.resetBase(index, term)<br/>keep the bytes (to send to followers)
+    C-->>D: Ready{persist: [CompactLog(index, term)]}
+    D->>S: compactLog → WAL record SNAPSHOT_MARK
+    D->>S: sync()  (and maybe write a checkpoint)
+```
+
+**The snapshot must be durable before the compaction record.** If `SNAPSHOT_MARK(412)` reached the disk
+and the snapshot file didn't, a crash would leave a WAL that says "entries up to 412 are gone" with no
+snapshot holding them. Those committed entries would be lost forever. Recovery checks this explicitly
+(next sections). The mutation that renames the snapshot before fsyncing its data is the realistic form
+of this bug.
+
+### Canonical snapshots
+
+`KvStateMachine.snapshot()` encodes the sorted map as `version, count, (key, value)*`
+(`KvCodec.encodeSnapshot`). Equal states give byte-identical snapshots, whatever order the keys were
+written in. The decoder rejects anything non-canonical (keys out of order, trailing bytes). Two nodes
+snapshotting at the same index produce the same bytes, which is what lets a follower resume a chunked
+transfer from a new leader.
+
+---
+
+<a id="m3-7-atomic"></a>
+## 7. Saving a snapshot atomically, and WAL checkpoints
+
+### The snapshot file (`SnapshotStore.java:40`)
+
+```
+step 1  write  snapshot.snap.tmp        crash here → tmp is junk; snapshot.snap is the OLD one
+step 2  fsync  snapshot.snap.tmp        crash here → same: the rename hasn't happened
+step 3  rename tmp → snapshot.snap      crash here → the rename may or may not survive;
+                                          either way the file it names is complete (step 2)
+step 4  fsync  the directory            now the rename is durable: the NEW one, for sure
+```
+
+Skipping step 2 is the bug: after a crash the name can point at a file whose bytes never reached the
+disk (empty or torn). The file carries its own CRC, so recovery detects that and stops. In
+`SnapshotStoreTest` a crash after each of the four steps, over 50 seeds each, always leaves the old or
+the new snapshot.
+
+### Checkpoints (`checkpoint`, `FileWalStorage.java:218`)
+
+A `SNAPSHOT_MARK` makes old entries logically dead, but the bytes are still in old segments. Once the
+WAL is bigger than one segment after a compaction, the next sync writes a **checkpoint**: a new segment
+that restates the whole current state, and then deletes everything older.
+
+```
+before:   wal-…05.log  wal-…06.log  wal-…07.log (current)
+          [entries 1..90, votes, truncates, MARK(80) ...                     ]
+
+1. write  wal-…08.log.tmp = RESET | HARD_STATE | MARK(80, t4) | ENTRIES(81..97)
+2. fsync  wal-…08.log.tmp
+3. rename → wal-…08.log, fsync dir          (crash after this: replay 05,06,07,08 → RESET in 08
+                                              throws away what 05–07 built → same state)
+4. delete wal-…05/06/07.log, fsync dir
+
+after:    wal-…08.log (current)
+```
+
+`RESET` is what makes the overlap harmless: replaying old segments and then the checkpoint gives the
+same state as replaying the checkpoint alone. `aCrashAtAnyPointOfACheckpointRecoversTheSameState`
+injects an fsync failure at each step over 400 seeds and checks exactly that.
+
+---
+
+<a id="m3-8-recovery"></a>
+## 8. Recovery: putting a node back together
+
+On restart, `FileWalStorage.open` rebuilds the state; the driver then restores the state machine from
+the snapshot and builds the core from the same state.
+
+```mermaid
+flowchart TD
+    A["replay WAL segments<br/>(cut a torn tail in the last one)"] --> B["LogImage: hard state,<br/>base (bi, bt), entries after bi"]
+    S["load snapshot.snap (CRC-checked)<br/>→ (si, st) or none"] --> C
+    B --> C{"compare snapshot index si<br/>with log base bi<br/>(LogImage.alignWith)"}
+    C -- "si #lt; bi" --> X["FAIL-STOP: the log was compacted past its snapshot;<br/>entries si+1..bi are gone"]
+    C -- "si = bi" --> OK["consistent"]
+    C -- "si #gt; bi" --> R["the snapshot was saved but the crash came before its<br/>SNAPSHOT_MARK was synced → rebase the log onto it,<br/>write the missing MARK, fsync"]
+    R --> OK
+    OK --> D["PersistentState(hardState, snapshot, entries)"]
+    D --> E["driver: stateMachine.restore(snapshot)"]
+    D --> F["core: log base = snapshot,<br/>commitIndex = lastApplied = snapshot index"]
+```
+
+Why write the missing mark during recovery? Without it, the WAL would still hold, say, entries 1..4,
+while the core continues from snapshot 8 and appends entry 9. The next recovery would find `ENTRIES(9)`
+following a log that ends at 4 and call it corruption.
+
+After recovery the node has `commitIndex = lastApplied = snapshotIndex`. Everything in the snapshot is
+committed by construction, and the rest is relearned from the leader, as in M2.
+
+---
+
+<a id="m3-9-installsnapshot"></a>
+## 9. InstallSnapshot (Figure 13)
+
+### When it happens
+
+A follower that was down or partitioned long enough comes back. The leader backs `nextIndex` up with
+fast backup (M2) until it falls at or below the leader's `snapshotIndex`: the entries the follower
+needs no longer exist. So the leader streams its snapshot instead.
+
+### The messages
+
+```
+InstallSnapshot(term, leaderId=from, lastIncludedIndex, lastIncludedTerm, offset, data, done)   Figure 13
+InstallSnapshotResponse(term, lastIncludedIndex, nextOffset, done)       ← Figure 13 has only term;
+                                                                            the rest is our addition
+```
+
+The paper's response carries only `term`. With one chunk in flight, the leader also needs to know which
+snapshot the reply is about and how many bytes the follower holds, so it can send the next chunk or
+resend a lost one.
+
+### A real transfer
+
+This is the exact message sequence from `SnapshotTest.aFollowerBehindTheLeadersSnapshotCatchesUpThroughInstallSnapshot`
+(a 200-byte snapshot in 64-byte chunks; the leader's log is compacted through index 10):
+
+```mermaid
+    sequenceDiagram
+        participant L as leader n1 (term 2)<br/>snapshot through 10, entries 11–13
+        participant F as follower n2 (empty log)
+        L->>F: AppendEntries(prev 12/t1, [13], commit 10)
+        F-->>L: reject (rejectedIndex 12, conflictIndex 1: my log is empty)
+        Note over L: nextIndex → 1 ≤ snapshotIndex 10 → send the snapshot
+        L->>F: InstallSnapshot(10/t1, offset 0, 64 bytes, done=false)
+        F-->>L: nextOffset 64
+        L->>F: InstallSnapshot(offset 64, 64 bytes)
+        F-->>L: nextOffset 128
+        L->>F: InstallSnapshot(offset 128, 64 bytes)
+        F-->>L: nextOffset 192
+        L->>F: InstallSnapshot(offset 192, 8 bytes, done=true)
+        Note over F: complete: no entry (10, t1) in my log → discard it<br/>base = 10, persist, restore the state machine
+        F-->>L: done
+        Note over L: matchIndex 10, nextIndex 11
+        L->>F: AppendEntries(prev 10/t1, [11, 12, 13], commit 10)
+        F-->>L: success, matchIndex 13
+```
+
+### The follower's decisions (`onInstallSnapshot`, `RaftNodeCore.java:582`)
+
+```mermaid
+flowchart TD
+    A[InstallSnapshot chunk] --> B{term < currentTerm?}
+    B -- yes --> R1[reply with my term; ignore]
+    B -- no --> C[sender is the leader: become follower, reset election timer]
+    C --> D{"lastIncludedIndex ≤ commitIndex?<br/>(D1a rule 5)"}
+    D -- yes --> R2["stale: I already have all of it committed.<br/>reply done; change NOTHING"]
+    D -- no --> E{"buffer for this (index, term)<br/>and offset == bytes held?"}
+    E -- "no, and offset ≠ 0" --> R3["reply nextOffset = what I hold (maybe 0)"]
+    E -- yes, or a new transfer at offset 0 --> F[append chunk]
+    F --> G{done?}
+    G -- no --> R4[reply nextOffset]
+    G -- yes --> H{"my log holds (lastIncludedIndex,<br/>lastIncludedTerm)?"}
+    H -- yes --> K["keep the entries after it (Figure 13 step 6)"]
+    H -- no --> L2["discard the whole log (step 7)"]
+    K --> P["persist InstallSnapshot: save snapshot, then SNAPSHOT_MARK;<br/>commitIndex = lastApplied = index;<br/>Ready.snapshotToRestore → driver restores the state machine"]
+    L2 --> P
+```
+
+**Why the stale check matters** (mutation M3-F(4)). A delayed InstallSnapshot for index 40 arrives at a
+follower that has meanwhile committed and applied up to 55. Installing it would throw away committed
+entries 41–55 from the follower's disk and roll its KV store back to index 40. The follower would
+re-replicate and converge later, which is why the old checkers barely noticed (10 of 100 seeds). The two
+new direct checks (section 11) catch it in 99 of 100.
+
+### The leader's side (`onInstallSnapshotResponse`, `RaftNodeCore.java:641`)
+
+The leader keeps `Transfer(index, term, offset)` per follower:
+- A reply that **advances** the offset → send the next chunk.
+- A reply with a **smaller** offset (the follower restarted and lost its buffer, or an old duplicate)
+  → reset the offset but don't send now; the next heartbeat does. Duplicated replies therefore can't
+  multiply the chunks in flight.
+- `done` → `matchIndex = max(old, index)`, `nextIndex = index + 1`, and normal AppendEntries resume.
+- **Heartbeats resend the current chunk.** For a follower in snapshot mode, the chunk is the heartbeat,
+  which also retransmits after a lost message.
+- If the leader compacts again mid-transfer, the next chunk notices the snapshot changed and restarts
+  from offset 0 with the new one.
+
+---
+
+<a id="m3-10-driver"></a>
+## 10. The driver: when to snapshot, restoring, `Unknown` outcomes
+
+`NodeDriver.handle` keeps the E1 order, with two additions:
+- **Restore before apply** (`restore`, `NodeDriver.java:175`): if the `Ready` carries
+  `snapshotToRestore`, the state machine is replaced with it before any `toApply` entries.
+- **Snapshot between events** (`maybeSnapshot`, `NodeDriver.java:155`): after a `Ready` is fully
+  handled, the state machine is exactly at `lastApplied` (E1a rule 5), so that's the only safe moment to
+  serialize it.
+
+**`ProposalOutcome.Unknown`.** A former leader may have proposals waiting at indexes that an installed
+snapshot now covers. The snapshot doesn't say which entries it contains, so the driver can't tell whether
+the proposal was committed or overwritten. It reports `Unknown`: the client must retry, which is safe
+only once M4 adds sessions that deduplicate retries. (In the gate this happened 405–727 times per 300
+seeds under chaos.)
+
+---
+
+<a id="m3-11-simulator"></a>
+## 11. Simulator changes: real WAL, crash mid-write, shadow model
+
+### Every node runs the real WAL on a `SimDisk`
+
+`InMemoryStorage` is now only for unit tests. In the simulator each node has a `SimDisk`, and every
+(re)start calls `FileWalStorage.open` on it, so **every one of the ~800,000 restarts in the gate ran the
+real recovery code** on whatever the crash left behind.
+
+### Crashing in the middle of a write
+
+A crash between two events loses nothing: every `Ready` already ended with a successful fsync. To
+exercise torn writes, a new fault **arms a crash during the node's next fsync** (`Simulation.java:399`):
+`SimDisk.failNextFsync()`. The node writes its batch, the fsync throws, the driver halts (fail-stop),
+and the simulator crashes it, which tears the unsynced batch randomly. `FaultConfig.crashLoops()` biases
+the fault mix to 70% crashes and mid-write crashes, every 40–200 ms.
+
+### The `DurabilityChecker`: a shadow model of each disk
+
+The checker keeps its own model of each node's durable state, fed by `TrackedStorage` with every write,
+every saved snapshot, and every **successful** sync. It is written independently of the WAL (it doesn't
+use `LogImage`), so a bug in one isn't silently repeated in the other.
+
+```mermaid
+flowchart LR
+    W["node writes:<br/>saveHardState / append /<br/>truncate / compactLog"] --> P["model.pending"]
+    SS["saveSnapshot returned"] --> M
+    Y["sync() returned OK"] --> A["apply pending → model<br/>(check c)"] --> M["model: what is durable"]
+    X["crash"] --> RC["restart: WAL recovers state R"]
+    M --> CHK{"(a) R == model + some prefix<br/>of the pending writes?"}
+    RC --> CHK
+    CHK -- no --> V["Durability violated"]
+```
+
+Three checks:
+- **(a) Node level, at every restart** (`onRecover`, `DurabilityChecker.java:148`). The recovered state
+  must equal the model plus **a prefix** of the writes that were pending when the node died. Why a prefix:
+  a crash during fsync can persist the first records of a batch, but never a later record without an
+  earlier one (the file only grows, and torn bytes fail the CRC).
+- **(b) Cluster level, when an index first becomes committed** (`observeCommit`, `:172`). A majority of
+  models must hold that entry durably, in the log or under a snapshot. This catches a leader counting an
+  acknowledgement sent before the follower's fsync.
+- **(c) At every sync** (`onSync`). A node **whose term has reached the commit term** never durably
+  deletes a committed entry it holds, except by covering it with a snapshot. Without this, a
+  truncate-on-match or stale-install bug can shrink the majority behind a commit and heal before
+  anything else notices. Why the term condition matters is the next story.
+
+And one more in `StateMachineSafetyChecker`: **within one incarnation, `lastApplied` never goes back.**
+A node may restart from an older snapshot, but a running node that un-applies commands has shown clients
+a state that later disappears.
+
+### A false alarm the gate found, and what it teaches (Figure 8 again)
+
+The first 5,000-seed gate run failed once (5 nodes, crash loop, seed 327):
+`Durability violated: n5 truncated committed entry 224`. The replayed trace showed this sequence:
+
+```
+term 27   entry 224 (t27) reaches n4, n5 and others, but is not committed yet
+          n3 is behind: its log ends at 223
+term 28   n3 wins an election (its log is as up to date as a majority's at that moment)
+term 29   n4 wins, appends no-op 227 (t29), replicates it to a majority that does NOT include n5
+          (n4→n5 links are blocked) → 227 commits, and with it 224 (t27)    ← committed in term 29
+          n5 crashes, restarts at term 27, still holding 224 (t27)
+t=9740ms  a delayed AppendEntries from n3 (term 28) reaches n5:
+          prev 223/t27, entries [224 (t28)]
+          n5 is at term 27, so term 28 is newer: it must accept. 224 conflicts → truncate.
+```
+
+n5 did exactly what Raft says. The entry was committed by n4 in term 29 through a majority **without**
+n5. Every node in that majority is at term 29 or higher, so it rejects n3's term-28 messages and can
+never lose 224. n5 never heard of term 29, so it can. That's fine, because n5 wasn't part of the
+majority, and it will get 224 back from n4.
+
+So the correct check is: **a node whose current term is at least the commit term never deletes the
+committed entry.** Those nodes only follow leaders of that term or later, and Leader Completeness says
+those leaders all hold the entry. The checker records the term of the first node that reports each
+index committed (at least the committing leader's term) and checks only nodes at or past it. After the
+fix the seed passes, every mutation is still caught at the same rate, and the gate is clean.
+
+The lesson: "a committed entry is on a majority" doesn't mean "every node that has it keeps it". It's
+the same reason Figure 8 exists: who holds an entry matters less than which terms they have seen.
+
+### Tracking logs that get compacted
+
+M2's `NodeLogTracker` computed prefix hashes by reading entries from the node's log. After compaction
+those entries are gone, so in M3 the tracker hashes entries **when they are written** (TrackedStorage
+passes them in) and keeps the hashes below the snapshot across restarts (`restart`,
+`NodeLogTracker.java:74`). When an installed snapshot replaces a log (`onRebase`, `:65`), hashes 1..index
+are taken from the Leader Completeness checker's registry of committed prefix hashes. A snapshot holds
+only committed entries, so that's exactly right.
+
+### A harness bug found on the way
+
+The first run with snapshots reported State Machine Safety violations in every configuration, comparing
+entry 91 on one node with entry 107 on another "at index 91". The protocol was fine. The checker stored
+applied entries in a list by position, assuming every node applies indexes 1, 2, 3… A node restored from
+a snapshot starts applying at, say, 92, so entry 107 landed at position 91. It's now a map keyed by index.
+Lesson: a new feature can break the assumptions of the test harness, not just the code.
+
+---
+
+<a id="m3-12-mutations"></a>
+## 12. Mutation testing in M3
+
+| Mutation | Where | Config | Caught |
+|---|---|---|---|
+| Lying fsync (now on the real WAL) | `SimDisk.setFsyncIsNoop` | chaos, 50 seeds | **Durability 50/50** (the restart check sees the loss directly) |
+| Same, all durability checkers off | | chaos, 300 seeds | Leader Completeness 212, Election Safety 43, Log Matching 18, State Machine Safety 2 (passed 20, liveness 5) |
+| Recovery keeps the torn tail | `StorageMutation.SKIP_TORN_TAIL_CUT` | crash loop, 100 | **Durability 100/100** |
+| Snapshot renamed before its data is fsynced | `StorageMutation.SKIP_SNAPSHOT_DATA_FSYNC` | crash loop, 100 | **Durability 59/100**: needs a crash after a snapshot where not all unsynced bytes survive (1 in 3 crashes keeps them all) |
+| Follower installs stale snapshots, always discards its log | `ProtocolMutation.NAIVE_INSTALL_SNAPSHOT` | chaos, 100 | **98 Durability (c)** + 1 guard in `RaftLog` = 99/100 (10/100 before checks (c) and "no rollback" existed) |
+| M2 truncate on match | | chaos, 100 | Durability (c) 100/100 (M2: Leader Completeness / replica divergence) |
+| Controls: no mutation, batch 1 and crash loop | | 100 + 100 | 0 safety violations |
+
+---
+
+<a id="m3-13-tests"></a>
+## 13. Tests written
+
+| Module | Test | What it proves |
+|---|---|---|
+| storage | `DiskContractTest` → `RealDiskTest`, `SimDiskTest` | both disks behave the same when nothing crashes |
+| storage | `SimDiskCrashTest` (14) | the crash model: synced data survives; unsynced appends survive as none/all/prefix/garbage; unsynced renames, deletes and truncates are undone; fsync failure; lying disk; determinism |
+| storage | `FileWalStorageTest` (11) | records, truncation, rolling, segment names made durable, torn-tail cut, corruption in an older segment = fail-stop, real directory |
+| storage | `WalTornTailProperties` | cut a valid WAL at **every byte offset** (20 seeds) and add zeros/garbage after random cuts (jqwik, 300 tries): recovery returns exactly the last whole record |
+| storage | `WalSnapshotTest` (9) | compaction, install with and without a matching entry, snapshot ahead of the WAL, WAL past the snapshot = corruption, checkpoints keep the WAL small, crash at every checkpoint step (400 seeds), real directory, both storage mutations bite |
+| storage | `SnapshotStoreTest` | crash after each of the 4 save steps leaves old or new; corrupt file fails loudly |
+| core | `SnapshotTest` (17) | log base rules, compaction, rule 3 (AppendEntries below the base), chunk assembly, wrong offsets, keep vs discard, stale install ignored, stale term rejected, end-to-end catch-up, heartbeat retransmit |
+| statemachine | `KvSnapshotTest` | restore reproduces state and index; canonical bytes; malformed and out-of-order snapshots rejected; round-trip property |
+| node | `NodeDriverTest` (+4) | snapshot saved before compaction; recovery from a snapshot; installed snapshot replaces the state; covered proposals end `Unknown` |
+| sim | `DurabilityCheckerTest` (12) | (a) exact and prefix recovery, out-of-order survival rejected; (b) majority; (c) deleting a committed entry, but not on a node still in an older term (Figure 8) |
+| sim | `ReplicationCheckersTest` (+3) | tracker keeps hashes across compaction/restart, seeds installs from the registry; rollback detected |
+| sim | `ChaosTest` | the gate, now with `crashLoop` configs and guards that mid-write crashes, torn tails, snapshots and installs actually happen |
+| sim | `MutationSanityTest` (+3) | the M3-F table above |
+
+Total: 250 tests, about 20 s for `./gradlew build`.
+
+---
+
+<a id="m3-14-results"></a>
+## 14. Results
+
+Gate (2026-11-24): `./gradlew :raft-sim:test -Psim.seeds=5000`, **0 violations** of invariants 1–6,
+vote durability, replica-state agreement and liveness, over 5,000 seeds per row. Runtime **2 min 31 s**
+for all four rows.
+
+| Config | Crashes | of them mid-fsync | Torn tails cut | Restarts checked (a) | Snapshots taken | Installs | Longest log in memory |
+|---|---|---|---|---|---|---|---|
+| chaos, 3 nodes | 44,904 | 22,326 | 8,619 | 59,904 | 71,782 | 14,167 | 189 |
+| chaos, 5 nodes | 46,656 | 23,194 | 8,966 | 71,656 | 153,018 | 35,673 | 190 |
+| crash loop, 3 nodes | 301,100 | 140,956 | 53,392 | 316,100 | 43,782 | 5,631 | 120 |
+| crash loop, 5 nodes | 324,898 | 159,198 | 61,240 | 349,898 | 115,943 | 25,879 | 137 |
+
+Client traffic per row: ~3.24M proposals. Committed: 1.70M / 2.23M (chaos 3 / 5) and 0.95M / 1.57M
+(crash loop 3 / 5); crash loops commit less because nodes are down so often. `Unknown` outcomes:
+6,179 / 13,718 / 6 / 315.
+
+**The log stays bounded.** The highest commit index in a run reached 625, but no node ever held more
+than 190 entries in memory, with snapshots every 40–80 entries. Without snapshots, M2 logs grew to
+about 630.
+
+`./gradlew build`: 250 tests, about 20 s.
+
+---
+
+<a id="m3-15-shortcuts"></a>
+## 15. Shortcuts and what is left for later
+
+- **Memory (M3-C):** the core holds the latest snapshot's bytes, and `FileWalStorage` keeps its own copy
+  of the log after the base (for checkpoints). Fine for a KV store that fits in RAM, which this one
+  does anyway; a production system would stream snapshots from disk.
+- **macOS:** `FileChannel.force` is `fsync(2)`, which on macOS doesn't flush the drive's cache
+  (`F_FULLFSYNC` does), and directory fsync may be a no-op there. Linux (Docker) is the real target.
+- **`Unknown` outcomes** exist until M4's sessions make retries safe.
+- **Leader snapshots block the event loop.** Serializing the state machine happens on the driver
+  thread. Fine at this size; etcd and TiKV do it in the background with copy-on-write state.
+
+---
+
+<a id="m3-16-study-questions"></a>
+## 16. Study questions (with answers)
+
+**Q1. `write()` returned successfully. Is the data durable? What about after `fsync(file)` for a file
+you just created?**
+<details><summary>Answer</summary>
+
+No: `write` only reaches the page cache. After `fsync(file)` the bytes are durable, but the file's
+**name** isn't until the directory is fsynced. A crash can leave the data on disk with no name pointing
+to it. That's why a new WAL segment's first sync also calls `fsyncDir`.
+</details>
+
+**Q2. Recovery finds a record with a bad CRC. When does it cut the file and carry on, and when does it
+refuse to start? Why is the difference safe?**
+<details><summary>Answer</summary>
+
+Bad record in the **last** segment: cut and carry on, because segments only roll right after a
+successful sync, so only the last segment can hold unsynced bytes. Those bytes were never acknowledged
+to anyone, so dropping them loses nothing that was promised. Bad record in an **earlier** segment:
+those bytes were synced, so something corrupted durable data, and the node stops rather than guess.
+</details>
+
+**Q3. Why must the snapshot file be durable before the WAL's `SNAPSHOT_MARK` record? What does recovery
+do if it finds the mark but not the snapshot, and the other way round?**
+<details><summary>Answer</summary>
+
+The mark says "entries up to i are gone"; only the snapshot holds what they did. Mark without snapshot
+(si &lt; bi): committed state is lost, so recovery fail-stops. Snapshot without mark (si &gt; bi): the
+crash came between the two steps; recovery rebases the log onto the snapshot and writes the missing
+mark. Nothing was lost.
+</details>
+
+**Q4. A follower with `commitIndex = 55` receives a complete InstallSnapshot through index 40. What
+does it do, and what would go wrong if it installed it?**
+<details><summary>Answer</summary>
+
+It replies `done` and changes nothing (D1a rule 5): everything in that snapshot is already committed
+in its log. Installing it would roll the state machine back to index 40 and delete committed entries
+41–55 from its disk. Clients may have seen results from those entries, and the majority that committed
+them would have shrunk by one.
+</details>
+
+**Q5. Why does the leader resend the current chunk on every heartbeat, but not when it gets a reply
+with a smaller offset than it expected?**
+<details><summary>Answer</summary>
+
+Heartbeats are the retransmission timer: if a chunk or its reply is lost, the next heartbeat repeats
+it. A reply with a smaller offset is either an old duplicate or a follower that restarted. Resending
+immediately on every such reply would let duplicated replies multiply the chunks in flight, so the
+leader just resets the offset and lets the heartbeat send.
+</details>
+
+**Q6. A checkpoint is half done: the new segment is renamed into place, but the old segments haven't
+been deleted yet. The node crashes. What does recovery replay, and why is the result right?**
+<details><summary>Answer</summary>
+
+All segments in order: the old ones, then the checkpoint. The checkpoint starts with `RESET`, which
+throws away everything the old segments built, then restates hard state, base and entries. Old + RESET
++ checkpoint gives the same state as the checkpoint alone.
+</details>
+
+**Q7. The shadow model accepts a recovered state that includes *some* of the writes that were pending
+when the node crashed. Why is that allowed, and why only a prefix?**
+<details><summary>Answer</summary>
+
+A crash during fsync may have persisted part of the batch. Those writes were never acknowledged (the
+fsync failed, nothing was sent), so keeping them is harmless. A WAL only grows and every record has a
+CRC, so what survives is always the records up to some point: record 2 can't survive without record 1.
+</details>
+
+**Q8. Why couldn't the M2 `NodeLogTracker` work with compaction, and how does M3's know the prefix hash
+of an installed snapshot it never saw entries for?**
+<details><summary>Answer</summary>
+
+M2's tracker read entries from the node's log to hash them; compacted entries are gone. M3 hashes at
+write time and keeps hashes below the base across restarts. For an installed snapshot it copies hashes
+1..index from the registry of committed prefix hashes. A snapshot contains only committed entries, so
+its prefix is the committed prefix.
+</details>
+
+**Q9. Check (c) says a node never deletes a committed entry. Why does it apply only to nodes whose term
+is at least the term in which the entry was committed?**
+<details><summary>Answer</summary>
+
+A node in an older term can still accept AppendEntries from a stale leader of a term below the commit
+term. That leader may lack the entry and overwrite it, which is legal (seed 327: n5 at term 27 accepted
+n3's term-28 entry 224, while n4 had committed a different 224 in term 29 without n5). Nodes at the
+commit term or later follow only leaders that hold the entry (Leader Completeness), so for them a
+deletion is always a bug. The committing majority consists of exactly such nodes.
+</details>
+
+---
+
+<a id="m3-17-glossary"></a>
+## 17. Glossary additions
+
+| Term | Meaning |
+|---|---|
+| **page cache** | the OS's in-RAM copy of file data; `write` lands here, `fsync` pushes it to the device |
+| **fsync / fsyncDir** | wait until a file's bytes / a directory's entries (names) are on stable storage |
+| **torn write** | a crash during a write leaves only part of it (sometimes with junk) |
+| **WAL** | write-ahead log: every change is appended and fsynced before it takes effect elsewhere |
+| **segment** | one WAL file; a new one starts after a sync once the current one is full |
+| **torn-tail cut** | recovery truncates an incomplete/bad last record of the last segment |
+| **fail-stop** | on unexpected corruption, stop rather than run on guessed state |
+| **snapshot** | the state machine's state at an applied index, plus that index and its term |
+| **log base / snapshotIndex** | the last index covered by the snapshot; the log holds only entries after it |
+| **compaction** | dropping log entries covered by a durable snapshot |
+| **checkpoint** | a new WAL segment that restates the whole state so older segments can be deleted |
+| **InstallSnapshot** | the RPC that sends a snapshot, in chunks, to a follower behind the leader's base |
+| **atomic replace** | write tmp, fsync, rename over the target, fsync the directory |
+| **shadow model** | the checker's independent record of what each node made durable |
+| **crash loop** | a fault mix dominated by frequent crashes, most of them during an fsync |
+| **Unknown outcome** | a proposal whose index was covered by an installed snapshot; retry needs M4 sessions |

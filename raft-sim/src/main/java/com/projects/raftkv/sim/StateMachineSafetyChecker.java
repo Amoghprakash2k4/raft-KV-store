@@ -4,9 +4,7 @@ import com.projects.raftkv.core.LogEntry;
 import com.projects.raftkv.core.LogView;
 import com.projects.raftkv.core.NodeId;
 import com.projects.raftkv.core.RaftStatus;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -17,23 +15,31 @@ import java.util.Map;
 public final class StateMachineSafetyChecker {
     private record Applied(LogEntry entry, NodeId node, long atMs) {}
 
-    private final List<Applied> appliedByIndex = new ArrayList<>();   // position i - 1 = index i
+    // By index, not by position: a node restored from a snapshot starts applying above it, so indexes
+    // reach the checker with gaps.
+    private final Map<Long, Applied> appliedByIndex = new HashMap<>();
     private final Map<NodeId, Long> lastAppliedSeen = new HashMap<>();
+
+    /** A restarted node rebuilds its state from its snapshot (or from scratch) and counts up again. */
+    void onRestart(NodeId node) { lastAppliedSeen.remove(node); }
 
     void observe(long now, RaftStatus s, LogView log) {
         long prev = lastAppliedSeen.getOrDefault(s.id(), 0L);
         long current = s.lastApplied();
         lastAppliedSeen.put(s.id(), current);
-        // After a restart lastApplied is back at 0 and counts up again; every re-application is checked too.
-        if (current < prev) return;
-        for (long i = prev + 1; i <= current; i++) {
+        // Within one incarnation the applied state only moves forward: going back would un-apply
+        // committed commands that clients may already have seen (a corollary of §5.4.3).
+        if (current < prev) {
+            throw new InvariantViolation("State Machine Safety violated at t=" + now + "ms: " + s.id()
+                    + " rolled its applied state back from index " + prev + " to " + current + " without restarting");
+        }
+        // Every re-application after a restart is checked too. Indexes covered by a snapshot were not
+        // applied entry by entry here: the Replica state checker compares the restored state instead.
+        for (long i = Math.max(prev, log.snapshotIndex()) + 1; i <= current; i++) {
             LogEntry e = log.entryAt(i).orElseThrow(() -> new InvariantViolation(
                     "State Machine Safety: " + s.id() + " applied index beyond its log"));
-            if (i > appliedByIndex.size()) {
-                appliedByIndex.add(new Applied(e, s.id(), now));
-                continue;
-            }
-            Applied first = appliedByIndex.get((int) i - 1);
+            Applied first = appliedByIndex.putIfAbsent(i, new Applied(e, s.id(), now));
+            if (first == null) continue;
             if (!first.entry().equals(e)) {
                 throw new InvariantViolation("State Machine Safety violated at t=" + now + "ms: " + s.id()
                         + " applied " + e + " at index " + i + ", but " + first.node() + " applied "

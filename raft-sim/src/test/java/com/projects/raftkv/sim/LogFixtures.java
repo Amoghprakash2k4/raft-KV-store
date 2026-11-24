@@ -38,10 +38,7 @@ final class LogFixtures {
 
     /** Builds a tracker that has seen the whole log once. */
     static NodeLogTracker tracked(LogView log) {
-        NodeLogTracker t = new NodeLogTracker();
-        t.reset();
-        t.refresh(log);
-        return t;
+        return NodeLogTracker.of(log);
     }
 
     static final class ListLog implements LogView {

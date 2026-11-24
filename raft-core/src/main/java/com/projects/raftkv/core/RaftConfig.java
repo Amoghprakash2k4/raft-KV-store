@@ -12,7 +12,17 @@ public record RaftConfig(NodeId self,
                          List<NodeId> members,
                          int electionTimeoutTicks,
                          int heartbeatIntervalTicks,
-                         int maxEntriesPerAppend) {
+                         int maxEntriesPerAppend,
+                         int snapshotChunkBytes) {
+    /** Figure 13 chunk size in production (DESIGN.md M3-D). */
+    public static final int DEFAULT_SNAPSHOT_CHUNK_BYTES = 64 * 1024;
+
+    public RaftConfig(NodeId self, List<NodeId> members, int electionTimeoutTicks, int heartbeatIntervalTicks,
+                      int maxEntriesPerAppend) {
+        this(self, members, electionTimeoutTicks, heartbeatIntervalTicks, maxEntriesPerAppend,
+                DEFAULT_SNAPSHOT_CHUNK_BYTES);
+    }
+
     public RaftConfig {
         Objects.requireNonNull(self);
         members = List.copyOf(members);
@@ -25,6 +35,7 @@ public record RaftConfig(NodeId self,
         if (heartbeatIntervalTicks < 1 || electionTimeoutTicks <= heartbeatIntervalTicks * 2)
             throw new IllegalArgumentException("need 1 <= heartbeat and election > 2*heartbeat");
         if (maxEntriesPerAppend < 1) throw new IllegalArgumentException("maxEntriesPerAppend < 1");
+        if (snapshotChunkBytes < 1) throw new IllegalArgumentException("snapshotChunkBytes < 1");
     }
 
     public int quorum() { return members.size() / 2 + 1; }

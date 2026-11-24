@@ -4,4 +4,6 @@ package com.projects.raftkv.sim;
 public record SimResult(long seed, long eventsProcessed, long traceHash,
                         int leadersElected, long maxTerm, long firstLeaderAtMs, long lastNewLeaderAtMs,
                         int crashes, int partitions, int pauses,
-                        long proposals, long committed, long lost, long rejected, long maxCommitIndex) {}
+                        long proposals, long committed, long lost, long rejected, long unknown, long maxCommitIndex,
+                        int midWriteCrashes, int tornTailsCut, long restartsChecked,
+                        long snapshotsTaken, long snapshotsInstalled, long maxLogEntries) {}

@@ -47,7 +47,7 @@ final class ClientWorkload {
     private final Map<Long, Client> inFlight = new HashMap<>();
     private long nextProposalId = 1;
 
-    long proposals, committed, lost, rejected;
+    long proposals, committed, lost, rejected, unknown;
     long lastCommitAt = -1;
 
     ClientWorkload(WorkloadConfig cfg, List<NodeId> members, SplittableRandom rng, Scheduler scheduler,
@@ -92,6 +92,7 @@ final class ClientWorkload {
                 lastCommitAt = now;
             }
             case ProposalOutcome.Lost x -> lost++;
+            case ProposalOutcome.Unknown x -> unknown++;
             case ProposalOutcome.Rejected r -> {
                 rejected++;
                 c.target = r.leaderHint().orElseGet(this::randomMember);
