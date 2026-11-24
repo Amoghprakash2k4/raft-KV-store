@@ -7,11 +7,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Milestone gate. Invariants 1-6 (Election Safety, Leader Append-Only, Log Matching, Leader
- * Completeness, State Machine Safety, Durability), replica state agreement, durable votes and liveness,
- * under drops, duplicates, reordering, long delays, symmetric and one-way partitions, crash/restart,
- * crashes in the middle of an fsync and process pauses, with clients proposing commands throughout.
- * Every node runs the real WAL on a simulated disk. Run with -Psim.seeds=5000 for the gate.
+ * Milestone gate. Invariants 1-7 (Election Safety, Leader Append-Only, Log Matching, Leader
+ * Completeness, State Machine Safety, Durability, Linearizability), replica state agreement, durable
+ * votes and liveness, under drops, duplicates, reordering, long delays, symmetric and one-way
+ * partitions, crash/restart, crashes in the middle of an fsync and process pauses, with closed-loop
+ * clients (retries, sessions, ReadIndex reads) over lossy client links throughout. Every node runs the
+ * real WAL on a simulated disk. Run with -Psim.seeds=5000 for the gate.
  */
 class ChaosTest {
 
@@ -36,15 +37,23 @@ class ChaosTest {
             assertThat(results.stream().mapToInt(SimResult::partitions).sum()).isPositive();
             assertThat(results.stream().mapToInt(SimResult::pauses).sum()).isPositive();
             assertThat(results.stream().mapToLong(SimResult::lost).sum()).as("overwritten proposals").isPositive();
+            assertThat(results.stream().mapToLong(SimResult::timeouts).sum()).as("client timeouts").isPositive();
+            assertThat(results.stream().mapToLong(SimResult::redirects).sum()).as("leader redirects").isPositive();
+            assertThat(results.stream().mapToLong(SimResult::duplicatesAnswered).sum()).as("duplicates answered from sessions").isPositive();
+            assertThat(results.stream().mapToLong(SimResult::unansweredAtEnd).sum()).as("unknown-outcome operations").isPositive();
             assertThat(results.stream().mapToInt(SimResult::midWriteCrashes).sum()).as("crashes during fsync").isPositive();
             assertThat(results.stream().mapToInt(SimResult::tornTailsCut).sum()).as("torn WAL tails recovered").isPositive();
             assertThat(results.stream().mapToLong(SimResult::snapshotsTaken).sum()).as("snapshots taken").isPositive();
             assertThat(results.stream().mapToLong(SimResult::snapshotsInstalled).sum()).as("snapshots installed").isPositive();
         }
-        assertThat(results).allSatisfy(r -> assertThat(r.committed()).isPositive());
+        assertThat(results).allSatisfy(r -> {
+            assertThat(r.writesCompleted()).isPositive();
+            assertThat(r.readsCompleted()).isPositive();
+        });
         System.out.printf("[%s %d nodes] seeds=%d elections=%d maxTerm=%d crashes=%d (mid-write %d, torn tails cut %d,"
                         + " restarts checked %d) partitions=%d pauses=%d"
-                        + " | proposals=%d committed=%d lost=%d rejected=%d unknown=%d maxCommitIndex=%d"
+                        + " | ops=%d writes=%d reads=%d attempts=%d timeouts=%d redirects=%d retries=%d unanswered=%d"
+                        + " lost=%d unknown=%d dedupHits=%d linkDups=%d linSteps(max)=%d maxCommitIndex=%d"
                         + " | snapshots taken=%d installed=%d, longest in-memory log=%d entries%n",
                 name, nodes, results.size(),
                 results.stream().mapToInt(SimResult::leadersElected).sum(),
@@ -55,11 +64,19 @@ class ChaosTest {
                 results.stream().mapToLong(SimResult::restartsChecked).sum(),
                 results.stream().mapToInt(SimResult::partitions).sum(),
                 results.stream().mapToInt(SimResult::pauses).sum(),
-                results.stream().mapToLong(SimResult::proposals).sum(),
-                results.stream().mapToLong(SimResult::committed).sum(),
+                results.stream().mapToLong(SimResult::opsStarted).sum(),
+                results.stream().mapToLong(SimResult::writesCompleted).sum(),
+                results.stream().mapToLong(SimResult::readsCompleted).sum(),
+                results.stream().mapToLong(SimResult::attempts).sum(),
+                results.stream().mapToLong(SimResult::timeouts).sum(),
+                results.stream().mapToLong(SimResult::redirects).sum(),
+                results.stream().mapToLong(SimResult::retryReplies).sum(),
+                results.stream().mapToLong(SimResult::unansweredAtEnd).sum(),
                 results.stream().mapToLong(SimResult::lost).sum(),
-                results.stream().mapToLong(SimResult::rejected).sum(),
                 results.stream().mapToLong(SimResult::unknown).sum(),
+                results.stream().mapToLong(SimResult::duplicatesAnswered).sum(),
+                results.stream().mapToLong(SimResult::linkDuplicates).sum(),
+                results.stream().mapToLong(SimResult::linearizabilitySteps).max().orElse(0),
                 results.stream().mapToLong(SimResult::maxCommitIndex).max().orElse(0),
                 results.stream().mapToLong(SimResult::snapshotsTaken).sum(),
                 results.stream().mapToLong(SimResult::snapshotsInstalled).sum(),

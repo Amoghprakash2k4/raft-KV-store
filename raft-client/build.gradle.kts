@@ -3,5 +3,6 @@ plugins {
 }
 
 dependencies {
-    implementation(project(":raft-transport"))
+    api(project(":raft-core"))           // NodeId, Bytes
+    api(project(":raft-statemachine"))   // KvCommand, KvRequest, KvCodec: the request format
 }

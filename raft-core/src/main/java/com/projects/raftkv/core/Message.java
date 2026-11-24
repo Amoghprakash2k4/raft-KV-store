@@ -17,10 +17,24 @@ public sealed interface Message {
     record RequestVoteResponse(NodeId from, NodeId to, long term, boolean voteGranted)
             implements Message {}
 
-    /** Figure 2 AppendEntries arguments. leaderId == from. Empty entries == heartbeat. */
+    /**
+     * Figure 2 AppendEntries arguments. leaderId == from. Empty entries == heartbeat.
+     * {@code readRound} (thesis §6.4, DESIGN.md M4-B): the leader's ReadIndex round when it sent this;
+     * the reply echoes it, which proves the follower still accepted this leader's term after the round
+     * started. 0 = no read round yet.
+     */
     record AppendEntries(NodeId from, NodeId to, long term, long prevLogIndex, long prevLogTerm,
-                         List<LogEntry> entries, long leaderCommit) implements Message {
-        public AppendEntries { entries = List.copyOf(entries); }
+                         List<LogEntry> entries, long leaderCommit, long readRound) implements Message {
+        public AppendEntries {
+            entries = List.copyOf(entries);
+            if (readRound < 0) throw new IllegalArgumentException("negative readRound");
+        }
+
+        /** Without a read round (tests that do not involve reads). */
+        public AppendEntries(NodeId from, NodeId to, long term, long prevLogIndex, long prevLogTerm,
+                             List<LogEntry> entries, long leaderCommit) {
+            this(from, to, term, prevLogIndex, prevLogTerm, entries, leaderCommit, 0);
+        }
     }
 
     /**
@@ -36,13 +50,23 @@ public sealed interface Message {
      *       = its lastIndex + 1. Otherwise conflictTerm = the term it holds at prevLogIndex and
      *       conflictIndex = the first index it holds with that term.</li>
      * </ul>
+     *   <li>{@code readRound}: echoed from the request, success or not (M4-B), but only when the request
+     *       is from the reply's term. A rejection of an older term's request echoes 0: the reply carries
+     *       the follower's newer term, and an echoed old round would pass for an ack in that term.</li>
      * Fields that do not apply are 0.
      */
     record AppendEntriesResponse(NodeId from, NodeId to, long term, boolean success, long matchIndex,
-                                 long rejectedIndex, long conflictTerm, long conflictIndex) implements Message {
+                                 long rejectedIndex, long conflictTerm, long conflictIndex, long readRound)
+            implements Message {
         public AppendEntriesResponse {
-            if (matchIndex < 0 || rejectedIndex < 0 || conflictTerm < 0 || conflictIndex < 0)
+            if (matchIndex < 0 || rejectedIndex < 0 || conflictTerm < 0 || conflictIndex < 0 || readRound < 0)
                 throw new IllegalArgumentException("negative index or term");
+        }
+
+        /** Without a read round (tests that do not involve reads). */
+        public AppendEntriesResponse(NodeId from, NodeId to, long term, boolean success, long matchIndex,
+                                     long rejectedIndex, long conflictTerm, long conflictIndex) {
+            this(from, to, term, success, matchIndex, rejectedIndex, conflictTerm, conflictIndex, 0);
         }
     }
 
@@ -51,11 +75,17 @@ public sealed interface Message {
      * (lastIncludedIndex, lastIncludedTerm), starting at byte {@code offset}. leaderId == from.
      */
     record InstallSnapshot(NodeId from, NodeId to, long term, long lastIncludedIndex, long lastIncludedTerm,
-                           long offset, Bytes data, boolean done) implements Message {
+                           long offset, Bytes data, boolean done, long readRound) implements Message {
         public InstallSnapshot {
             Objects.requireNonNull(data);
-            if (lastIncludedIndex < 1 || lastIncludedTerm < 1 || offset < 0)
+            if (lastIncludedIndex < 1 || lastIncludedTerm < 1 || offset < 0 || readRound < 0)
                 throw new IllegalArgumentException("bad InstallSnapshot header");
+        }
+
+        /** Without a read round (tests that do not involve reads). */
+        public InstallSnapshot(NodeId from, NodeId to, long term, long lastIncludedIndex, long lastIncludedTerm,
+                               long offset, Bytes data, boolean done) {
+            this(from, to, term, lastIncludedIndex, lastIncludedTerm, offset, data, done, 0);
         }
     }
 
@@ -63,12 +93,20 @@ public sealed interface Message {
      * Figure 13 InstallSnapshot results (just {@code term} in the paper), plus what the leader needs
      * with one chunk in flight (DESIGN.md M3-D): which snapshot this answers, how many bytes of it the
      * follower holds ({@code nextOffset}: send from there), and {@code done} once it is installed, or
-     * was not needed because the follower had already committed past it.
+     * was not needed because the follower had already committed past it. {@code readRound} is echoed
+     * from the request (M4-B), except in a rejection of an older term's request (0, see above).
      */
     record InstallSnapshotResponse(NodeId from, NodeId to, long term, long lastIncludedIndex, long nextOffset,
-                                   boolean done) implements Message {
+                                   boolean done, long readRound) implements Message {
         public InstallSnapshotResponse {
-            if (lastIncludedIndex < 0 || nextOffset < 0) throw new IllegalArgumentException("negative field");
+            if (lastIncludedIndex < 0 || nextOffset < 0 || readRound < 0)
+                throw new IllegalArgumentException("negative field");
+        }
+
+        /** Without a read round (tests that do not involve reads). */
+        public InstallSnapshotResponse(NodeId from, NodeId to, long term, long lastIncludedIndex, long nextOffset,
+                                       boolean done) {
+            this(from, to, term, lastIncludedIndex, nextOffset, done, 0);
         }
     }
 }

@@ -25,7 +25,7 @@ import java.util.Map;
  *           | 2 key                  (Get)
  *           | 3 key                  (Delete)
  *           | 4 key optional newValue (Cas: optional = expected)
- *   result  = version:u8(=1) ( 1 optional | 2 bool:u8 optional | 3 string )
+ *   result  = version:u8(=1) ( 1 optional | 2 bool:u8 optional | 3 string | 4 lastSeq:i64 )
  *   string  = length:i32 (>= 0) utf8-bytes      optional = 0 | 1 string      bool = 0 | 1
  * </pre>
  * Canonical: each value has exactly one encoding, and the decoder rejects anything else (unknown tags,
@@ -34,7 +34,9 @@ import java.util.Map;
 public final class KvCodec {
     private static final int VERSION = 1;
     private static final int PUT = 1, GET = 2, DELETE = 3, CAS = 4;
-    private static final int VALUE = 1, CAS_OUTCOME = 2, INVALID = 3;
+    private static final int VALUE = 1, CAS_OUTCOME = 2, INVALID = 3, STALE = 4;
+    /** Snapshot format 2 (M4) adds the client session table after the data. */
+    private static final int SNAPSHOT_VERSION = 2;
 
     private KvCodec() {}
 
@@ -68,6 +70,7 @@ public final class KvCodec {
                     writeOptional(out, c.previous());
                 }
                 case KvResult.Invalid i -> { out.writeByte(INVALID); writeString(out, i.reason()); }
+                case KvResult.Stale st -> { out.writeByte(STALE); out.writeLong(st.lastSeq()); }
             }
         });
     }
@@ -97,6 +100,7 @@ public final class KvCodec {
                 case VALUE -> new KvResult.Value(readOptional(in));
                 case CAS_OUTCOME -> new KvResult.CasOutcome(readFlag(in), readOptional(in));
                 case INVALID -> new KvResult.Invalid(readString(in));
+                case STALE -> new KvResult.Stale(in.readLong());
                 default -> throw new IllegalArgumentException("unknown result tag " + tag);
             };
         });
@@ -104,39 +108,82 @@ public final class KvCodec {
 
     // ---------------------------------------------------------------- snapshots
 
-    /**
-     * Snapshot of the whole map: {@code version u8, count i32, (key, value)*} with keys in strictly
-     * ascending order, so equal maps encode to identical bytes.
-     */
+    /** Everything a snapshot holds: the key-value data and the client session table (thesis §6.3). */
+    public record SnapshotState(TreeMap<String, String> data, TreeMap<Long, KvStateMachine.Session> sessions) {}
+
+    /** A snapshot of data with no sessions. */
     public static Bytes encodeSnapshot(SortedMap<String, String> data) {
-        if (data.comparator() != null) throw new IllegalArgumentException("natural key order required");
+        return encodeSnapshot(data, new TreeMap<>());
+    }
+
+    /**
+     * Snapshot format 2:
+     * <pre>
+     *   version u8(=2), count i32, (key string, value string)*        keys strictly ascending
+     *   sessions i32, (clientId i64, lastSeq i64, reply length-prefixed bytes)*   clientIds strictly ascending
+     * </pre>
+     * Equal states encode to identical bytes (DESIGN.md E1a rule 4).
+     */
+    public static Bytes encodeSnapshot(SortedMap<String, String> data, SortedMap<Long, KvStateMachine.Session> sessions) {
+        if (data.comparator() != null || sessions.comparator() != null)
+            throw new IllegalArgumentException("natural key order required");
         return write(out -> {
-            out.writeByte(VERSION);
+            out.writeByte(SNAPSHOT_VERSION);
             out.writeInt(data.size());
             for (Map.Entry<String, String> e : data.entrySet()) {
                 writeString(out, e.getKey());
                 writeString(out, e.getValue());
             }
+            out.writeInt(sessions.size());
+            for (Map.Entry<Long, KvStateMachine.Session> e : sessions.entrySet()) {
+                out.writeLong(e.getKey());
+                out.writeLong(e.getValue().lastSeq());
+                byte[] reply = e.getValue().reply().toByteArray();
+                out.writeInt(reply.length);
+                out.write(reply);
+            }
         });
     }
 
-    /** Strict inverse of {@link #encodeSnapshot}: rejects anything that is not exactly canonical. */
+    /** The data part of a snapshot (tests). */
     public static TreeMap<String, String> decodeSnapshot(Bytes b) {
+        return decodeSnapshotState(b).data();
+    }
+
+    /** Strict inverse of {@link #encodeSnapshot}: rejects anything that is not exactly canonical. */
+    public static SnapshotState decodeSnapshotState(Bytes b) {
         return read(b, in -> {
-            readVersion(in);
+            int v = in.readUnsignedByte();
+            if (v != SNAPSHOT_VERSION) throw new IllegalArgumentException("unsupported snapshot version " + v);
             int n = in.readInt();
             if (n < 0 || n > in.available()) throw new IllegalArgumentException("bad entry count " + n);
             TreeMap<String, String> m = new TreeMap<>();
             String prev = null;
             for (int i = 0; i < n; i++) {
                 String k = readString(in);
-                String v = readString(in);
+                String val = readString(in);
                 if (prev != null && prev.compareTo(k) >= 0)
                     throw new IllegalArgumentException("snapshot keys out of order: " + prev + " then " + k);
-                m.put(k, v);
+                m.put(k, val);
                 prev = k;
             }
-            return m;
+            int sn = in.readInt();
+            if (sn < 0 || sn > in.available()) throw new IllegalArgumentException("bad session count " + sn);
+            TreeMap<Long, KvStateMachine.Session> sessions = new TreeMap<>();
+            long prevId = Long.MIN_VALUE;
+            for (int i = 0; i < sn; i++) {
+                long id = in.readLong();
+                long lastSeq = in.readLong();
+                int len = in.readInt();
+                if (len < 0 || len > in.available()) throw new IllegalArgumentException("bad reply length " + len);
+                byte[] reply = in.readNBytes(len);
+                if (i > 0 && prevId >= id)
+                    throw new IllegalArgumentException("snapshot sessions out of order: " + prevId + " then " + id);
+                if (id == 0 || lastSeq < 1) throw new IllegalArgumentException("bad session " + id + "/" + lastSeq);
+                sessions.put(id, new KvStateMachine.Session(lastSeq, Bytes.copyOf(reply)));
+                prevId = id;
+            }
+            return new SnapshotState(m, sessions);
         });
     }
 

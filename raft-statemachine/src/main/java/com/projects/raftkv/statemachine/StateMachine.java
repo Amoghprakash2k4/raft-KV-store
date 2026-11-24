@@ -16,6 +16,13 @@ public interface StateMachine {
     /** Applies the command committed at {@code index} and returns the encoded result for the client. */
     Bytes apply(long index, Bytes command);
 
+    /**
+     * Answers a read-only query against the current state, without going through the log: the driver
+     * calls it for a ReadIndex read once lastApplied >= readIndex (thesis §6.4). Must not change any
+     * state (no session update, no index), so replicas stay identical.
+     */
+    Bytes query(Bytes query);
+
     /** The index of the last entry applied, or of the snapshot restored (0 if none). */
     long lastAppliedIndex();
 

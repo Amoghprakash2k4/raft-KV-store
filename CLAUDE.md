@@ -8,14 +8,17 @@ A Raft-based replicated key-value store in plain Java 21, built from scratch as 
 for the owner: a new grad with about 6 months of Java/Spring experience who wants to deeply understand
 consensus and end up with an interview-grade project. You act as a **senior distributed-systems mentor**.
 
-## Status (last updated 2026-11-24)
+## Status (last updated 2026-11-25)
 - **M1 Leader Election: DONE.** Gate passed: 0 Election Safety violations over 5,000 seeds × {3, 5} nodes.
 - **M2 Log Replication: DONE** (accepted by the owner 2026-11-23). 0 violations of invariants 1–5 over
   5,000 seeds × {3, 5} nodes; all mutation checks caught (rates in MILESTONES.md).
 - **M3 Durability: DONE** (accepted by the owner 2026-11-24). 0 violations of invariants 1–6 over
   5,000 seeds × {3, 5} × {chaos, crash loop}; all M3-F mutations caught (rates in MILESTONES.md).
-- **M4: next**, on branch `m4`. Start by asking about client session expiry (below).
-- **Git:** M1 `b0420ae`, docs `eb85e73`, M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
+- **M4 Clients and reads: DONE** (accepted by the owner 2026-11-25, committed on `m4`, merged to `main`, pushed).
+  The gate found a real ReadIndex bug (seed 4811: a stale-term rejection echoed a read round); fixed.
+  Sessions + dedup, `ClientSession` (raft-client), ReadIndex, linearizability checker (invariant 7),
+  lossy client links, three mutations caught. Gate numbers in MILESTONES.md. Not committed yet.
+- **Git:** history rewritten 2026-11-24 (author → "Amogh P"): M1 `a645fa8`, docs `069cc15`, M2 `ec88c75`, M3 `be439fc`. M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
   2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 
 ## How the owner wants to work (learned from the conversation)
@@ -55,6 +58,14 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   M2-B hand-written binary codec; M2-C test-only `Set<ProtocolMutation>`; M2-D open-loop sim clients
   without retries; M2-E driver matches `ProposalAccepted(index, term)` at apply time. Fast backup is
   added after the basic version passes.
+- **M4 choices (approved 2026-11-24):** scope = only the important parts; skipped on purpose (DEVIATIONS
+  K1–K5): session expiry (table unbounded), RegisterClient, lease reads, follower reads, pipelining.
+  M4-A pure `ClientSession` + closed-loop sim clients + lossy client links; M4-B ReadIndex with a
+  `readRound` echoed on AppendEntries/InstallSnapshot responses (one round in flight, batching); M4-C
+  sessions in `KvStateMachine` (snapshot v2, in `stateHash`, client 0 = no session); M4-D Wing & Gong +
+  Lowe memo, per key, unknown ops optional, 20M-step budget; M4-E one record per op, unique values;
+  M4-F mutations SKIP_DEDUP / READ_WITHOUT_QUORUM_CHECK / READ_BEFORE_CURRENT_TERM_COMMIT under
+  `FaultConfig.leaderHunting`.
 - **M3 choices (approved):** M3-A one WAL with typed records + CRC32C, torn-tail cut, checkpoint
   segments; M3-B real WAL on `SimDisk` in the simulator; M3-C core holds the latest snapshot bytes;
   M3-D Figure 13 chunks (64 B in sim); M3-E driver snapshots every N applied entries
@@ -63,7 +74,7 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   The owner asked for it to be checked once logs are non-empty.
 
 ## Still open (ask at the named milestone)
-- **M4:** client session expiry (unbounded table vs. deterministic expiry, thesis §6.3).
+- **M5:** PreVote, CheckQuorum, gRPC transport, metrics, CLI/HTTP client: ask before choosing approaches.
 
 ## Layout
 ```
@@ -76,24 +87,25 @@ raft-storage/       com.projects.raftkv.storage    Storage, InMemoryStorage (uni
                     ...storage.disk                Disk, RealDisk, SimDisk (page-cache crash model)
                     ...storage.wal                 FileWalStorage, WalRecord, WalCodec, WalOptions
 raft-transport/     com.projects.raftkv.transport  Transport
-raft-node/          com.projects.raftkv.node       NodeDriver (apply + pending proposals), ProposalOutcome,
-                                                   NodeHaltedException
-raft-statemachine/  com.projects.raftkv.statemachine StateMachine, KvStateMachine (TreeMap), KvCommand,
-                                                   KvRequest (clientId, seq), KvResult, KvCodec
-raft-client/        (empty: M4)
+raft-node/          com.projects.raftkv.node       NodeDriver (apply, pending proposals, ReadIndex reads),
+                                                   ProposalOutcome, ReadOutcome, NodeHaltedException
+raft-statemachine/  com.projects.raftkv.statemachine StateMachine (apply, query), KvStateMachine (data + session
+                                                   table), KvCommand, KvRequest (clientId, seq), KvResult (+Stale),
+                                                   KvCodec (snapshot v2 with sessions)
+raft-client/        com.projects.raftkv.client     ClientSession (pure: seq, retries, hints, timeouts)
 raft-sim/           com.projects.raftkv.sim        Simulation, NetworkConfig, FaultConfig, SimConfig,
                                                    WorkloadConfig, StorageConfig, ClientWorkload, Trace,
                                                    NodeLogTracker, TrackedStorage, checkers: ElectionSafety,
                                                    VoteDurability, LogMatching, LeaderAppendOnly,
                                                    LeaderCompleteness, StateMachineSafety, ReplicaState,
-                                                   Durability
+                                                   Durability; HistoryRecorder, LinearizabilityChecker
 compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md
 ```
 
 ## Commands
 ```
-./gradlew build                                   # all modules, 250 tests (~20 s), 300 seeds per chaos test
-./gradlew :raft-sim:test -Psim.seeds=5000         # milestone gate (~2.5 min: chaos + crash loop × {3, 5})
+./gradlew build                                   # all modules, 312 tests, 300 seeds per chaos test
+./gradlew :raft-sim:test --tests '*ChaosTest*' -Psim.seeds=5000   # milestone gate (chaos + crash loop × {3, 5})
 ./gradlew :raft-sim:test -Psim.seed=N             # replay one seed
 ```
 JDK 21 is installed at `/Users/amoghp/Library/Java/JavaVirtualMachines/ms-21.0.11` (the default `java`
@@ -101,8 +113,8 @@ is 25; the Gradle toolchain picks 21 automatically). Gradle 9.9.2 wrapper.
 
 ## Conventions and gotchas
 - Write tests first. Javadoc on each protocol rule cites the paper section or figure.
-- Shortcuts are marked `// SHORTCUT:` in code and listed in DEVIATIONS.md. After M2 there are none in
-  code; only P3 (`ReadRequested` throws until M4) and harness notes H1/H2 remain.
+- Shortcuts are marked `// SHORTCUT:` in code and listed in DEVIATIONS.md. After M4 there are none in
+  code; DEVIATIONS lists the M4 skips (K1–K5) and harness notes H2–H5.
 - Mutation hooks: `RaftNodeCore.withMutationsForTesting` + `ProtocolMutation`; each hook is one
   `// MUTATION (test only)` line. The Figure 8 mutation is only reachable with
   `withMaxEntriesPerAppend(1)` (the no-op otherwise rides with the old entries).
@@ -126,6 +138,19 @@ is 25; the Gradle toolchain picks 21 automatically). Gradle 9.9.2 wrapper.
   "committed entry never deleted" holds only for nodes at or past the commit term (Figure 8; seed 327).
 - WAL segments roll only right after a successful sync; that's what makes "bad bytes in the last
   segment = torn tail, elsewhere = corruption" valid. Snapshot file must be durable before `CompactLog`.
+- M4: dedup happens at **apply** time (a retry is a second log entry answered from the session). Client
+  attempt ids are `clientId << 40 | n`; each delivered copy of a client request gets its own
+  proposal/read id at the node (`Simulation.attemptOfDelivery`). `NodeDriver.create(..., readOutcomes,
+  snapshotEvery)` is the overload with a read listener; the others throw if a read is served.
+- M4 seed 4811: a rejection of an **older term's** AppendEntries/InstallSnapshot echoes read round 0.
+  The reply carries the follower's newer term, so an echoed old round would count as a current ack.
+  `-Psim.trace=N` keeps N trace lines (default 300) when debugging a replayed seed.
+- jqwik draws new random inputs every run. A property failing on an untouched module is a new input,
+  not a flake: reproduce it from the "Sample" in the test report and pin it as an `@Test` regression
+  (M4 found a wrong oracle in `WalTornTailProperties` this way).
 - Git: the project repo is this folder (remote `origin` = GitHub `Distributed-Raft-based-KV-store`).
   `/Users/amoghp` also contains a stray `~/.git`; the owner was warned. Never run git from the home
   directory.
+- Commits are authored as `Amogh P <143121631+Amoghprakash2k4@users.noreply.github.com>` (set in this
+  repo's local git config; the global config is the owner's work identity, leave it). **Never add a
+  `Co-Authored-By: Claude` trailer** or any Claude attribution to commits or PRs.

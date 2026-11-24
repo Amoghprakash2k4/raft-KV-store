@@ -115,7 +115,7 @@ rule it breaks. **Rejected:** subclass overrides (non-final classes, `this-escap
 (slow, untargeted; possible M6 extra).
 
 ### M2-D. Simulated clients: open loop, no retries
-Simulated clients propose random PUT/DELETE/CAS commands every 20–100 ms to the node they believe is
+**Superseded by M4-A.** Simulated clients propose random PUT/DELETE/CAS commands every 20–100 ms to the node they believe is
 leader, follow rejection hints, and never retry an unknown outcome. M2 checks that replicas agree
 (invariants 2–5); what clients observe (linearizability) is M4, together with retries and sessions.
 
@@ -171,3 +171,99 @@ Production 10,000; simulator 30-100.
 Lying fsync (on the WAL now), recovery that does not cut the torn tail, a snapshot renamed into place
 without fsyncing its data first, and a naive follower InstallSnapshot (no stale check, always discards
 the log). Each one must be caught by a checker, with measured rates and a clean control run.
+
+## M4. Clients and reads decisions (approved 2026-11-24)
+
+Scope: only the parts that matter for correctness. Session expiry, RegisterClient, lease reads, follower
+reads and client pipelining are skipped on purpose (DEVIATIONS.md K1–K5, EXPLANATION.md M4 §2).
+
+```mermaid
+flowchart LR
+    subgraph client["raft-client (pure)"]
+        CS["ClientSession<br/>clientId, seq, leader guess<br/>one op in flight"]
+    end
+    subgraph node["one node"]
+        D["NodeDriver"]
+        C["RaftNodeCore<br/>ReadIndex rounds"]
+        SM["KvStateMachine<br/>data + session table"]
+    end
+    CS -- "write: KvRequest(clientId, seq, cmd)<br/>same seq on every retry" --> D
+    CS -- "read: Get(key)" --> D
+    D -- "ProposeCommand / ReadRequested" --> C
+    C -- "toApply / ReadReady(readId, readIndex)" --> D
+    D -- "apply (dedup by session)" --> SM
+    D -- "query, once lastApplied ≥ readIndex" --> SM
+    D -- "Committed / Rejected(hint) / Lost / ReadOk" --> CS
+```
+
+### M4-A. Client model: a pure `ClientSession`, closed-loop simulated clients, lossy client links
+`raft-client` holds `ClientSession`, a pure state machine with no network or clock. It keeps one
+operation in flight: a write gets the next `seq`, and every retry re-sends exactly the same
+`KvRequest(clientId, seq, command)`. Any attempt's success completes the operation; only the latest
+attempt's failure or timeout triggers a retry. A rejection with a leader hint goes straight there; one
+without a hint backs off (10 ms in the simulator) and tries another node; a timeout (150 ms) tries
+another node. The simulator runs 5 closed-loop clients on it (think time 5–30 ms, 30% reads). Client
+requests and replies travel over lossy links with the peer network's drop, duplicate and long-delay
+probabilities. Each delivered copy gets its own proposal or read id at the node.
+**Rejected:** clients inside the simulator only (M5's network client would have to re-implement the
+retry rules); reliable client links (retries and duplicates would never happen, so dedup would go
+untested; that was harness note H1).
+
+### M4-B. ReadIndex with a read round carried on AppendEntries (thesis §6.4)
+`ReadRequested(readId)` on a non-leader is rejected with the leader hint. On the leader:
+1. Wait until it has committed an entry of its own term (its no-op). Before that its `commitIndex` can lag
+   behind writes earlier leaders committed and acknowledged.
+2. `readIndex = commitIndex`.
+3. Start read round `r + 1` and send AppendEntries to every peer. `AppendEntries`, `InstallSnapshot` and
+   both responses carry `readRound`; a response echoes it, success or not, because a reply in our term
+   proves the follower still accepted us after the read arrived. A rejection of an **older** term's
+   request echoes 0. It carries the follower's newer term, so an old term's round number would pass as a
+   current ack (found by the gate, seed 4811; EXPLANATION.md M4 §15). The leader keeps
+   `ackedRound[peer] = max(...)`, so reordered and duplicated replies are harmless, and releases every read
+   whose round is at or below the round a majority (counting itself) has echoed. At most one round is in
+   flight; reads arriving meanwhile batch into the next round. Heartbeats always carry the current
+   round, so a lost round is retried.
+4. The core emits `ReadReady(readId, readIndex)`; the driver serves it once `lastApplied ≥ readIndex`
+   with `StateMachine.query`, which changes nothing.
+
+Stepping down rejects every pending read. A deposed leader can never answer, because no majority
+echoes its old term.
+**Rejected:** lease reads (safety would depend on bounded clock drift; the brief forbids it); reads
+through the log (a log entry and an fsync per read); a separate ReadIndex message type (the round field
+on existing messages does the same job, as etcd's heartbeat context does).
+
+### M4-C. Sessions live in the replicated state machine (thesis §6.3)
+`KvStateMachine` keeps `clientId → (lastSeq, reply)` and decides at apply time:
+- `seq == lastSeq` → return the saved reply without executing;
+- `seq < lastSeq` → `KvResult.Stale` (an old copy nobody waits for);
+- `seq > lastSeq` → execute and save.
+
+Client 0 means "no session" (tools, tests and read queries). The table is in snapshot format v2 (sorted
+by clientId, strictly checked) and in `stateHash`, so the replica checker compares it. It never expires
+(owner decision, K1).
+**Rejected:** dedup in the driver or the core (not replicated, so replicas would decide differently after
+a crash or snapshot install).
+
+### M4-D. Linearizability checker: Wing & Gong with Lowe's memoization, per key
+At the end of each run, `LinearizabilityChecker` searches for a legal order of the recorded operations
+(Porcupine's algorithm). It tries linearizing an operation at its invocation, backtracks at a response
+that is not yet linearized, and memoizes (set of linearized operations, register state). The history is
+split per key, since registers compose (linearizability is local). The model is `KvStateMachine`'s
+semantics for one key. Operations without an answer get a response at +∞ and accept any output, so they
+may take effect or not. A search budget (20 million steps) turns an undecidable history into a
+failure with its own message. On failure it reports the operation with no legal point, the last
+operations completed before it, and those overlapping it.
+**Rejected:** Knossos/Porcupine as libraries (the brief asks for our own checker); a checker without
+memoization (exponential on long histories).
+
+### M4-E. History: one record per operation, unique values
+`HistoryRecorder` records each client operation (not each attempt) from the client's invocation time to
+the time it accepted an answer. Written values name their writer and seq (`c3-17`), so every value is
+unique and a stale or duplicated effect cannot hide behind an equal value.
+
+### M4-F. Mutations that must be caught, and a leader-targeted fault mix
+`SKIP_DEDUP` (state machine re-executes duplicates), `READ_WITHOUT_QUORUM_CHECK` (no step 3) and
+`READ_BEFORE_CURRENT_TERM_COMMIT` (no step 1), each caught by the linearizability checker, with clean
+control runs. A bad ReadIndex is stale only in the short window around a leadership change. So the
+read mutations run under `FaultConfig.leaderHunting()`, where 70% of faults isolate, pause or crash the
+current leader. This plays the same role as batch size 1 for the Figure 8 mutation.

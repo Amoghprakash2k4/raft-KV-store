@@ -70,8 +70,9 @@ class KvStateMachineTest {
         KvStateMachine other = new KvStateMachine();
         run(new KvCommand.Put("a", "1"));
         run(new KvCommand.Put("b", "2"));
-        other.apply(1, KvCodec.encode(new KvRequest(2, 1, new KvCommand.Put("b", "2"))));
-        other.apply(2, KvCodec.encode(new KvRequest(2, 2, new KvCommand.Put("a", "1"))));
+        // Same client and seqs: the session tables match too (the hash covers them, see KvSessionTest).
+        other.apply(1, KvCodec.encode(new KvRequest(1, 1, new KvCommand.Put("b", "2"))));
+        other.apply(2, KvCodec.encode(new KvRequest(1, 2, new KvCommand.Put("a", "1"))));
 
         assertThat(other.stateHash()).isEqualTo(sm.stateHash());
         run(new KvCommand.Put("b", "3"));

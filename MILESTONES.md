@@ -76,7 +76,7 @@ Replay: `./gradlew :raft-sim:test -Psim.seeds=5000` (gate), `-Psim.seed=N` (one 
 - [x] Gate: invariants 1–5 hold over 5,000 seeds with drops, duplicates, reordering, partitions and crashes.
 
 ### Carried to M4
-- [ ] `ReadRequested` / ReadIndex (P3 remainder). Client retries, sessions and dedup; lossy client links (H1).
+- [x] `ReadRequested` / ReadIndex (P3 remainder). Client retries, sessions and dedup; lossy client links (H1). Done in M4.
 
 ---
 
@@ -129,3 +129,76 @@ Mutation checks (measured rates):
 - [x] Mutations M3-F caught, with control runs
 - [x] Gate over 5,000 seeds
 - [x] Docs: DESIGN, DEVIATIONS, CLAUDE.md, EXPLANATION.md `# M3`
+
+---
+
+## M4: Clients and reads ✅ done (gate passed and accepted by the owner 2026-11-25)
+
+**Exit criterion:** invariant 7 (Linearizability) holds for the recorded client history over 1,000+
+chaos runs, and the M4 mutations are caught. Invariants 1–6 keep holding.
+
+**Built:** client sessions with exactly-once writes (dedup at apply time, in snapshots and the state
+hash); `ClientSession` (one operation in flight, same seq on every retry, leader hints, timeouts);
+ReadIndex reads (current-term commit, a `readRound` echoed on replication messages, wait for apply);
+lossy client links; `HistoryRecorder` + `LinearizabilityChecker` (Wing & Gong with Lowe's memo, per
+key); three mutations with leader-targeted faults.
+
+```mermaid
+flowchart LR
+    C["ClientSession<br/>clientId, seq, retries"] -- "write (clientId, seq)" --> L["leader"]
+    C -- "read" --> L
+    L -- "log → commit → apply" --> SM["KvStateMachine<br/>session table: dedup"]
+    L -- "ReadIndex round<br/>majority echo" --> P["followers"]
+    SM -- "answers" --> C
+    H["HistoryRecorder"] -. "every op: invoke, return, output" .-> LC["LinearizabilityChecker<br/>invariant 7"]
+```
+
+**Result:** 5,000 seeds × {3, 5} nodes × {chaos, crash loop} with 0 violations of invariants 1–7, vote
+durability, replica-state agreement, commit liveness and client liveness. Runtime 3 min 46 s.
+
+| Config | Client ops | Reads | Attempts | Dedup hits | Unknown at end | Max checker steps |
+|---|---|---|---|---|---|---|
+| chaos, 3 | 2,778,793 | 828,283 | 5,201,465 | 656,519 | 5,097 | 1,116 |
+| chaos, 5 | 3,576,365 | 1,067,595 | 5,799,628 | 1,181,729 | 8,355 | 1,248 |
+| crash loop, 3 | 1,643,026 | 487,377 | 4,580,184 | 586,035 | 6 | 651 |
+| crash loop, 5 | 2,565,638 | 764,252 | 5,226,128 | 1,424,296 | 176 | 1,017 |
+
+The first gate run failed on one seed (chaos, 5 nodes, seed 4811): a **real ReadIndex bug**. A
+follower rejected a long-delayed AppendEntries from the leader's older term but echoed its read round
+under its own newer term; the leader counted it and, cut off from the majority, served a stale read.
+Fix: a rejection of an older term's request echoes no round. Regression tests: two in `ReadIndexTest`,
+plus `RegressionSeedsTest.seed4811StaleTermReadRoundEcho` (EXPLANATION.md M4 §15).
+
+Mutation checks (measured rates):
+
+| Mutation | Config, seeds | Caught by |
+|---|---|---|
+| SKIP_DEDUP (duplicates re-executed) | chaos, 100 | Linearizability 100 |
+| READ_WITHOUT_QUORUM_CHECK | leader faults, 80% reads, 2 keys, 100 | Linearizability 75 |
+| READ_BEFORE_CURRENT_TERM_COMMIT | leader faults, 50% reads, 1 key, 200 | Linearizability 39 |
+| M2/M3 mutations, re-measured | as in M2/M3 | all still caught (Figure 8 4/1000, lying disk 50/50, snapshot fsync 67/100) |
+| Controls (batch 1; crash loop; both leader-fault mixes) | 100 + 100 + 100 + 200 | no violations |
+
+**Skipped on purpose** (owner's scope choice, 2026-11-24; none affects safety; full reasons and
+interview answers in EXPLANATION.md M4 §2–§3, list in DEVIATIONS.md K1–K5):
+
+| # | Skipped | Why it is safe to skip | Cost |
+|---|---|---|---|
+| K1 | Session expiry | 5 clients → 5 rows; correct expiry needs leader timestamps in the log so replicas expire identically | memory grows with clients ever seen |
+| K2 | RegisterClient | random 64-bit ids are unique in practice; registration matters mainly together with expiry | ids unique by chance, not by construction |
+| K3 | Lease reads | refused: they make safety depend on clock drift and pauses; ReadIndex is timing-free | one round trip per read batch |
+| K4 | Follower reads | scaling only; followers redirect to the leader, equally correct | the leader serves all reads |
+| K5 | Pipelining | one op in flight keeps dedup to "last seq + reply" | per-client throughput |
+
+`./gradlew build`: 312 tests, green.
+
+### Checklist
+- [x] Linearizability checker first, with hand-made histories and a jqwik property
+- [x] Sessions: dedup, `Stale`, snapshot v2, sessions in the state hash, `query`
+- [x] `ClientSession`: same seq on retry, hints, back-off, timeouts
+- [x] Simulator: closed-loop clients, lossy client links, history, invariant 7, client liveness
+- [x] ReadIndex in the core and the driver; reads no longer go through the log
+- [x] Mutations M4-F caught, with controls
+- [x] Gate over 5,000 seeds (bug at seed 4811 found and fixed, regression pinned)
+- [x] Docs: DESIGN, DEVIATIONS, CLAUDE.md, README, EXPLANATION.md `# M4`
+- [x] Accepted by the owner 2026-11-25; committed and pushed

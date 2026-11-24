@@ -102,6 +102,7 @@ class NodeDriverTest {
             @Override public long lastAppliedIndex() { return 0; }
             @Override public Bytes snapshot() { throw new UnsupportedOperationException(); }
             @Override public void restore(long index, Bytes snapshot) { throw new UnsupportedOperationException(); }
+            @Override public Bytes query(Bytes query) { throw new UnsupportedOperationException(); }
         };
         NodeDriver d = NodeDriver.create(new ScriptedCore(ready(List.of(new PersistOp.AppendEntries(List.of(e))),
                 List.of(msg), List.of(e), List.of())), new RecordingStorage(ops), m -> ops.add("send"), sm, o -> {});

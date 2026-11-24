@@ -17,7 +17,8 @@ import org.junit.jupiter.api.Test;
 class MutationSanityTest {
 
     private static final String[] SAFETY = {"Election Safety", "Vote durability", "Leader Append-Only",
-            "Log Matching", "Leader Completeness", "State Machine Safety", "Replica state divergence", "Durability"};
+            "Log Matching", "Leader Completeness", "State Machine Safety", "Replica state divergence", "Durability",
+            "Linearizability"};
 
     /** Failures of one mutated configuration, grouped by what caught them. */
     private record Tally(String name, int seeds, Map<String, Integer> caughtBy) {
@@ -137,6 +138,48 @@ class MutationSanityTest {
         assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(90);         // measured 99/100
     }
 
+    // ---------------------------------------------------------------- M4 client mutations (DESIGN.md M4-F)
+
+    /**
+     * Thesis §6.3: without dedup, a retried or duplicated write runs again. Invisible to the replica
+     * checkers (every replica re-runs it identically); only what clients observe shows it.
+     */
+    @Test
+    void skippingDedupIsCaughtByLinearizability() {
+        Tally t = run("skip dedup", SimConfig.chaos(3).withoutDedup(), 100);
+        assertThat(t.count("Linearizability")).isGreaterThanOrEqualTo(95);   // measured 100/100
+    }
+
+    /**
+     * The fault mix aimed at the leader (DESIGN.md M4-F): most faults isolate, pause or crash the current
+     * leader. A bad ReadIndex is stale only in the short window around a leadership change, so this puts
+     * many more reads in that window (as batch size 1 does for Figure 8).
+     */
+    private static SimConfig leaderHunting(int readPercent, int keys) {
+        return SimConfig.chaos(3).withFaults(FaultConfig.leaderHunting())
+                .withWorkload(new WorkloadConfig(5, 5, 30, keys, 150, 10, readPercent));
+    }
+
+    /** Thesis §6.4 step 3: a deposed leader that never confirms its leadership serves stale reads. */
+    @Test
+    void readingWithoutAQuorumCheckIsCaughtByLinearizability() {
+        Tally t = run("read without quorum check (leader faults, 80% reads)",
+                leaderHunting(80, 2).withMutation(ProtocolMutation.READ_WITHOUT_QUORUM_CHECK), 100);
+        assertThat(t.count("Linearizability")).isGreaterThanOrEqualTo(60);   // measured 75/100
+    }
+
+    /**
+     * Thesis §6.4 step 1: a new leader reading before its no-op commits may miss writes the old leader
+     * committed and acknowledged. Needs a write acknowledged in the last heartbeat before a leader
+     * change and a read reaching the new leader within one round trip of its election: a narrow window.
+     */
+    @Test
+    void readingBeforeTheCurrentTermCommitIsCaughtByLinearizability() {
+        Tally t = run("read before current-term commit (leader faults, 50% reads, 1 key)",
+                leaderHunting(50, 1).withMutation(ProtocolMutation.READ_BEFORE_CURRENT_TERM_COMMIT), 200);
+        assertThat(t.count("Linearizability")).isGreaterThanOrEqualTo(30);   // measured 40/200
+    }
+
     /** Control: the same runs without a mutation are clean, so the catches above are caused by the mutations. */
     @Test
     void unmutatedControlRunsAreClean() {
@@ -144,5 +187,9 @@ class MutationSanityTest {
         assertThat(t.safetyCatches()).isZero();
         Tally loop = run("control (crash loop)", SimConfig.crashLoop(3), 100);
         assertThat(loop.safetyCatches()).isZero();
+        Tally reads = run("control (leader faults, 80% reads)", leaderHunting(80, 2), 100);
+        assertThat(reads.safetyCatches()).isZero();
+        Tally mixed = run("control (leader faults, 50% reads, 1 key)", leaderHunting(50, 1), 200);
+        assertThat(mixed.safetyCatches()).isZero();
     }
 }

@@ -2383,3 +2383,891 @@ deletion is always a bug. The committing majority consists of exactly such nodes
 | **shadow model** | the checker's independent record of what each node made durable |
 | **crash loop** | a fault mix dominated by frequent crashes, most of them during an fsync |
 | **Unknown outcome** | a proposal whose index was covered by an installed snapshot; retry needs M4 sessions |
+---
+
+# M4: Clients and reads
+
+**Status:** done (gate passed and accepted by the owner 2026-11-25). §0–§3 were written before any code,
+to fix the scope: the words you need, and what M4 deliberately **does not** build and why. §4–§18
+explain what was built, how it is tested, what the runs showed, and the ReadIndex bug the gate caught
+(§15).
+
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **client** | a program that sends commands (PUT, GET, DELETE, CAS) to the cluster and waits for results |
+| **client session** | what the cluster remembers about one client: its ID and the last request it executed for it, plus that request's result |
+| **clientId** | a number that identifies one client for its whole lifetime |
+| **sequence number (seq)** | a counter the client puts on each request: 1, 2, 3… A **retry of the same request keeps the same seq**; a new request gets the next one |
+| **retry** | sending the same request again because no answer came back (lost message, crashed leader, timeout) |
+| **duplicate** | the same request arriving twice: from a retry, or because the network delivered one message twice |
+| **at-most-once** | a request runs once or not at all; you may never learn which (no retries) |
+| **at-least-once** | the request runs at least once, maybe more (retries without dedup) |
+| **exactly-once** | the request's effect happens once, even if it arrives many times: at-least-once delivery + dedup |
+| **dedup (deduplication)** | recognising a duplicate by (clientId, seq) and returning the saved result instead of running it again |
+| **idempotent** | running it twice gives the same result as once. GET is idempotent; "add 10 to x" is not; PUT looks idempotent but isn't once other writes interleave (see below) |
+| **linearizability** | every operation appears to take effect at one instant between when the client sent it and when it got the answer, and all clients agree on that order. Informally: the cluster behaves like a single, correct, up-to-date machine |
+| **stale read** | a read that returns a value that was already overwritten by a write that had *completed* before the read started. Not linearizable |
+| **ReadIndex** | the thesis §6.4 way to do linearizable reads without writing to the log: the leader notes its commitIndex, confirms it is still leader with one heartbeat round to a majority, waits until it has applied up to that index, then answers from its state machine |
+| **lease** | a time-limited promise: "for the next X ms, no other node can become leader". Lets a leader answer reads without a heartbeat round, but only if clocks behave |
+| **clock drift** | two computers' clocks running at slightly different speeds; also clock jumps (NTP corrections) and pauses (garbage collection, VM migration) |
+| **follower read** | a follower answering a read itself, after getting the read index from the leader, to spread read load |
+| **pipelining** | a client sending its next request before the previous one has been answered |
+| **session expiry** | removing old sessions so the session table doesn't grow forever |
+
+### Why exactly-once needs dedup: an example
+
+```
+client c1:  PUT x=1 (seq 7) ──► leader appends, commits, applies: x=1
+                                 reply is LOST in the network
+client c2:  PUT x=2 ──────────► applied: x=2   (c2 gets "ok")
+client c1:  no answer, so it retries PUT x=1 (seq 7)
+   without dedup:  applied AGAIN → x=1        c2's completed write silently undone ✗
+   with dedup:     session says "c1 already ran seq 7" → return the saved reply, x stays 2 ✓
+```
+
+That's why PUT is not really idempotent in a system with several clients: running it twice can undo
+someone else's write that happened in between.
+
+## 1. What M4 builds
+
+- Client sessions + dedup in the state machine (exactly-once writes, thesis §6.3).
+- A client that retries with the **same** seq, follows leader hints, and tries another node on timeout.
+- ReadIndex reads (thesis §6.4), confirmed with a round counter carried on heartbeats.
+- A linearizability checker (invariant 7) and a history recorder in the simulator.
+- Lossy client links (requests and replies dropped, duplicated, delayed), so retries really happen.
+- Three deliberate bugs that the checker must catch.
+
+## 2. What M4 skips, and why
+
+None of the skipped items affects **safety**: with them missing, no write is lost or applied twice, and
+no read is stale. Each is either an optimisation or a production concern that only matters with huge
+numbers of clients or heavy read load. Each is also listed in `DEVIATIONS.md`.
+
+### 2.1 Session expiry (thesis §6.3.2)
+
+**What it is.** Every client that ever talked to the cluster has a row in the session table. In
+production, clients come and go (web servers restart, phones disconnect), so the table would grow
+forever. Expiry deletes sessions that have been idle for a while.
+
+**Why it's hard.** The session table is part of the replicated state machine, so **every replica must
+delete exactly the same sessions at exactly the same log index**. Otherwise one replica deduplicates a
+retry and another re-executes it, and the replicas diverge. So expiry can't use each node's own clock.
+The thesis's fix: the leader writes its clock time into each log entry, and replicas expire sessions
+using that logged time, which is identical everywhere. A client whose session expired must then get a
+clear "session expired" error, because the cluster can no longer tell whether its retry already ran.
+
+```mermaid
+sequenceDiagram
+    participant C as client c1
+    participant R1 as replica A (own clock)
+    participant R2 as replica B (own clock)
+    Note over R1,R2: WRONG: each replica expires by its own clock
+    Note over R1: clock says c1 idle 61 s → delete session
+    Note over R2: clock says c1 idle 59 s → keep session
+    C->>R1: retry PUT x=1 (seq 7), applied at index 90
+    Note over R1: no session → executes again
+    Note over R2: session → returns saved reply
+    Note over R1,R2: replicas now disagree on x: State Machine Safety broken
+```
+
+**Why we skip it.** Our clients are a small fixed set, so the table stays tiny. Doing it right needs
+leader timestamps in entries, an expiry rule applied at apply time, and a new error path, for no
+correctness gain here.
+
+**What we give up.** Memory grows with the number of distinct clients ever seen. That would be a
+problem with millions of short-lived clients.
+
+### 2.2 RegisterClient (thesis §6.3)
+
+**What it is.** Before its first request, a client asks the cluster to register it. That is a log entry,
+and the entry's index becomes the clientId, which guarantees it is unique.
+
+**Why we skip it.** Clients choose their own ID instead (1, 2, 3 in the simulator; a random 64-bit ID in
+production, where a collision is about as likely as a disk failing silently). It saves a log entry and a
+round trip per client.
+
+**What we give up.** A guaranteed-unique ID, and the natural place to start expiry timers. Neither
+matters without session expiry.
+
+### 2.3 Lease-based reads (thesis §6.4.1)
+
+**What it is.** ReadIndex costs one heartbeat round per read batch, to prove the leader is still
+leader. A lease skips that. Followers promise not to elect anyone else for an election timeout after
+hearing from the leader, so the leader assumes "for the next X ms I'm certainly still leader" and
+answers immediately.
+
+**Why we skip it.** It makes **safety depend on clocks**, which the project brief forbids ("Safety must
+NEVER depend on clocks or timing"). If the leader's clock runs slow, or the leader pauses (garbage
+collection, VM stall) past its lease, a new leader may already exist and have accepted writes, and the
+old leader serves a stale read:
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant L1 as old leader (paused)
+    participant L2 as new leader
+    Note over L1: takes a lease until t=100<br/>then a GC pause freezes it
+    Note over L2: elected at t=150, commits PUT x=2
+    Note over L1: resumes; its clock wrongly says t=90<br/>"my lease is still valid"
+    C->>L1: GET x
+    L1-->>C: x=1   ✗ stale: x=2 had already committed
+```
+
+ReadIndex has no such failure: a deposed leader can't get a majority to acknowledge its old term, so it
+can't answer at all.
+
+**What we give up.** About one network round trip per read batch. A good interview line: *"I chose
+ReadIndex over leases because leases need bounded clock drift; ReadIndex keeps safety timing-free."*
+
+### 2.4 Reads on followers (thesis §6.4)
+
+**What it is.** A follower asks the leader for the current read index, waits until it has applied up to
+that index, then answers from its own copy. Reads are spread across all nodes instead of all hitting
+the leader.
+
+**Why we skip it.** Followers reject reads and point the client to the leader, the same as writes. That
+is simpler and just as correct. Read load only matters at high traffic, and M6 benchmarks will show
+whether it does here.
+
+**What we give up.** Read scalability, since the leader serves every read. This is the easiest skipped
+item to add later: it reuses the ReadIndex machinery plus one request/response message.
+
+### 2.5 More than one request in flight per client (pipelining)
+
+**What it is.** A client sends requests 6, 7 and 8 without waiting for 5 to be answered, for throughput.
+
+**Why we skip it.** With one request at a time, dedup needs only the client's **last** seq and its saved
+reply: anything equal is a duplicate, anything smaller is stale. With pipelining, requests can arrive
+and commit out of order, so the session must keep a window of seqs and replies, and the client must
+tell the cluster which replies it has received so old ones can be dropped. That's a lot more state and
+many more edge cases.
+
+**What we give up.** Per-client throughput. A busy application can get the same effect by using
+several clients.
+
+## 3. Summary
+
+| Skipped | Category | Safety affected? | Cost of skipping | Effort to add later |
+|---|---|---|---|---|
+| Session expiry | production scale | no | memory grows with the number of clients ever seen | high |
+| RegisterClient | production scale | no | IDs unique by randomness, not by construction | low |
+| Lease reads | performance | no (and adding it would *risk* safety) | one round trip per read batch | medium |
+| Follower reads | performance | no | the leader serves all reads | low |
+| Pipelining | performance | no | one request in flight per client | high |
+
+### 3.1 How the skip list was decided
+
+The rule used, in order:
+
+1. **Anything safety needs is built, fully.** If leaving it out could lose a write, apply one twice or
+   return a stale read, it is in M4: sessions + dedup, ReadIndex with all its rules, the client's
+   same-seq retry, and the checker that proves all of it.
+2. **Anything that only makes it faster or bigger is skipped,** as long as adding it later doesn't mean
+   redesigning what exists. Each skipped item fits into the current design as an add-on.
+3. **Anything that would make safety depend on clocks is refused,** even if it's faster (lease reads).
+   The brief says safety must never depend on timing.
+
+```mermaid
+flowchart TD
+    F["a feature from thesis chapter 6"] --> Q1{"without it, can a client<br/>see a wrong answer?"}
+    Q1 -- yes --> B["BUILD in M4<br/>sessions, dedup, ReadIndex,<br/>same-seq retries, checker"]
+    Q1 -- no --> Q2{"does it make safety<br/>depend on clocks?"}
+    Q2 -- yes --> R["REFUSE<br/>lease reads"]
+    Q2 -- no --> Q3{"needed at this project's scale<br/>(5 clients, 3-5 nodes)?"}
+    Q3 -- no --> S["SKIP, list in DEVIATIONS<br/>expiry, RegisterClient,<br/>follower reads, pipelining"]
+    Q3 -- yes --> B
+```
+
+### 3.2 Interview answers: "why did you skip X?"
+
+Each item has a short answer you can say in about 30 seconds, the follow-up questions an interviewer is
+likely to ask with answers, and how you would build it. The pattern of a good answer is always:
+**what it is → why it isn't needed for correctness → what it costs → how I'd add it.**
+
+**The opening answer (if asked "what did you leave out of client handling?")**
+
+> "I built everything chapter 6 of Ongaro's thesis needs for correctness: client sessions so retries
+> are exactly-once, ReadIndex for linearizable reads without going through the log, and a
+> linearizability checker that verifies client histories over thousands of chaos runs. I skipped five
+> things, all either performance or production-scale features: session expiry, RegisterClient, lease
+> reads, follower reads and pipelining. None of them changes whether an answer is correct, and each one
+> fits the current design as an add-on. Lease reads I skipped on purpose, not just for time: they make
+> safety depend on bounded clock drift, and my design rule was that safety never depends on timing."
+
+---
+
+#### K1. Session expiry
+
+> **30 seconds:** "The session table maps each clientId to its last seq and reply, so retries are
+> deduplicated. Without expiry it grows by one row per client ever seen. With 5 simulated clients that
+> is 5 rows, so it doesn't matter here. Doing it correctly is subtle: the table is replicated state, so
+> every replica must expire the same session at the same log index. You can't use local clocks; the
+> leader has to put a timestamp in log entries and replicas expire based on that. I'd rather leave it
+> out than add a version that could make replicas diverge."
+
+| Follow-up | Answer |
+|---|---|
+| Why not just delete sessions idle for 60 s on each node? | Node clocks differ. Replica A deletes c1's session at index 90, replica B at index 95. A retry applied at index 92 is re-executed on A and deduplicated on B: the replicas diverge, which breaks State Machine Safety. Expiry must be a deterministic function of the log. |
+| How does the thesis do it? | §6.3.2: the leader stamps each entry with its current time. When applying an entry, each replica uses that logged time to expire sessions idle longer than a timeout. Every replica sees the same timestamps in the same order, so they all expire at the same index. Leader clocks can still jump, but that only affects *when* sessions expire, not agreement between replicas. |
+| What happens to a client whose session expired? | It must get a "session expired" error, not a normal answer. The cluster no longer knows whether its last request ran, so silently running the retry could apply it twice. The client must surface "unknown outcome" to the application. |
+| What's the risk of setting the timeout too low? | A slow client (a long GC pause, a network outage) loses its session and its retry gets "expired" instead of being deduplicated. Higher timeout = more memory, fewer such errors. |
+| How would you build it? | A `timestamp` field on log entries set by the leader; at apply, `KvStateMachine` drops sessions with `lastActive < entryTime - timeout`; a `KvResult.SessionExpired`; snapshot v3 stores `lastActive`; a mutation that expires by local clock, which the replica-state checker must catch. |
+
+#### K2. RegisterClient
+
+> **30 seconds:** "In the thesis, a client registers first: a log entry whose index becomes its unique
+> clientId. I let clients pick their own id. In the simulator that's 1 to 5, and in production it would
+> be a random 64-bit number, where a collision is around 1 in 2^64 per pair. Registration mainly matters
+> together with session expiry, because it gives the cluster a place to start tracking a client's
+> lifetime. Since I skipped expiry, it adds a log entry and a round trip per client for no benefit."
+
+| Follow-up | Answer |
+|---|---|
+| What goes wrong if two clients share an id? | Their sequence numbers collide. Client B's seq 7 would be treated as a duplicate of client A's seq 7 and get A's saved reply. That's a correctness bug, which is why the id must be unique: by randomness (64 bits) or by construction (registration). |
+| Why does registration "guarantee" uniqueness? | The id is the log index of the registration entry, and each index holds exactly one committed entry, by Log Matching and State Machine Safety. |
+| How would you build it? | A `Register` command; the state machine creates a session keyed by the entry's index and returns it; `ClientSession` sends it before its first request; requests with an unknown clientId get `SessionExpired`. About 50 lines plus tests. |
+
+#### K3. Lease-based reads (the most important one to answer well)
+
+> **30 seconds:** "ReadIndex confirms leadership with one heartbeat round per batch of reads. A lease
+> avoids that round: the leader assumes nobody else can be elected for an election timeout after its
+> last majority ack, so it answers immediately. But that assumption only holds if clocks run at about
+> the same speed and the process doesn't pause. If the old leader stalls in a GC pause past its lease, a
+> new leader can commit writes, and the old one wakes up and serves a stale read. My rule was that
+> safety never depends on timing, so I used ReadIndex. The cost is one round trip per read *batch*, not
+> per read, because concurrent reads share a round."
+
+| Follow-up | Answer |
+|---|---|
+| Who uses leases in practice? | etcd offers both (`ReadOnlySafe` = ReadIndex is the default, `ReadOnlyLeaseBased` is optional). TiKV uses lease reads for speed and relies on bounded clock drift. Spanner uses TrueTime, GPS and atomic clocks, which bound clock uncertainty explicitly. |
+| How much faster are leases? | A read skips one majority round trip, a few milliseconds in one datacenter. With batching, ReadIndex pays it once per batch, so under load the difference shrinks. M6 benchmarks could measure it. |
+| Why is ReadIndex safe even when the old leader pauses? | After it resumes, it must still get a majority to echo a read round **in its own term**. If a new leader exists, a majority has moved to a higher term, so they reply with that term and the old leader steps down and rejects its pending reads. No timing involved. (Seed 4811, §15, is a bug in exactly this check, found by the simulator.) |
+| How would you make leases safer? | Lease duration = election timeout minus a clock-drift margin; the lease starts when the heartbeat was *sent*, not acked; use a monotonic clock; plus CheckQuorum (M5), so a leader cut off from the majority steps down. A GC pause longer than the margin still breaks it, which is the core problem. |
+| Would your simulator catch a broken lease? | Yes. A process pause is one of the injected faults, and `READ_WITHOUT_QUORUM_CHECK` (which behaves like an infinite lease) is caught in 75 of 100 seeds. |
+
+```mermaid
+flowchart LR
+    subgraph RI["ReadIndex (built)"]
+        A1["read arrives"] --> A2["readIndex = commitIndex"] --> A3["heartbeat round:<br/>majority echoes the round<br/>in MY term"] --> A4["wait applied ≥ readIndex"] --> A5["answer"]
+    end
+    subgraph LE["Lease read (refused)"]
+        B1["read arrives"] --> B2{"now < lease end?<br/>(my clock)"} -- yes --> B5["answer immediately"]
+    end
+```
+
+The only difference is box A3 against box B2: a message proof against a clock assumption.
+
+#### K4. Reads on followers
+
+> **30 seconds:** "With ReadIndex, a follower can serve a linearizable read too: it asks the leader for
+> the current read index, the leader confirms leadership with its round, the follower waits until it
+> has applied that index, then answers locally. That spreads read *work* across nodes. I skipped it
+> because it's a pure scaling feature: followers reject reads with a leader hint, which is just as
+> correct. It's the easiest skipped item to add, because it reuses the existing ReadIndex machinery plus
+> one request/response message."
+
+| Follow-up | Answer |
+|---|---|
+| Why can't a follower simply answer from its own state? | It may be behind: a write the leader committed and acknowledged may not have reached it yet. A client that wrote x=2 and then reads x=1 from a lagging follower sees a stale read. The follower needs the leader's commit index, confirmed by a quorum round, before it may answer. |
+| Does it reduce load on the leader? | Partly. The leader still runs a round per batch, but it no longer reads the state machine or sends the value. For large values or expensive queries, that's most of the work. |
+| What about "stale reads are OK" reads? | Some systems offer serializable or bounded-staleness reads straight from a follower (etcd's `--consistency=s`). Not linearizable, but cheap. A product decision, not needed here. |
+| How would you build it? | A `ReadIndexRequest(readId)` → `ReadIndexResponse(readId, readIndex)` message pair; the leader treats it as one more pending read in its round; the follower holds the read until `appliedIndex ≥ readIndex`, using the same `NodeDriver` code path; a mutation where the follower skips the wait. |
+
+#### K5. More than one request in flight per client (pipelining)
+
+> **30 seconds:** "Each client has one operation in flight. That makes dedup simple: the session keeps
+> only the last seq and its reply, so equal means duplicate and lower means stale. With pipelining,
+> seq 6, 7 and 8 can be in flight together and commit in any order, so the session must keep a window
+> of replies, and the client must tell the cluster which replies it already received so the window can
+> shrink. The thesis does this with a 'lowest seq without a response' field. It's a lot of state and
+> edge cases for per-client throughput, and an application can get the same throughput by using several
+> clients."
+
+| Follow-up | Answer |
+|---|---|
+| Why does one-in-flight make dedup trivial? | The client never sends seq n+1 before it has seq n's answer. So when n+1 arrives, n's reply will never be needed again and can be replaced. One row per client is enough. |
+| What breaks if you pipeline with the current table? | Seq 8 is applied before a retry of seq 7. The table now says lastSeq = 8, so the retry of 7 gets `Stale` instead of its real answer. The client never learns whether 7 ran. |
+| How would you build it? | The session holds a map seq → reply; each request carries `ackedBelow` (the lowest seq without a response); the state machine drops replies below it; a request below the window gets `Stale`. The checker already handles concurrency, but the client must allow overlapping operations, and the history recorder records them as concurrent. |
+| Does pipelining change ordering guarantees? | Yes, an important subtlety: two pipelined writes from one client may be applied in a different order than sent if they go through different leaders after a failover. If the application needs per-client FIFO order, the state machine must apply seq n+1 only after n (buffer or reject). |
+
+### 3.3 One-line answers to memorize
+
+| Question | One line |
+|---|---|
+| Why skip session expiry? | Unbounded table is fine for 5 clients; correct expiry needs log timestamps so replicas expire identically. |
+| Why skip RegisterClient? | Random 64-bit ids are unique in practice; registration only pays off with expiry. |
+| Why no lease reads? | They make safety depend on clocks and pauses; ReadIndex keeps safety timing-free at one round trip per batch. |
+| Why no follower reads? | A scaling feature; it reuses ReadIndex plus one message, easy to add when benchmarks show the leader is the bottleneck. |
+| Why one request in flight? | Dedup needs only the last seq; pipelining needs a reply window and client acks, for throughput several clients already give. |
+| What did you not skip? | Anything safety needs: exactly-once writes, linearizable reads, and a checker that proves both under chaos. |
+
+## 4. The decisions you approved (M4-A to M4-F)
+
+| # | Decision | In one line |
+|---|----------|-------------|
+| M4-A | Client model | A pure `ClientSession` in `raft-client`; 5 closed-loop simulated clients on it; lossy client links |
+| M4-B | ReadIndex | A `readRound` number rides on AppendEntries/InstallSnapshot and is echoed back; a majority echo confirms leadership |
+| M4-C | Sessions | `clientId → (lastSeq, reply)` inside `KvStateMachine`, decided at apply time, in snapshots and the state hash |
+| M4-D | Checker | Wing & Gong search with Lowe's memo, split per key, unknown operations optional, step budget |
+| M4-E | History | One record per client operation (not per attempt); every written value is unique |
+| M4-F | Mutations | Skip dedup, read without quorum check, read before the current-term commit; leader-targeted faults; controls |
+
+Full text, with rejected alternatives: DESIGN.md "M4".
+
+The whole path of one write and one read through the layers:
+
+```mermaid
+flowchart TB
+    subgraph C["raft-client: ClientSession (pure)"]
+        W["write(cmd): seq+1<br/>retry = same request"]
+        R["read(key): no seq"]
+    end
+    subgraph N["leader node"]
+        DRV["NodeDriver"]
+        CORE["RaftNodeCore"]
+        KV["KvStateMachine<br/>data + sessions"]
+    end
+    W -- "ProposeCommand" --> DRV
+    R -- "read(readId, Get key)" --> DRV
+    DRV --> CORE
+    CORE -- "append, replicate, commit" --> CORE
+    CORE -- "committed entries" --> DRV
+    DRV -- "apply: dedup by (clientId, seq)" --> KV
+    CORE -- "ReadReady(readId, readIndex)<br/>after a majority echoed the round" --> DRV
+    DRV -- "query once lastApplied ≥ readIndex" --> KV
+    DRV -- "answer" --> C
+```
+
+## 5. Invariant 7: linearizability, in plain words
+
+**The rule.** Every operation has an interval: from the moment the client sent it (invoke) to the moment
+the client got the answer (return). Linearizable means you can put one dot inside every interval, the
+moment it "really happened", such that reading the dots left to right gives a legal single-machine
+history: every read returns the latest write before its dot, every PUT returns the value it replaced,
+and so on.
+
+Two consequences matter most:
+- If operation A **returned before** B was **invoked**, A's dot is before B's dot. Real-time order is
+  respected. That is exactly what a stale read breaks.
+- If A and B **overlap**, either order is allowed.
+
+Timeline of a stale read (each bar is an interval, `●` a possible dot):
+
+```
+time ─────────────────────────────────────────────────────────►
+c1  PUT x=1  |──●──|                                     returns (prev: none)
+c2  PUT x=2           |───●───|                          returns (prev: 1)
+c3  GET x                          |──────|  → 1   ✗  no dot works: x=2 finished before c3 began
+c4  GET x             |─────────────────────| → 1  ✓  overlaps PUT x=2: its dot can go before it
+```
+
+c3 is the bug ReadIndex exists to prevent (a deposed leader answering from old state); c4 is fine.
+
+**Unknown outcomes.** An operation whose answer never arrived (the run ended, or every reply was lost) may
+have happened, at any time after its invocation, or not at all. The checker treats its return time as
++∞ and accepts any output for it.
+
+**Why per key.** Each key is an independent register, and linearizability is *local*: a history is
+linearizable if and only if each key's sub-history is (Herlihy & Wing). Checking 5 small histories is
+far cheaper than one big one.
+
+## 6. Client sessions and dedup (thesis §6.3)
+
+**The problem.** A client can't tell "my request was lost" from "my request ran, but the reply was
+lost". It must retry, and a retry of a request that already ran would run it twice (the example in §0).
+
+**The fix, in two halves:**
+1. The **client** numbers its requests (`seq` = 1, 2, 3...) and **re-sends the same seq** on every retry.
+2. The **state machine** remembers, per client, the last seq it executed and that request's reply:
+
+```mermaid
+flowchart TD
+    A["apply(index, KvRequest(clientId, seq, cmd))"] --> Z{"clientId == 0?"}
+    Z -- "yes: no session" --> X["execute, return the result"]
+    Z -- "no" --> S{"compare seq with<br/>session.lastSeq"}
+    S -- "equal: a duplicate" --> D["return the SAVED reply<br/>do not execute"]
+    S -- "smaller: an old copy" --> ST["return Stale(lastSeq)<br/>do not execute"]
+    S -- "larger, or no session yet" --> E["execute<br/>save (seq, reply) as the session"]
+```
+
+A retry after a lost reply, end to end:
+
+```mermaid
+sequenceDiagram
+    participant C as client c1
+    participant L as leader
+    participant SM as state machine (every replica)
+    C->>L: PUT x=1 (c1, seq 7)
+    L->>SM: commit + apply at index 40
+    Note over SM: executes, session c1 = (7, reply "prev: none")
+    L--xC: reply lost
+    Note over C: timeout, retry with the SAME seq
+    C->>L: PUT x=1 (c1, seq 7)
+    L->>SM: commit + apply at index 45 (a second log entry)
+    Note over SM: seq 7 == lastSeq 7, duplicate: return the saved reply, x unchanged
+    L-->>C: "prev: none" (the original answer)
+```
+
+Notice that the duplicate **is** in the log twice (indexes 40 and 45). Dedup happens at **apply** time,
+not at the leader's door, because only applying is deterministic on every replica. The leader can't
+know whether index 40 will commit when the retry arrives, and a new leader may never have seen it.
+
+**Why the session table must be replicated state.** Every replica must make the same decision for the
+same entry. So the table travels in snapshots (format v2) and is part of `stateHash`, which the replica
+checker compares. A replica restored from a snapshot without sessions would re-execute a retry that the
+others answer from their sessions, and the replicas would diverge.
+
+**`Stale`.** With one request in flight per client, a smaller seq can only be an old copy delayed in the
+network (a long-delay duplicate) that arrives after the client has moved on. Nobody waits for it, so
+`Stale` is just "ignored, safely". Without dedup this old copy would execute *late*, the second way the
+SKIP_DEDUP mutation is caught.
+
+**Client 0.** `clientId = 0` means "no session": never deduplicated. Read queries use it, and so do tools
+and tests that don't care.
+
+Code: `KvStateMachine.apply` (`raft-statemachine/.../KvStateMachine.java:52`), snapshot v2 in
+`KvCodec.encodeSnapshot` / `decodeSnapshotState`.
+
+## 7. The client: `ClientSession` (raft-client)
+
+A pure state machine, like the core: no network, no clock. The caller sends each `Attempt`, schedules
+its timeout, and feeds back replies (`Reply.Ok`, `Reply.NotLeader(hint)`, `Reply.Retry`) and timeouts.
+It answers with a `Decision`: `Send(attempt)`, `Completed(result)` or `Ignore`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> InFlight: write(cmd) seq+1, or read(key)
+    InFlight --> InFlight: NotLeader(hint) on the latest attempt, go to the hint at once
+    InFlight --> InFlight: NotLeader(no hint), back off, try another node
+    InFlight --> InFlight: Retry (Lost / Unknown), back off, same node, SAME request
+    InFlight --> InFlight: timeout of the latest attempt, try another node, SAME request
+    InFlight --> Idle: Ok from ANY attempt of this operation
+    InFlight --> InFlight: anything about an older attempt, ignored
+```
+
+The rules that make it correct:
+- **Same request on every retry.** Same clientId, seq and command bytes, so dedup can recognise it.
+- **Any attempt's `Ok` completes the operation.** All attempts carry the same request, so they all get
+  the same answer (the first execution's reply, through the session).
+- **Only the latest attempt's failure causes a retry.** Otherwise one operation could fan out into many
+  parallel attempts.
+- **Leader guess.** The node that answered is tried first next time; a rejection's hint updates it; a
+  timeout clears it.
+
+Code: `ClientSession.onReply` (`raft-client/.../ClientSession.java:127`), `onTimeout` (`:151`).
+
+## 8. ReadIndex: linearizable reads without the log (thesis §6.4)
+
+Before M4 a read was a `Get` entry in the log: correct, but it cost an fsync and a replication round per
+read. ReadIndex gives the same guarantee for one heartbeat round per **batch** of reads, with no disk
+write.
+
+**The four steps, and what breaks without each:**
+
+| Step | What the leader does | Without it |
+|---|---|---|
+| 1 | Wait until it has committed an entry of **its own term** (the no-op from §8 of the paper) | A new leader's `commitIndex` can be behind writes the old leader already committed and acknowledged. The read misses them. (Mutation READ_BEFORE_CURRENT_TERM_COMMIT.) |
+| 2 | `readIndex = commitIndex` | (this is the point the read is ordered at) |
+| 3 | Confirm it is **still the leader**: a majority must answer a heartbeat sent **after** the read arrived | A leader cut off by a partition, or paused, doesn't know a newer leader exists and answers from old state. (Mutation READ_WITHOUT_QUORUM_CHECK.) |
+| 4 | Wait until `lastApplied ≥ readIndex`, then read the state machine | The state machine may not have applied the writes the read must see yet. |
+
+**Why step 3 works, without clocks.** A follower that answers our heartbeat *in our term* had not
+granted its vote to any newer candidate at that moment. A newer leader needs a majority, and our
+majority overlaps every other majority, so at the moment of the echo no newer leader could have
+committed anything. Our `commitIndex` from step 2 was therefore still the latest commit point when the
+read arrived. The read is ordered at that point, which lies inside its interval.
+
+**How "a heartbeat sent after the read" is recognised: the read round.**
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant L as leader (round 6)
+    participant F1 as follower 1
+    participant F2 as follower 2
+    C->>L: read k (readId 31)
+    Note over L: own-term entry committed: yes<br/>readIndex = commitIndex = 120<br/>start round 7
+    L->>F1: AppendEntries(..., readRound 7)
+    L->>F2: AppendEntries(..., readRound 7)
+    F1-->>L: response(term ok, readRound 7)
+    Note over L: ackedRound: self 7, F1 7, F2 6<br/>majority has 7, so release round ≤ 7
+    Note over L: ReadReady(31, readIndex 120)
+    Note over L: driver: lastApplied ≥ 120? then query
+    L-->>C: value of k
+    F2-->>L: response(readRound 7), late, harmless (max)
+```
+
+Details that make it robust:
+- The round is **echoed even by a rejection** (`success = false`) in our term: a log mismatch still proves
+  the follower accepts our term. But a rejection of a request from an **older term** echoes nothing: it
+  is stamped with the follower's newer term, and an old term's round number would pass for a current
+  ack. The gate found exactly this bug (§15).
+- `ackedRound[peer] = max(old, echoed)`: duplicated and reordered replies can't move it backwards, and an
+  echo of an *older* round never counts for a newer read.
+- **Batching:** at most one round in flight. Reads that arrive meanwhile wait, then share the next round,
+  so 100 reads cost one round, not 100.
+- **Lost rounds:** every heartbeat carries the current round number, so a lost round is re-sent within one
+  heartbeat interval.
+- **Stepping down** (any higher term) rejects every pending read; the client retries at the new leader.
+
+A deposed leader can't answer at all, so it can't answer wrongly:
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant Old as old leader (term 3, cut off)
+    participant New as new leader (term 4)
+    Note over Old,New: partition: Old can reach clients but no peer
+    New->>New: elected in term 4, commits PUT x=2
+    C->>Old: GET x
+    Note over Old: starts read round 9<br/>no peer answers in term 3<br/>the read waits
+    Note over Old: partition heals
+    New->>Old: AppendEntries(term 4)
+    Note over Old: higher term, step down<br/>ReadRejected(hint: none)
+    Old-->>C: rejected, retry elsewhere
+```
+
+Code: `RaftNodeCore.onReadRequested` (`raft-core/.../RaftNodeCore.java:264`), `serviceReads` (`:286`),
+`rejectPendingReads` (`:312`), the echo handling at `:535` and `:712`;
+`RoleState.Leader.roundAckedByMajority` (`RoleState.java:95`).
+
+## 9. The driver's half: step 4
+
+`NodeDriver.read(readId, query)` (`raft-node/.../NodeDriver.java:132`) remembers the query and feeds
+`ReadRequested` to the core. When `ReadReady(readId, readIndex)` comes back, the read waits in a map
+ordered by `readIndex` until the driver's applied index (no-ops included) reaches it. Then
+`StateMachine.query(Get key)` answers it and the outcome goes to the read listener as
+`ReadOutcome.Ok(readId, readIndex, result)`. `query` changes nothing: no index, no session.
+
+Ready's order (persist → send → apply → notify) means entries applied in the same `Ready` as the release
+come first. In practice `readIndex ≤ lastApplied` always holds by then (the core hands out entries up to
+`commitIndex` in the same `Ready`), but the driver doesn't rely on that.
+
+## 10. The simulator: closed-loop clients over lossy links
+
+```mermaid
+sequenceDiagram
+    participant CL as ClientWorkload (c1..c5)
+    participant LK as client link (lossy)
+    participant N as node (NodeDriver)
+    participant H as HistoryRecorder
+    CL->>H: invoke(c2, PUT k1=c2-8, t=4210)
+    CL->>LK: attempt A (target n2)
+    LK--xN: dropped (5%)
+    Note over CL: 150 ms later: timeout, attempt B to n3 (same request)
+    CL->>LK: attempt B
+    LK->>N: arrives (delay 1-10 ms, sometimes 10-50x), maybe twice (2%)
+    N-->>LK: NotLeader(hint n1)
+    LK-->>CL: reply
+    CL->>LK: attempt C to n1 (same request)
+    LK->>N: arrives at n1, committed, applied
+    N-->>LK: Committed(result)
+    LK-->>CL: reply
+    CL->>H: complete(c2, Value(prev), t=4391)
+```
+
+- **5 clients**, each with one operation in flight, thinking 5–30 ms between operations; **30% reads**
+  (ReadIndex), the rest PUT (55% of writes), DELETE (20%), CAS (25%) over 5 keys.
+- **Client links** use the peer network's numbers: 5% drop, 2% duplicate, 1–10 ms delay, 1% of messages
+  delayed 10–50×. So retries, duplicate deliveries and very late duplicates happen constantly.
+- **Each delivered copy** of a request gets its own proposal or read id at the node (two copies of one
+  attempt are two proposals), mapped back to the attempt when the outcome returns over the lossy link.
+- **History:** one record per operation, from invocation to the answer the client accepted. Operations
+  still open at the end are unknown.
+- **At the end of each run:** invariant 7 (`Simulation.checkLinearizability`, `Simulation.java:200`),
+  then liveness: in the last second of the quiet period every client completed an operation and some
+  write completed.
+
+## 11. The linearizability checker
+
+The search (Wing & Gong 1993, with Lowe's memoization, as in Porcupine) walks a time-ordered list of
+call and return events:
+
+```mermaid
+flowchart TD
+    S["entry = first event"] --> Q{"entry is a CALL?"}
+    Q -- "yes" --> M{"model accepts this op's<br/>output from the current state?"}
+    M -- "yes, and (linearized set + op, new state)<br/>not seen before" --> L["linearize it: push (op, old state)<br/>remove its call and return from the list<br/>entry = first event again"]
+    M -- "no, or already seen" --> NX["entry = next event"]
+    Q -- "no: a RETURN of an op<br/>not yet linearized" --> B{"stack empty?"}
+    B -- "yes" --> F["NOT linearizable"]
+    B -- "no" --> U["backtrack: pop the last choice<br/>put its events back<br/>entry = the event after it"]
+    L --> E{"list empty?"}
+    E -- "yes" --> OK["linearizable"]
+    E -- "no" --> Q
+    NX --> Q
+    U --> Q
+```
+
+Why it is correct: an operation may be linearized at any point after its call and before its return.
+Reaching a return whose operation isn't linearized yet means the choices so far can't work, so undo the
+last one. The **memo** of (which operations are linearized, register state) cuts the search: two
+different paths to the same set and the same state have the same future.
+
+A tiny worked example (key x, starts empty):
+
+```
+events:  call A(PUT x=1)  call B(GET x → 1)  return A  return B
+step 1   at call A: PUT from {} with "prev: none" is legal → linearize A, state x=1
+step 2   at call B: GET returns 1 from x=1, legal → linearize B, state x=1
+step 3   list empty → linearizable (order A, B)
+If B had returned "none": step 2 fails, move on to "return A": A is linearized, fine,
+then "return B": B is not linearized → backtrack (undo A), try B first: GET none from {} is legal,
+then A: legal → linearizable (order B, A). Both are within the intervals, because they overlap.
+```
+
+Practical points:
+- **Model** = `KvStateMachine` semantics for one key (`LinearizabilityChecker.step`, `:71`). `Stale` or
+  `Invalid` answers are never legal: a correct client never accepts one.
+- **Ties:** at equal times calls sort before returns, so the operations count as concurrent (the
+  lenient choice; it can only hide a violation by one millisecond, never invent one).
+- **Budget:** 20 million steps per run; exceeding it fails the run as "Linearizability undecided".
+  In the gate the biggest search took a few thousand steps (§14).
+- **Report:** the operation with no legal point, the last 5 operations completed before it began, and
+  the operations overlapping it. A real one, from the READ_WITHOUT_QUORUM_CHECK mutation:
+
+```
+key k0: not linearizable ... No legal point for:
+  c5 Get[key=k0] [9624, 9784] -> c3-13
+The last operations that completed before it began:
+  c5 Put[key=k0, value=c5-11] [9065, 9557] -> prev c3-13
+  c3 Get[key=k0] [9584, 9600] -> c5-11          ← c3 already saw c5-11 ...
+Operations overlapping it:
+  c5 Get[key=k0] [9624, 9784] -> c3-13          ← ... then c5 read the older c3-13: a stale read
+```
+
+Code: `raft-sim/.../LinearizabilityChecker.java` (`checkKey` at `:105`).
+
+## 12. Mutation testing in M4
+
+| Mutation | What it breaks | Config, seeds | Caught by |
+|---|---|---|---|
+| SKIP_DEDUP | §6.3: state machine re-executes duplicates | chaos, 100 | Linearizability 100 |
+| READ_WITHOUT_QUORUM_CHECK | §6.4 step 3 | leader faults, 80% reads, 2 keys, 100 | Linearizability 75 |
+| READ_BEFORE_CURRENT_TERM_COMMIT | §6.4 step 1 | leader faults, 50% reads, 1 key, 200 | Linearizability 39 |
+| Controls (no mutation) | | batch 1; crash loop; both leader-fault configs: 100 + 100 + 100 + 200 | 0 violations |
+
+Notes:
+- **SKIP_DEDUP is invisible to every replica checker.** Each replica re-executes the duplicate
+  identically, so logs, applied entries and state hashes all agree. Only the client's view shows that a
+  write took effect twice. That is why invariant 7 exists.
+- **The read mutations need a leadership change at the right moment.** Under the standard chaos mix they
+  were caught in only 7% (no quorum check) and 14% (before the current-term commit) of seeds. The
+  `leaderHunting` fault mix aims 70% of faults at the current leader (isolate, pause, crash), the same
+  trick as batch size 1 for the Figure 8 mutation in M2. A pause is the classic case: the leader
+  resumes, still believes it leads, and finds reads queued in its socket.
+- **READ_BEFORE_CURRENT_TERM_COMMIT is the hardest.** It needs a write acknowledged in the last heartbeat
+  interval before the leader change (so the followers' `commitIndex` lags), and a read reaching the new
+  leader within about one round trip of its election. Hence about 20% of seeds (39–40 of 200 across runs), not more.
+
+## 13. Tests written (first)
+
+| Test class | What it pins down |
+|---|---|
+| `KvSessionTest` (12) | duplicate returns the saved reply without executing (incl. CAS), Stale, per-client sessions, seq gaps, client 0, seq ≥ 1, sessions in snapshots, hash covers sessions, `query` read-only, rejects writes, SKIP_DEDUP behaviour, out-of-order sessions rejected |
+| `ReadIndexTest` (16) | rejection with/without hint, no echo in a rejection of an older term (seed 4811, twice), round started and released only on a majority echo, echo on rejection, duplicate/reordered echoes, batching into the next round, heartbeats carry the round, readIndex = commitIndex at arrival, waiting for the no-op, step-down rejects all, partitioned old leader never serves, both mutations |
+| `NodeDriverReadTest` (5) | served from the state machine, waits until applied (no-ops count), apply-before-notify order, rejection with hint, one readId in flight |
+| `ClientSessionTest` (11) | same seq on every retry, late success of an older attempt completes, older attempts' failures ignored, replies to finished ops ignored, hints followed at once, back-off without a hint, leader guess, reads carry no seq, one op at a time, unique attempt ids |
+| `LinearizabilityCheckerTest` (12) | sequential, stale read, concurrent reads, no going back in time, write applied twice, unknown writes (may/may not, not before invocation), CAS, Stale is illegal, per-key split, budget, and a jqwik property: generated register histories accepted, a corrupted read rejected (300 tries) |
+| `MutationSanityTest` (+3, controls +2) | §12 |
+| `RegressionSeedsTest` (1) | seed 4811 replayed end to end (§15) |
+| `WalTornTailProperties` (+1) | the jqwik counterexample pinned as a test (§16) |
+| `ChaosTest` | invariants 1–7 + liveness; guards that timeouts, redirects, dedup hits and unknown operations really happen |
+
+## 14. Results
+
+**Gate:** 5,000 seeds × {3, 5} nodes × {chaos, crash loop} = 20,000 runs, 0 violations of invariants
+1–7, vote durability, replica-state agreement, commit liveness and client liveness. Runtime 3 min 46 s
+(M3: 2 min 31 s; the extra time is the clients, the history and the checker). The first run failed
+once (seed 4811); §15 tells that story. These numbers come from the run after the fix.
+
+| Config | Client ops | Reads | Attempts | Timeouts | Redirects | Dedup hits | Unknown at end | Max checker steps |
+|---|---|---|---|---|---|---|---|---|
+| chaos, 3 | 2,778,793 | 828,283 | 5,201,465 | 1,275,175 | 1,146,723 | 656,519 | 5,097 | 1,116 |
+| chaos, 5 | 3,576,365 | 1,067,595 | 5,799,628 | 1,045,907 | 1,176,405 | 1,181,729 | 8,355 | 1,248 |
+| crash loop, 3 | 1,643,026 | 487,377 | 4,580,184 | 1,539,667 | 1,397,413 | 586,035 | 6 | 651 |
+| crash loop, 5 | 2,565,638 | 764,252 | 5,226,128 | 1,268,742 | 1,391,491 | 1,424,296 | 176 | 1,017 |
+
+How to read it:
+- **About 10.6 million client operations** were checked for linearizability, about 5 million of them
+  retried at least once (attempts ≫ ops).
+- **Dedup hits: 3.8 million.** Each one is a retry or a duplicated message that would have applied a
+  write a second time without sessions (that's what SKIP_DEDUP shows).
+- **Unknown at end:** operations still in flight when the run stopped. The checker may place each one
+  anywhere after its start, or nowhere.
+- **Checker steps:** the largest search over any key in any run was 1,248 steps against a budget of 20
+  million. Splitting per key, plus the memo, keeps the search tiny.
+
+`./gradlew build`: 312 tests, green.
+
+## 15. The bug the gate found: an old term's round number passed as a new ack
+
+The first 5,000-seed gate run failed once: **chaos, 5 nodes, seed 4811**, invariant 7, with no mutation
+switched on. The report:
+
+```
+No legal point for:
+  c5 Get[key=k0] [4459, 4812] -> c2-39
+The last operations that completed before it began:
+  c2 Put[key=k0, value=c2-39] [3931, 3944]
+  c5 Put[key=k0, value=c5-38] [4326, 4348] -> prev c2-39     ← c5 itself overwrote c2-39 ...
+  ...
+  c1 Get[key=k0] [4422, 4444] -> c4-27                       ← ... and others already read newer values
+```
+
+A real stale read. The full trace (`-Psim.trace=3000000`) showed who served it: **n2**, the leader of
+term 10, cut off with n1 by a partition while n4 led term 12. n2 released the read after n1 echoed round
+9. That is only 2 of 5, so how? A temporary debug print of n2's `ackedRound` gave the answer:
+`{n1=9, n3=8, n4=8, n5=10}`. **n5 had "echoed" round 10 in term 10, but n2 never sent round 10 in
+term 10.**
+
+```mermaid
+sequenceDiagram
+    participant N2 as n2
+    participant N5 as n5
+    Note over N2: leader of term 6, read rounds up to 10
+    N2->>N5: AppendEntries(term 6, readRound 10)
+    Note over N2,N5: this message takes the slow path: delayed 10-50x
+    Note over N2: later: leader of term 10, rounds restart at 0
+    Note over N5: now in term 10 too, following n2
+    Note over N5: the delayed term-6 message finally arrives
+    Note over N5: term 6 is older than 10, reject (correct)<br/>reply term = 10, and it echoed readRound 10 (the bug)
+    N5-->>N2: AppendEntriesResponse(term 10, success false, readRound 10)
+    Note over N2: term 10 = my term, so ackedRound[n5] = max(.., 10)<br/>n5 now counts for every round up to 10
+    Note over N2: partitioned from n3, n4, n5, yet a read in round 9<br/>is "confirmed" by self + n1 + n5: stale read
+```
+
+**The broken assumption.** "A reply in my term echoing round r proves the follower accepted me after
+I sent round r." True only if the request that carried r was also from my term. A rejection of an
+*older* term's request carries the follower's *current* term (the protocol requires that, so the old
+leader steps down) but an echo from a different term. The round counter restarts with each term, so
+round 10 of term 6 and round 10 of term 10 are unrelated numbers.
+
+**The fix** (two lines): a rejection of an older term's AppendEntries or InstallSnapshot echoes round 0.
+Now every echoed round comes from a request of the reply's own term. Tests:
+- `ReadIndexTest.aRejectionOfAnOlderTermEchoesNoRound` (follower side);
+- `ReadIndexTest.anOldTermsRoundCannotConfirmARead` (the leader-side story);
+- `RegressionSeedsTest.seed4811StaleTermReadRoundEcho` (the whole run).
+
+All three were checked to fail without the fix. Then the whole gate was re-run from scratch.
+
+**Lessons.**
+1. A number that means something only within a term must never cross terms. The paper's own fields
+   avoid this by always comparing terms first. A field we added needed the same care.
+2. 4,999 of 5,000 seeds and every unit test passed. The bug needed a 10–50× delayed message, a term change
+   in between and a partition. That is why the gate runs thousands of seeds with long delays.
+3. Without the linearizability checker this bug would be invisible: every replica agreed, and every
+   Raft invariant held. Only what a client saw was wrong.
+
+## 16. A test bug found along the way (not in M4 code)
+
+The first full build after the M4 changes failed in an **M3** test, `WalTornTailProperties.garbageAfterACutIsDiscarded`.
+jqwik draws new random inputs each run, and this one (seed 4, 52 bytes of garbage, all zeros) had never
+been tried. Recovery returned a newer state than the test expected: a vote for `n0` in term 2.
+
+**What happened:** the cut tore a HardState record in the middle, and every byte after the cut in that
+record happened to be zero (the vote is for node 0). The "garbage" was 52 zeros, so it rebuilt the
+record **byte for byte**, CRC included. Recovery can't tell, and shouldn't: the bytes on disk *are* that
+record. The test's expectation was wrong, not the WAL.
+
+**Fix:** the expected state is now taken at "the cut plus however many garbage bytes equal the original
+bytes", and the failing input is pinned as a regression example (`zeroGarbageThatRebuildsTheTornRecordIsKept`).
+Lesson: a property test's *oracle* can be wrong too; when a property fails, first check whether the
+claim or the code is at fault.
+
+## 17. Shortcuts and what is left for later
+
+- **K1–K5** (§2, with interview answers in §3.2): session expiry, RegisterClient, lease reads, follower
+  reads, pipelining. Not built, on purpose; none affects safety.
+- **H4:** the read mutations are measured under the leader-targeted fault mix (§12).
+- **H5:** invariant 7 is checked at the end of each run, not after every event.
+- Removed: **P3** (ReadIndex threw), **H1** (reliable client links), **S4** (`Unknown` outcomes could
+  not be retried safely; they now retry with the same seq).
+- M5 will put a network client around `ClientSession` and a client port on the node.
+
+## 18. Study questions (with answers)
+
+**Q1. Why does dedup happen when an entry is applied, not when the leader receives the request?**
+Only applying is deterministic on every replica. When a retry reaches the leader, the first copy may be
+in the log but not yet committed. It might never commit, and a new leader might not have it at all. If
+the leader dropped the retry, a lost first copy would mean the write never happens. At apply time
+everyone sees the same committed sequence and makes the same decision.
+
+**Q2. A client's PUT was applied at index 40 and its retry at index 45. Is the log wrong?**
+No. Both entries are committed; the second one is answered from the session without executing. The log
+holds requests, not effects.
+
+**Q3. Why must the session table be in the snapshot?**
+Because a replica restored from a snapshot must make the same dedup decisions as one that applied every
+entry. Without the sessions it would re-execute a retry that the others answer from their sessions, and
+the replicas would diverge (the replica-state checker would catch that: `stateHash` covers sessions).
+
+**Q4. ReadIndex step 1: give a concrete history where skipping it returns a stale value.**
+Leader L1 commits PUT x=2 at index 10, applies it and acknowledges the client, then crashes before its
+next heartbeat. The followers still have `commitIndex = 9`. F1 becomes leader with `commitIndex = 9`.
+A read arrives before F1's no-op commits; with step 1 skipped, `readIndex = 9`, the round succeeds, and
+F1 answers the old x. The client that saw "x=2 done" earlier now reads the old value.
+
+**Q5. Why does a *rejected* AppendEntries still count as a leadership ack for reads?**
+The follower answered in our term, so it hasn't moved to a higher term: it accepts us as leader of this
+term. The log mismatch is about replication, not leadership.
+
+**Q6. Why must the heartbeat be sent *after* the read arrived?**
+An ack to an earlier heartbeat only proves we were leader *then*. A newer leader may have been elected
+and committed writes between that ack and the read's arrival. The read round number makes "sent after"
+checkable: the read needs echoes of its round or a later one.
+
+**Q7. Why is the lease approach unsafe without clock assumptions?**
+The lease says "nobody else can be leader until time T". If the leader's clock runs slow or the process
+pauses, it may believe it's before T when a new leader already exists. ReadIndex asks the followers
+instead of the clock.
+
+**Q8. SKIP_DEDUP passed every replica checker. Why?**
+Every replica re-executes the duplicate in the same way, so the logs, the applied entries and the states
+still agree. Replicas agreeing with each other isn't the same as the system being correct for clients.
+Only the client history shows that a write took effect twice.
+
+**Q9. The checker treats unanswered operations as "may or may not have happened". Why is that the only
+correct choice?**
+The client never learned the outcome. A lost reply looks exactly like a lost request. Assuming "it
+happened" or "it didn't" would report false violations for histories a correct system can produce.
+
+**Q10. Why can the checker split the history by key?**
+Linearizability is local (Herlihy & Wing): a history is linearizable if and only if the sub-history of
+each object is. Our objects are the keys. Splitting turns one huge search into many small ones.
+
+**Q11. What would break if two clients used the same clientId?**
+Their seqs would collide: client A's seq 5 would be answered with client B's saved reply for seq 5, or
+marked Stale. That is why RegisterClient exists in the thesis, and why we'd use random 64-bit ids in
+production (K2).
+
+**Q12. Seed 4811: why may a rejection carry no read-round echo, while a rejection in the current term
+must carry one?**
+A current-term rejection (log mismatch) answers a request of the same term: it proves the follower
+accepted this leader's term after the round was sent. A stale-term rejection answers a request of an
+*older* term but is stamped with the follower's *newer* term. The echoed number belongs to the old term's
+counter, so the leader would compare numbers from two different counters.
+
+**Q13. Could a client accept a `Stale` reply?**
+Not with one request in flight: `Stale` answers a seq *older* than the last executed one, and a
+client's current seq is always its newest. It can only reach an older attempt, which the client
+ignores. The checker treats a recorded `Stale` as a violation, so a client bug here would be caught.
+
+## 19. Glossary additions
+
+| Term | Meaning |
+|---|---|
+| **session table** | `clientId → (lastSeq, saved reply)` inside the state machine |
+| **Stale** | the answer to a request older than the client's last executed one; nothing is executed |
+| **read round** | a counter on the leader's AppendEntries/InstallSnapshot, echoed back, proving "still leader after this read arrived" |
+| **readIndex** | the commit index a read is ordered at; served once applied |
+| **attempt** | one try of an operation at one node; an operation can have many attempts, all carrying the same request |
+| **closed-loop client** | waits for the answer before starting its next operation |
+| **history** | the list of (operation, invoke time, return time, answer) the clients recorded |
+| **linearization point** | the instant inside an operation's interval at which it "really happened" |
+| **Wing & Gong / Lowe** | the backtracking search for a linearization, with memoization of (linearized set, state) |
+| **unknown operation** | one whose answer never arrived; may or may not have taken effect |
+| **leader-hunting faults** | a fault mix that aims most faults at the current leader, used for the read mutations |

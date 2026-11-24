@@ -1,123 +1,147 @@
 package com.projects.raftkv.sim;
 
-import com.projects.raftkv.core.Bytes;
+import com.projects.raftkv.client.ClientSession;
+import com.projects.raftkv.client.ClientSession.Attempt;
+import com.projects.raftkv.client.ClientSession.Decision;
+import com.projects.raftkv.client.ClientSession.Reply;
 import com.projects.raftkv.core.NodeId;
-import com.projects.raftkv.node.ProposalOutcome;
 import com.projects.raftkv.statemachine.KvCodec;
 import com.projects.raftkv.statemachine.KvCommand;
-import com.projects.raftkv.statemachine.KvRequest;
-import java.util.HashMap;
+import com.projects.raftkv.statemachine.KvResult;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.SplittableRandom;
 import java.util.function.LongSupplier;
 
 /**
- * Open-loop simulated clients (DESIGN.md M2-D). Each client proposes a random PUT/DELETE/CAS/GET to the
- * node it believes is leader, follows rejection hints, and never retries: M2 checks that replicas agree,
- * not what clients observe (that is M4's linearizability checker).
+ * Closed-loop simulated clients (DESIGN.md M4-A). Each client runs the real {@link ClientSession}: one
+ * operation at a time, retries with the same seq, leader hints, timeouts. Every operation is recorded
+ * in the {@link HistoryRecorder} from invocation to the answer the client finally accepts, which is
+ * what the linearizability checker (invariant 7) judges.
  */
 final class ClientWorkload {
 
     interface Scheduler { void at(long timeMs, Runnable action); }
 
-    interface Submitter { void submit(String client, NodeId target, long proposalId, Bytes command); }
+    /** Puts one attempt on the (lossy) client link to its target node. */
+    interface Sender { void send(String client, Attempt attempt); }
 
-    /** A client that hears nothing for this long assumes its target is gone and picks another node. */
-    private static final long SILENCE_MS = 300;
+    private static final class Client {
+        final ClientSession session;
+        final String name;
+        long lastCompletedAt = -1;
 
-    private final class Client {
-        final long id;
-        long seq;
-        NodeId target;
-        long lastHeardAt;
-        String lastValue = "";
-
-        Client(long id, NodeId target) { this.id = id; this.target = target; }
-        String name() { return "c" + id; }
+        Client(ClientSession session) {
+            this.session = session;
+            this.name = "c" + session.clientId();
+        }
     }
 
     private final WorkloadConfig cfg;
-    private final List<NodeId> members;
     private final SplittableRandom rng;
     private final Scheduler scheduler;
-    private final Submitter submitter;
+    private final Sender sender;
     private final LongSupplier clock;
-    private final Map<Long, Client> inFlight = new HashMap<>();
-    private long nextProposalId = 1;
+    private final HistoryRecorder history;
+    private final List<Client> clients = new ArrayList<>();
 
-    long proposals, committed, lost, rejected, unknown;
-    long lastCommitAt = -1;
+    long opsStarted, writesCompleted, readsCompleted, attempts, timeouts, redirects, retryReplies;
+    long lastWriteCompletedAt = -1;
 
     ClientWorkload(WorkloadConfig cfg, List<NodeId> members, SplittableRandom rng, Scheduler scheduler,
-                   Submitter submitter, LongSupplier clock) {
+                   Sender sender, LongSupplier clock, HistoryRecorder history) {
         this.cfg = cfg;
-        this.members = members;
         this.rng = rng;
         this.scheduler = scheduler;
-        this.submitter = submitter;
+        this.sender = sender;
         this.clock = clock;
+        this.history = history;
+        for (int i = 1; i <= cfg.clients(); i++) {
+            clients.add(new Client(new ClientSession(i, members, rng.split(),
+                    new ClientSession.Config(cfg.timeoutMs(), cfg.backoffMs()))));
+        }
     }
 
     void start() {
-        for (int i = 1; i <= cfg.clients(); i++) {
-            Client c = new Client(i, randomMember());
-            scheduler.at(clock.getAsLong() + interval(), () -> send(c));
-        }
+        for (Client c : clients) scheduler.at(clock.getAsLong() + think(), () -> nextOperation(c));
     }
 
-    private void send(Client c) {
+    /** The earliest time any client last completed an operation (liveness: every client makes progress). */
+    long slowestClientLastCompletedAt() {
+        return clients.stream().mapToLong(c -> c.lastCompletedAt).min().orElse(Long.MAX_VALUE);
+    }
+
+    private void nextOperation(Client c) {
         long now = clock.getAsLong();
-        if (now - c.lastHeardAt > SILENCE_MS) {
-            c.target = randomMember();
-            c.lastHeardAt = now;
-        }
-        c.seq++;
-        long proposalId = nextProposalId++;
-        inFlight.put(proposalId, c);
-        proposals++;
-        submitter.submit(c.name(), c.target, proposalId, KvCodec.encode(new KvRequest(c.id, c.seq, randomCommand(c))));
-        scheduler.at(now + interval(), () -> send(c));
-    }
-
-    void onOutcome(ProposalOutcome o) {
-        Client c = inFlight.remove(o.proposalId());
-        if (c == null) return;
-        long now = clock.getAsLong();
-        c.lastHeardAt = now;
-        switch (o) {
-            case ProposalOutcome.Committed x -> {
-                committed++;
-                lastCommitAt = now;
-            }
-            case ProposalOutcome.Lost x -> lost++;
-            case ProposalOutcome.Unknown x -> unknown++;
-            case ProposalOutcome.Rejected r -> {
-                rejected++;
-                c.target = r.leaderHint().orElseGet(this::randomMember);
-            }
-        }
-    }
-
-    private KvCommand randomCommand(Client c) {
+        opsStarted++;
         String key = "k" + rng.nextInt(cfg.keys());
-        String value = c.name() + "-" + c.seq;
+        Attempt a;
+        if (rng.nextInt(100) < cfg.readPercent()) {
+            history.invoke(c.name, new KvCommand.Get(key), now);
+            a = c.session.read(key);
+        } else {
+            KvCommand cmd = randomWrite(c, key);
+            history.invoke(c.name, cmd, now);
+            a = c.session.write(cmd);
+        }
+        dispatch(c, a);
+    }
+
+    /** Values name their writer and seq ("c3-17"), so every written value is unique: a strong check. */
+    private KvCommand randomWrite(Client c, String key) {
+        String value = c.name + "-" + (c.session.seq() + 1);
         int roll = rng.nextInt(100);
-        KvCommand cmd;
-        if (roll < 50) cmd = new KvCommand.Put(key, value);
-        else if (roll < 65) cmd = new KvCommand.Delete(key);
-        else if (roll < 85) cmd = new KvCommand.Cas(key, rng.nextBoolean() ? Optional.empty() : Optional.of(c.lastValue), value);
-        else cmd = new KvCommand.Get(key);
-        if (!(cmd instanceof KvCommand.Get) && !(cmd instanceof KvCommand.Delete)) c.lastValue = value;
-        return cmd;
+        if (roll < 55) return new KvCommand.Put(key, value);
+        if (roll < 75) return new KvCommand.Delete(key);
+        Optional<String> expected = rng.nextBoolean() ? Optional.empty()
+                : Optional.of("c" + (1 + rng.nextInt(cfg.clients())) + "-" + (1 + rng.nextInt((int) Math.max(1, c.session.seq() + 1))));
+        return new KvCommand.Cas(key, expected, value);
     }
 
-    private int interval() {
-        return cfg.minIntervalMs() + rng.nextInt(cfg.maxIntervalMs() - cfg.minIntervalMs() + 1);
+    private void dispatch(Client c, Attempt a) {
+        scheduler.at(clock.getAsLong() + a.delayMs(), () -> {
+            attempts++;
+            sender.send(c.name, a);
+            scheduler.at(clock.getAsLong() + cfg.timeoutMs(), () -> {
+                Decision d = c.session.onTimeout(a.attemptId());
+                if (d instanceof Decision.Send) timeouts++;
+                handle(c, d);
+            });
+        });
     }
 
-    private NodeId randomMember() {
-        return members.get(rng.nextInt(members.size()));
+    /** A node's answer to an attempt arrived back at its client. */
+    void onReply(long attemptId, Reply reply) {
+        Client c = clients.get((int) (attemptId >>> 40) - 1);
+        Decision d = c.session.onReply(attemptId, reply);
+        if (d instanceof Decision.Send) {
+            if (reply instanceof Reply.NotLeader) redirects++;
+            else retryReplies++;
+        }
+        handle(c, d);
+    }
+
+    private void handle(Client c, Decision d) {
+        switch (d) {
+            case Decision.Ignore i -> { }
+            case Decision.Send s -> dispatch(c, s.attempt());
+            case Decision.Completed done -> {
+                long now = clock.getAsLong();
+                KvResult result = KvCodec.decodeResult(done.result());
+                boolean read = history.complete(c.name, result, now) instanceof KvCommand.Get;
+                if (read) readsCompleted++;
+                else {
+                    writesCompleted++;
+                    lastWriteCompletedAt = now;
+                }
+                c.lastCompletedAt = now;
+                scheduler.at(now + think(), () -> nextOperation(c));
+            }
+        }
+    }
+
+    private int think() {
+        return cfg.minThinkMs() + rng.nextInt(cfg.maxThinkMs() - cfg.minThinkMs() + 1);
     }
 }

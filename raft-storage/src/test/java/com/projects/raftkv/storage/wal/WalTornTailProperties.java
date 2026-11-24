@@ -98,7 +98,21 @@ class WalTornTailProperties {
         byte[] torn = Arrays.copyOf(w.file(), cut + garbage);
         for (int i = cut; i < torn.length; i++) torn[i] = zeros ? 0 : (byte) rng.nextInt(256);
 
-        PersistentState expected = w.stateAtOffset().floorEntry((long) cut).getValue();
+        // Garbage that happens to equal the original bytes is indistinguishable from them: if it completes
+        // the record the cut tore (e.g. zeros where the record had zeros), recovery rightly keeps it.
+        int same = 0;
+        while (cut + same < Math.min(torn.length, w.file().length) && torn[cut + same] == w.file()[cut + same]) same++;
+        PersistentState expected = w.stateAtOffset().floorEntry((long) cut + same).getValue();
         assertThat(recoverFrom(torn)).isEqualTo(expected);
+    }
+
+    /**
+     * Regression (found by jqwik on 2026-11-25): the cut tore a HardState record (term 2, vote for n0)
+     * whose remaining bytes were all zeros, and zero garbage rebuilt it byte for byte. The test's
+     * expectation was wrong, not recovery.
+     */
+    @Test
+    void zeroGarbageThatRebuildsTheTornRecordIsKept() {
+        garbageAfterACutIsDiscarded(4, 52, true);
     }
 }

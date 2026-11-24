@@ -16,6 +16,13 @@ public sealed interface KvResult {
         public CasOutcome { Objects.requireNonNull(previous); }
     }
 
+    /**
+     * The request's seq is older than the last one this client's session executed (thesis §6.3). It is a
+     * delayed copy of a request the client has already moved past; nothing was executed. With one
+     * request in flight per client nobody is waiting for this reply.
+     */
+    record Stale(long lastSeq) implements KvResult {}
+
     /** The command bytes could not be decoded. Deterministic, so every replica answers the same. */
     record Invalid(String reason) implements KvResult {
         public Invalid { Objects.requireNonNull(reason); }

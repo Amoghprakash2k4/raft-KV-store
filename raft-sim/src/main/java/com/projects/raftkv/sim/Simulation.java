@@ -1,6 +1,7 @@
 package com.projects.raftkv.sim;
 
-import com.projects.raftkv.core.Bytes;
+import com.projects.raftkv.client.ClientSession;
+import com.projects.raftkv.client.ClientSession.Reply;
 import com.projects.raftkv.core.Event;
 import com.projects.raftkv.core.Message;
 import com.projects.raftkv.core.NodeId;
@@ -13,6 +14,7 @@ import com.projects.raftkv.core.SoftState;
 import com.projects.raftkv.node.NodeDriver;
 import com.projects.raftkv.node.NodeHaltedException;
 import com.projects.raftkv.node.ProposalOutcome;
+import com.projects.raftkv.node.ReadOutcome;
 import com.projects.raftkv.statemachine.KvStateMachine;
 import com.projects.raftkv.core.PersistentState;
 import com.projects.raftkv.storage.StorageException;
@@ -20,14 +22,18 @@ import com.projects.raftkv.storage.disk.SimDisk;
 import com.projects.raftkv.storage.wal.FileWalStorage;
 import com.projects.raftkv.storage.wal.WalOptions;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.SplittableRandom;
+import java.util.function.Consumer;
 import java.util.stream.IntStream;
 
 /**
  * Deterministic discrete-event simulation of a cluster: virtual time, a seeded network, a seeded fault
- * schedule, simulated clients, and invariant checks after every event. Each node runs the real
+ * schedule, closed-loop simulated clients over lossy client links, invariant checks after every event,
+ * and a linearizability check of everything the clients saw at the end (invariant 7). Each node runs the real
  * NodeDriver and KvStateMachine over the real write-ahead log (FileWalStorage) on a SimDisk, which loses or
  * tears unsynced data on a crash; every restart runs the real WAL recovery.
  * Same (seed, config) gives the same run.
@@ -39,6 +45,9 @@ public final class Simulation {
      * commands still commit, and every node has applied what was committed one window before the end.
      */
     private static final long LIVENESS_WINDOW_MS = 1_000;
+
+    /** Search budget for the end-of-run linearizability check (exceeding it fails the run). */
+    private static final long LINEARIZABILITY_STEP_BUDGET = 20_000_000;
 
     private record Scheduled(long time, long seq, Runnable action) {}
 
@@ -72,12 +81,14 @@ public final class Simulation {
     private final SplittableRandom faultRng;
     private final SplittableRandom nodeRng;
     private final SplittableRandom clientRng;
+    private final SplittableRandom linkRng;
     private final List<NodeId> members;
     private final List<SimNode> nodes = new ArrayList<>();
     private final boolean[][] blocked;      // blocked[from][to], 1-based ids
     private final PriorityQueue<Scheduled> queue = new PriorityQueue<>(
             (a, b) -> a.time != b.time ? Long.compare(a.time, b.time) : Long.compare(a.seq, b.seq));
-    private final Trace trace = new Trace(300);
+    /** Lines kept for a failure report: -Psim.trace=N keeps more (debugging a replayed seed). */
+    private final Trace trace = new Trace(Integer.getInteger("sim.trace", 300));
     private final ElectionSafetyChecker electionSafety = new ElectionSafetyChecker();
     private final VoteDurabilityChecker voteDurability = new VoteDurabilityChecker();
     private final LogMatchingChecker logMatching = new LogMatchingChecker();
@@ -87,6 +98,10 @@ public final class Simulation {
     private final LeaderCompletenessChecker leaderCompleteness = new LeaderCompletenessChecker();
     private final DurabilityChecker durability;
     private final ClientWorkload workload;
+    private final HistoryRecorder history = new HistoryRecorder();
+    /** Each copy of a client request delivered to a node gets its own id there; this maps it to the attempt. */
+    private final Map<Long, Long> attemptOfDelivery = new HashMap<>();
+    private long nextDeliveryId = 1;
 
     private long now;
     private long seq;
@@ -103,6 +118,11 @@ public final class Simulation {
     private long snapshotsInstalled;
     private long maxLogEntries;
     private long commitTargetForLiveness = -1;
+    private long lostProposals;
+    private long unknownProposals;
+    private long duplicatesAnswered;
+    private long linkDuplicates;
+    private long linearizabilitySteps;
 
     private Simulation(long seed, SimConfig cfg) {
         this.seed = seed;
@@ -113,6 +133,7 @@ public final class Simulation {
         this.nodeRng = root.split();
         this.clientRng = root.split();
         SplittableRandom diskRng = root.split();
+        this.linkRng = root.split();
         this.members = IntStream.rangeClosed(1, cfg.clusterSize()).mapToObj(NodeId::new).toList();
         this.blocked = new boolean[cfg.clusterSize() + 1][cfg.clusterSize() + 1];
         int every = cfg.storage().snapshotEvery();
@@ -122,7 +143,8 @@ public final class Simulation {
             nodes.add(new SimNode(id, r, new NodeLogTracker(leaderCompleteness::committedHashAt), snapshotEvery));
         }
         this.durability = new DurabilityChecker(members, cfg.checkDurability());
-        this.workload = new ClientWorkload(cfg.workload(), members, clientRng, this::at, this::submit, () -> now);
+        this.workload = new ClientWorkload(cfg.workload(), members, clientRng, this::at, this::sendToNode, () -> now,
+                history);
     }
 
     public static SimResult run(long seed, SimConfig cfg) {
@@ -156,22 +178,47 @@ public final class Simulation {
             throw new InvariantViolation("Liveness: no current-term leader in the last " + LIVENESS_WINDOW_MS
                     + "ms of the quiet period (last seen at " + lastCurrentLeaderSeenAt + "ms)");
         }
-        if (cfg.workload().clients() > 0) checkCommitLiveness(end);
+        if (cfg.workload().clients() > 0) {
+            checkLinearizability();
+            checkClientLiveness(end);
+        }
         for (SimNode n : nodes) if (n.up()) countSnapshots(n);
         long maxTerm = nodes.stream().filter(SimNode::up)
                 .mapToLong(n -> n.driver.status().hard().currentTerm()).max().orElse(0);
         return new SimResult(seed, events, trace.hash(), electionSafety.leadersElected(), maxTerm,
                 firstLeaderAt, lastNewLeaderAt, crashes, partitions, pauses,
-                workload.proposals, workload.committed, workload.lost, workload.rejected, workload.unknown,
+                workload.opsStarted, workload.writesCompleted, workload.readsCompleted, workload.attempts,
+                workload.timeouts, workload.redirects, workload.retryReplies, history.unknown(),
+                lostProposals, unknownProposals, duplicatesAnswered, linkDuplicates, linearizabilitySteps,
                 maxCommitIndex(), midWriteCrashes, tornTailsCut, durability.restartsChecked(),
                 snapshotsTaken, snapshotsInstalled, maxLogEntries);
     }
 
-    /** Commands keep committing after the faults heal, and every node catches up (restarted ones included). */
-    private void checkCommitLiveness(long end) {
-        if (workload.lastCommitAt < end - LIVENESS_WINDOW_MS) {
-            throw new InvariantViolation("Liveness: no client command committed in the last " + LIVENESS_WINDOW_MS
-                    + "ms of the quiet period (last commit at " + workload.lastCommitAt + "ms)");
+    /**
+     * Invariant 7: what the clients saw is linearizable. Operations still unanswered at the end may or may
+     * not have taken effect. Safety, so it runs before the liveness checks: a violation is reported as such.
+     */
+    private void checkLinearizability() {
+        LinearizabilityChecker.Result r = LinearizabilityChecker.check(history.history(), LINEARIZABILITY_STEP_BUDGET);
+        linearizabilitySteps = r.steps();
+        if (!r.linearizable()) {
+            throw new InvariantViolation((r.budgetExceeded() ? "Linearizability undecided: " : "Linearizability violated: ")
+                    + r.describe());
+        }
+    }
+
+    /**
+     * After the faults heal: every client keeps completing operations, writes keep committing, and every
+     * node catches up (restarted ones included).
+     */
+    private void checkClientLiveness(long end) {
+        if (workload.lastWriteCompletedAt < end - LIVENESS_WINDOW_MS) {
+            throw new InvariantViolation("Liveness: no client write completed in the last " + LIVENESS_WINDOW_MS
+                    + "ms of the quiet period (last at " + workload.lastWriteCompletedAt + "ms)");
+        }
+        if (workload.slowestClientLastCompletedAt() < end - LIVENESS_WINDOW_MS) {
+            throw new InvariantViolation("Liveness: a client completed nothing in the last " + LIVENESS_WINDOW_MS
+                    + "ms of the quiet period (its last completion at " + workload.slowestClientLastCompletedAt() + "ms)");
         }
         for (SimNode n : nodes) {
             long applied = n.driver.status().lastApplied();
@@ -224,9 +271,10 @@ public final class Simulation {
                 : RaftNodeCore.withMutationsForTesting(rc, recovered, nodeRng.split(), cfg.mutations());
         n.tracker.restart(recovered);
         stateMachineSafety.onRestart(n.id);
-        n.stateMachine = new KvStateMachine();
+        n.stateMachine = cfg.skipDedup() ? KvStateMachine.withoutDedupForTesting() : new KvStateMachine();
         NodeDriver.restoreFrom(recovered, n.stateMachine);   // the snapshot; the rest is re-applied from the log
-        n.driver = NodeDriver.create(core, n.trackedStorage, this::onSend, n.stateMachine, this::onOutcome, n.snapshotEvery);
+        n.driver = NodeDriver.create(core, n.trackedStorage, this::onSend, n.stateMachine, this::onOutcome,
+                this::onReadOutcome, n.snapshotEvery);
         n.lastSoft = null;
         n.lastAppliedSeen = -1;
         trace.add(now, n.name(), "start #" + n.incarnation + " " + n.driver.status().hard());
@@ -247,6 +295,7 @@ public final class Simulation {
     private void countSnapshots(SimNode n) {
         snapshotsTaken += n.driver.snapshotsTaken();
         snapshotsInstalled += n.driver.snapshotsInstalled();
+        duplicatesAnswered += n.stateMachine.duplicatesAnswered();
     }
 
     private void tick(SimNode n, int incarnation) {
@@ -257,8 +306,13 @@ public final class Simulation {
 
     private void deliver(SimNode n, Event event) {
         if (!(event instanceof Event.Tick)) trace.add(now, n.name(), event);
+        run(n, d -> d.handle(event));
+    }
+
+    /** Runs one driver call (an event, or a read) and then every invariant checker; a halted node crashes. */
+    private void run(SimNode n, Consumer<NodeDriver> call) {
         try {
-            n.driver.handle(event);
+            call.accept(n.driver);
         } catch (NodeHaltedException e) {
             if (n.midWriteCrashArmed) midWriteCrashes++;
             crash(n, "halted: " + e.getMessage());
@@ -308,25 +362,77 @@ public final class Simulation {
 
     // ---------------------------------------------------------------- clients
 
-    /** A client request reaches its target after 1-5 ms; it is lost if the node is down. */
-    private void submit(String client, NodeId target, long proposalId, Bytes command) {
-        trace.add(now, client, "propose #" + proposalId + " -> " + target);
-        at(now + between(clientRng, 1, 5), () -> arriveProposal(target, proposalId, command));
+    /**
+     * A client attempt travels to its target over a lossy link (DESIGN.md M4-A): it may be dropped,
+     * duplicated or delayed (long delays included) like peer messages, so retries and late duplicates
+     * really happen. Each delivered copy gets its own proposal/read id at the node.
+     */
+    private void sendToNode(String client, ClientSession.Attempt a) {
+        trace.add(now, client, (a.read() ? "read #" : "write #") + Long.toHexString(a.attemptId()) + " -> " + a.target());
+        if (linkRng.nextDouble() < cfg.network().dropProbability()) return;
+        at(now + linkDelay(), () -> arriveAtNode(a));
+        if (linkRng.nextDouble() < cfg.network().duplicateProbability()) {
+            linkDuplicates++;
+            at(now + linkDelay(), () -> arriveAtNode(a));
+        }
     }
 
-    private void arriveProposal(NodeId target, long proposalId, Bytes command) {
-        SimNode n = nodes.get(target.value() - 1);
-        if (!n.up()) return;
+    private void arriveAtNode(ClientSession.Attempt a) {
+        SimNode n = nodes.get(a.target().value() - 1);
+        if (!n.up()) return;                                  // lost: the node is down
         if (now < n.pausedUntil) {
-            at(n.pausedUntil, () -> arriveProposal(target, proposalId, command));
+            at(n.pausedUntil, () -> arriveAtNode(a));
             return;
         }
-        deliver(n, new Event.ProposeCommand(proposalId, command));
+        long delivery = nextDeliveryId++;
+        attemptOfDelivery.put(delivery, a.attemptId());
+        if (a.read()) {
+            trace.add(now, n.name(), "read " + delivery + " (attempt " + Long.toHexString(a.attemptId()) + ")");
+            run(n, d -> d.read(delivery, a.payload()));
+        } else {
+            deliver(n, new Event.ProposeCommand(delivery, a.payload()));
+        }
     }
 
     private void onOutcome(ProposalOutcome o) {
         trace.add(now, "cli", o);
-        workload.onOutcome(o);
+        Reply reply = switch (o) {
+            case ProposalOutcome.Committed c -> new Reply.Ok(c.result());
+            case ProposalOutcome.Rejected r -> new Reply.NotLeader(r.leaderHint());
+            case ProposalOutcome.Lost l -> { lostProposals++; yield new Reply.Retry(); }
+            case ProposalOutcome.Unknown u -> { unknownProposals++; yield new Reply.Retry(); }
+        };
+        replyToClient(o.proposalId(), reply);
+    }
+
+    private void onReadOutcome(ReadOutcome o) {
+        trace.add(now, "cli", o);
+        Reply reply = switch (o) {
+            case ReadOutcome.Ok ok -> new Reply.Ok(ok.result());
+            case ReadOutcome.Rejected r -> new Reply.NotLeader(r.leaderHint());
+        };
+        replyToClient(o.readId(), reply);
+    }
+
+    /** The answer travels back over the same kind of lossy link. */
+    private void replyToClient(long delivery, Reply reply) {
+        Long attempt = attemptOfDelivery.remove(delivery);
+        if (attempt == null) throw new IllegalStateException("second outcome for delivery " + delivery);
+        if (linkRng.nextDouble() < cfg.network().dropProbability()) return;
+        at(now + linkDelay(), () -> workload.onReply(attempt, reply));
+        if (linkRng.nextDouble() < cfg.network().duplicateProbability()) {
+            linkDuplicates++;
+            at(now + linkDelay(), () -> workload.onReply(attempt, reply));
+        }
+    }
+
+    private long linkDelay() {
+        NetworkConfig net = cfg.network();
+        long delay = between(linkRng, net.minDelayMs(), net.maxDelayMs());
+        if (linkRng.nextDouble() < net.longDelayProbability()) {
+            delay *= between(linkRng, net.longDelayMinFactor(), net.longDelayMaxFactor());
+        }
+        return delay;
     }
 
     // ---------------------------------------------------------------- network
@@ -378,6 +484,13 @@ public final class Simulation {
 
     private void injectFault() {
         FaultConfig f = cfg.faults();
+        if (f.targetLeader() && faultRng.nextInt(10) < 7) {
+            java.util.Optional<SimNode> leader = currentLeader();
+            if (leader.isPresent()) {
+                injectLeaderFault(leader.get());
+                return;
+            }
+        }
         int kind = f.crashLoop() && faultRng.nextInt(10) < 7 ? (faultRng.nextBoolean() ? 3 : 5) : faultRng.nextInt(6);
         switch (kind) {
             case 0 -> partitionSymmetric();
@@ -404,6 +517,44 @@ public final class Simulation {
                 trace.add(now, n.name(), "ARM crash during next fsync");
             });
             default -> throw new IllegalStateException("unreachable");
+        }
+    }
+
+    /** The up node that is leader in the highest term, if any. */
+    private java.util.Optional<SimNode> currentLeader() {
+        return nodes.stream().filter(SimNode::up)
+                .filter(n -> n.driver.status().soft().role() == Role.LEADER)
+                .max(java.util.Comparator.comparingLong(n -> n.driver.status().hard().currentTerm()));
+    }
+
+    /**
+     * DESIGN.md M4-F: the faults under which a leader's reads can go stale. Isolated: the others elect a
+     * new leader while clients can still reach this one. Paused: it resumes believing it still leads and
+     * finds client requests queued. Crashed: a new leader takes over with a commitIndex that may lag.
+     */
+    private void injectLeaderFault(SimNode leader) {
+        FaultConfig f = cfg.faults();
+        switch (faultRng.nextInt(3)) {
+            case 0 -> {
+                healLinks();
+                for (NodeId other : members) {
+                    if (other.equals(leader.id)) continue;
+                    blocked[leader.id.value()][other.value()] = true;
+                    blocked[other.value()][leader.id.value()] = true;
+                }
+                partitions++;
+                trace.add(now, "sim", "ISOLATE LEADER " + leader.name());
+            }
+            case 1 -> {
+                if (now < leader.pausedUntil) return;
+                leader.pausedUntil = now + between(faultRng, f.minPauseMs(), f.maxPauseMs());
+                pauses++;
+                trace.add(now, leader.name(), "PAUSE LEADER until " + leader.pausedUntil + "ms");
+            }
+            default -> {
+                crash(leader, "injected (leader)");
+                at(now + between(faultRng, f.minDownMs(), f.maxDownMs()), () -> restart(leader));
+            }
         }
     }
 

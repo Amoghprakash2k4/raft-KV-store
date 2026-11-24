@@ -2,6 +2,7 @@ package com.projects.raftkv.core;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -10,8 +11,8 @@ import java.util.Set;
 import java.util.random.RandomGenerator;
 
 /**
- * Deterministic Raft core: leader election (M1), log replication (M2) and log compaction with
- * InstallSnapshot (M3), following Figure 2 ("State", "AppendEntries RPC", "RequestVote RPC", "Rules for
+ * Deterministic Raft core: leader election (M1), log replication (M2), log compaction with
+ * InstallSnapshot (M3) and ReadIndex reads (M4, thesis §6.4), following Figure 2 ("State", "AppendEntries RPC", "RequestVote RPC", "Rules for
  * Servers"), Figure 13 (InstallSnapshot) and the snapshot boundary rules in DESIGN.md D1a.
  *
  * <p>Each {@link #step} mutates in-memory state and returns a {@link Ready}. Per DESIGN.md E1 the
@@ -99,9 +100,9 @@ public final class RaftNodeCore implements RaftCore {
             case Event.MessageReceived(Message m) -> onMessage(m);
             case Event.ProposeCommand p -> onPropose(p);
             case Event.SnapshotCreated sc -> onSnapshotCreated(sc);
-            case Event.ReadRequested r ->
-                    throw new UnsupportedOperationException("ReadIndex arrives in M4: " + r);
+            case Event.ReadRequested r -> onReadRequested(r);
         }
+        if (role instanceof RoleState.Leader l) serviceReads(l);
         return drainReady();
     }
 
@@ -221,6 +222,7 @@ public final class RaftNodeCore implements RaftCore {
      */
     private void stepDownToHigherTerm(long term) {
         boolean wasLeader = role instanceof RoleState.Leader;
+        if (role instanceof RoleState.Leader l) rejectPendingReads(l);
         currentTerm = term;
         votedFor = Optional.empty();
         role = new RoleState.Follower(Optional.empty());
@@ -250,6 +252,68 @@ public final class RaftNodeCore implements RaftCore {
         log.append(List.of(e));
         logOps.add(new PersistOp.AppendEntries(List.of(e)));
         return e;
+    }
+
+    // ---------------------------------------------------------------- ReadIndex reads (thesis §6.4)
+
+    /**
+     * A read arrives. Only the leader can serve it; others reject with the leader they know, like
+     * proposals (thesis §6.2). The leader queues it; {@link #serviceReads} gives it a read index and a
+     * round when it may.
+     */
+    private void onReadRequested(Event.ReadRequested r) {
+        if (role instanceof RoleState.Leader l) {
+            l.waitingReads.add(r.readId());
+        } else {
+            notices.add(new ClientNotice.ReadRejected(r.readId(), softState().leader()));
+        }
+    }
+
+    /**
+     * Runs after every step on the leader. Thesis §6.4, DESIGN.md M4-B:
+     * <ol>
+     *   <li>Wait until this leader has committed an entry of its own term (its no-op). Before that its
+     *       commitIndex may lag behind entries earlier leaders committed and clients saw acknowledged.</li>
+     *   <li>readIndex = commitIndex.</li>
+     *   <li>Confirm it is still leader: start read round r+1 (at most one round in flight, so waiting
+     *       reads batch into the next one), send it to every peer, and release each read once a
+     *       majority has echoed a round at least as new as the read's. A peer echoing in our term
+     *       had not voted for a newer leader when it replied, after the read arrived, so no newer
+     *       leader could have committed anything at that point.</li>
+     * </ol>
+     * The driver then waits for lastApplied &gt;= readIndex before querying the state machine (step 4).
+     */
+    private void serviceReads(RoleState.Leader l) {
+        boolean ownTermCommitted = log.termAt(commitIndex).orElse(-1) == currentTerm;
+        boolean mayChooseReadIndex = ownTermCommitted
+                || mutations.contains(ProtocolMutation.READ_BEFORE_CURRENT_TERM_COMMIT);   // MUTATION (test only)
+        if (mutations.contains(ProtocolMutation.READ_WITHOUT_QUORUM_CHECK) && mayChooseReadIndex) {
+            for (long id : l.waitingReads) notices.add(new ClientNotice.ReadReady(id, commitIndex));   // MUTATION (test only)
+            l.waitingReads.clear();
+            return;
+        }
+        if (!l.waitingReads.isEmpty() && mayChooseReadIndex
+                && l.roundAckedByMajority(config.quorum()) >= l.readRound) {       // no round in flight
+            l.readRound++;
+            for (long id : l.waitingReads) l.readsInRound.add(new RoleState.Leader.PendingRead(id, commitIndex, l.readRound));
+            l.waitingReads.clear();
+            broadcastAppend(l);
+        }
+        long confirmed = l.roundAckedByMajority(config.quorum());
+        for (Iterator<RoleState.Leader.PendingRead> it = l.readsInRound.iterator(); it.hasNext(); ) {
+            RoleState.Leader.PendingRead p = it.next();
+            if (p.round() > confirmed) break;                // rounds only grow along the list
+            notices.add(new ClientNotice.ReadReady(p.readId(), p.readIndex()));
+            it.remove();
+        }
+    }
+
+    /** A leader that steps down can answer none of its reads: the client retries elsewhere. */
+    private void rejectPendingReads(RoleState.Leader l) {
+        for (RoleState.Leader.PendingRead p : l.readsInRound) notices.add(new ClientNotice.ReadRejected(p.readId(), Optional.empty()));
+        for (long id : l.waitingReads) notices.add(new ClientNotice.ReadRejected(id, Optional.empty()));
+        l.readsInRound.clear();
+        l.waitingReads.clear();
     }
 
     // ---------------------------------------------------------------- snapshots (§7)
@@ -341,7 +405,9 @@ public final class RaftNodeCore implements RaftCore {
      */
     private void onAppendEntries(Message.AppendEntries ae) {
         if (ae.term() < currentTerm) {
-            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(), 0, 0));
+            // No read-round echo: this reply carries OUR term, the round belongs to the sender's older term,
+            // and the leader would count it as an ack in our term (M4-B; gate seed 4811).
+            send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(), 0, 0, 0));
             return;
         }
         followLeader(ae.from(), "AppendEntries");
@@ -353,13 +419,13 @@ public final class RaftNodeCore implements RaftCore {
         if (prevTerm.isEmpty()) {
             // Fast backup hint: our log ends before prevLogIndex.
             send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(),
-                    0, log.lastIndex() + 1));
+                    0, log.lastIndex() + 1, ae.readRound()));
             return;
         }
         if (prevTerm.getAsLong() != ae.prevLogTerm()) {
             // Fast backup hint: the term we hold there and where our run of that term starts.
             send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, false, 0, ae.prevLogIndex(),
-                    prevTerm.getAsLong(), log.firstIndexOfTermAt(ae.prevLogIndex())));
+                    prevTerm.getAsLong(), log.firstIndexOfTermAt(ae.prevLogIndex()), ae.readRound()));
             return;
         }
 
@@ -373,7 +439,8 @@ public final class RaftNodeCore implements RaftCore {
         if (ae.leaderCommit() > commitIndex) {
             commitIndex = Math.max(commitIndex, Math.min(ae.leaderCommit(), lastNewEntry));
         }
-        send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, true, lastNewEntry, 0, 0, 0));
+        send(new Message.AppendEntriesResponse(self, ae.from(), currentTerm, true, lastNewEntry, 0, 0, 0,
+                ae.readRound()));
     }
 
     /**
@@ -407,7 +474,8 @@ public final class RaftNodeCore implements RaftCore {
     private Message.AppendEntries skipCompactedEntries(Message.AppendEntries ae) {
         long base = log.snapshotIndex();
         List<LogEntry> rest = ae.entries().stream().filter(e -> e.index() > base).toList();
-        return new Message.AppendEntries(ae.from(), ae.to(), ae.term(), base, log.snapshotTerm(), rest, ae.leaderCommit());
+        return new Message.AppendEntries(ae.from(), ae.to(), ae.term(), base, log.snapshotTerm(), rest, ae.leaderCommit(),
+                ae.readRound());
     }
 
     /** Steps 3 and 4: skip entries we already have, truncate at the first real conflict, append the rest. */
@@ -465,6 +533,7 @@ public final class RaftNodeCore implements RaftCore {
      */
     private void onAppendEntriesResponse(Message.AppendEntriesResponse r) {
         if (!(role instanceof RoleState.Leader l) || r.term() != currentTerm) return;
+        l.ackRound(r.from(), r.readRound());                     // success or not: it accepts our term (M4-B)
         Progress p = l.progress(r.from());
         if (r.success()) {
             if (r.matchIndex() > log.lastIndex())
@@ -546,7 +615,8 @@ public final class RaftNodeCore implements RaftCore {
         long prevTerm = log.termAt(prevIndex).orElseThrow(
                 () -> new IllegalStateException("nextIndex " + p.nextIndex() + " beyond log for " + peer));
         List<LogEntry> entries = log.entriesFrom(p.nextIndex(), config.maxEntriesPerAppend());
-        send(new Message.AppendEntries(self, peer, currentTerm, prevIndex, prevTerm, entries, commitIndex));
+        send(new Message.AppendEntries(self, peer, currentTerm, prevIndex, prevTerm, entries, commitIndex,
+                ((RoleState.Leader) role).readRound));
     }
 
     // ---------------------------------------------------------------- InstallSnapshot (§7, Figure 13)
@@ -564,7 +634,7 @@ public final class RaftNodeCore implements RaftCore {
         int from = (int) t.offset();
         int to = Math.min(all.length, from + config.snapshotChunkBytes());
         send(new Message.InstallSnapshot(self, peer, currentTerm, s.index(), s.term(), from,
-                Bytes.copyOf(java.util.Arrays.copyOfRange(all, from, to)), to == all.length));
+                Bytes.copyOf(java.util.Arrays.copyOfRange(all, from, to)), to == all.length, l.readRound));
     }
 
     /**
@@ -581,38 +651,39 @@ public final class RaftNodeCore implements RaftCore {
      */
     private void onInstallSnapshot(Message.InstallSnapshot m) {
         if (m.term() < currentTerm) {
-            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, false));
+            // No read-round echo for an older term's message (see onAppendEntries).
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, false, 0));
             return;
         }
         followLeader(m.from(), "InstallSnapshot");
         boolean naive = mutations.contains(ProtocolMutation.NAIVE_INSTALL_SNAPSHOT);   // MUTATION (test only)
         if (m.lastIncludedIndex() <= commitIndex && !naive) {
             incoming = Optional.empty();
-            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, true));
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, true, m.readRound()));
             return;
         }
         Incoming in = incoming.filter(x -> x.index() == m.lastIncludedIndex() && x.term() == m.lastIncludedTerm())
                 .orElse(null);
         if (in == null) {
             if (m.offset() != 0) {
-                send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, false));
+                send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, false, m.readRound()));
                 return;
             }
             in = new Incoming(m.lastIncludedIndex(), m.lastIncludedTerm(), new java.io.ByteArrayOutputStream());
             incoming = Optional.of(in);
         }
         if (m.offset() != in.bytes().size()) {
-            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), in.bytes().size(), false));
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), in.bytes().size(), false, m.readRound()));
             return;
         }
         in.bytes().writeBytes(m.data().toByteArray());
         if (!m.done()) {
-            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), in.bytes().size(), false));
+            send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), in.bytes().size(), false, m.readRound()));
             return;
         }
         incoming = Optional.empty();
         installSnapshot(new Snapshot(m.lastIncludedIndex(), m.lastIncludedTerm(), Bytes.copyOf(in.bytes().toByteArray())), naive);
-        send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, true));
+        send(new Message.InstallSnapshotResponse(self, m.from(), currentTerm, m.lastIncludedIndex(), 0, true, m.readRound()));
     }
 
     private void installSnapshot(Snapshot s, boolean naive) {
@@ -640,6 +711,7 @@ public final class RaftNodeCore implements RaftCore {
      */
     private void onInstallSnapshotResponse(Message.InstallSnapshotResponse r) {
         if (!(role instanceof RoleState.Leader l) || r.term() != currentTerm) return;
+        l.ackRound(r.from(), r.readRound());
         Optional<RoleState.Leader.Transfer> t = l.transfer(r.from()).filter(x -> x.index() == r.lastIncludedIndex());
         if (t.isEmpty()) return;                                            // answers an older transfer
         if (r.done()) {

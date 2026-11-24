@@ -16,5 +16,15 @@ public enum ProtocolMutation {
      * Install every complete InstallSnapshot: no stale check (lastIncludedIndex <= commitIndex) and always
      * discard the log (Figure 13 steps 6-7, D1a rule 5). Rolls a follower back to an older state.
      */
-    NAIVE_INSTALL_SNAPSHOT
+    NAIVE_INSTALL_SNAPSHOT,
+    /**
+     * ReadIndex without step 3 (thesis §6.4): answer a read at commitIndex without confirming leadership
+     * with a majority. A deposed leader that has not heard of the new term serves stale reads.
+     */
+    READ_WITHOUT_QUORUM_CHECK,
+    /**
+     * ReadIndex without step 1 (thesis §6.4): take readIndex = commitIndex before this leader has committed
+     * an entry of its own term. A new leader's commitIndex can lag behind writes already acknowledged.
+     */
+    READ_BEFORE_CURRENT_TERM_COMMIT
 }

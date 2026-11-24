@@ -16,7 +16,8 @@ import org.junit.jupiter.api.Test;
 class KvSnapshotTest {
 
     private static void put(KvStateMachine sm, long index, String k, String v) {
-        sm.apply(index, KvCodec.encode(new KvRequest(1, index, new KvCommand.Put(k, v))));
+        // clientId 0 = no session, so these tests are about the data alone (sessions: KvSessionTest).
+        sm.apply(index, KvCodec.encode(new KvRequest(0, 0, new KvCommand.Put(k, v))));
     }
 
     @Test
@@ -74,12 +75,13 @@ class KvSnapshotTest {
         // Hand-build a snapshot with keys "b" then "a".
         java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
         try (java.io.DataOutputStream out = new java.io.DataOutputStream(buf)) {
-            out.writeByte(1);
+            out.writeByte(2);
             out.writeInt(2);
             for (String s : List.of("b", "2", "a", "1")) {
                 out.writeInt(1);
                 out.write(s.getBytes());
             }
+            out.writeInt(0);   // no sessions
         } catch (java.io.IOException e) {
             throw new java.io.UncheckedIOException(e);
         }

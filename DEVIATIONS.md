@@ -5,13 +5,28 @@ and the code carries a matching `// SHORTCUT:` comment where it applies.
 
 ## From the Raft protocol
 
-| # | Where | Shortcut | Removed in |
-|---|-------|----------|------------|
-| P3 | `RaftNodeCore.step`, `NodeDriver.handle` | `ReadRequested` throws `UnsupportedOperationException` (and the driver throws on `ReadReady`/`ReadRejected`). It fails loudly rather than being silently ignored. Until then, reads go through the log as `KvCommand.Get`, which is linearizable but costs a log entry per read. | M4 |
+None open. `grep -rn "SHORTCUT:\|arrives in M" raft-*/src/main` returns nothing.
 
 Removed in M2: **P1** (heartbeats with `prevLogIndex = 0`, now real `nextIndex`/`prevLogTerm` with entries), **P2**
 (no no-op on election, now appended in `becomeLeader`, §8), and the M2 half of **P3** (proposals and non-empty
-AppendEntries are handled). `grep -rnE "M1 only|arrives? in M2" raft-*/src/main` returns nothing.
+AppendEntries are handled). Removed in M4: the rest of **P3** (`ReadRequested` threw; it is now ReadIndex,
+thesis §6.4, DESIGN.md M4-B).
+
+## Skipped in M4 on purpose (owner decision 2026-11-24)
+
+Full reasons, diagrams and interview answers for each: EXPLANATION.md M4 §2 (what and why) and §3.2
+(follow-up questions with answers).
+
+None of these affects safety: no write is lost or applied twice, no read is stale. Each is explained in
+detail, with diagrams, in EXPLANATION.md M4 §2.
+
+| # | Thesis feature | What we do instead | Cost | Effort to add |
+|---|----------------|--------------------|------|---------------|
+| K1 | Session expiry (§6.3.2) | The session table is unbounded. | Memory grows with the number of distinct clients ever seen. | High: leader timestamps in entries, expiry at apply time, a "session expired" error. |
+| K2 | RegisterClient (§6.3) | Clients choose their own id (1..5 in the simulator; a random 64-bit id in production). | Ids unique by randomness, not by construction. | Low. |
+| K3 | Lease-based reads (§6.4.1) | Every read batch costs one ReadIndex round. | About one round trip per read batch. | Medium, and it would make safety depend on clocks (the brief forbids that). |
+| K4 | Reads served by followers (§6.4) | Followers reject reads with a leader hint. | The leader serves every read. | Low: reuses ReadIndex plus one message. |
+| K5 | Several requests in flight per client | One operation in flight per client; dedup keeps only the last seq. | Per-client throughput. | High: a window of seqs and replies, plus client acks. |
 
 ## From the project brief
 
@@ -25,9 +40,12 @@ AppendEntries are handled). `grep -rnE "M1 only|arrives? in M2" raft-*/src/main`
 
 | # | What | Why it is acceptable now | Revisit |
 |---|------|--------------------------|---------|
-| H1 | Simulated client requests reach nodes over a reliable 1–5 ms channel (no drops or duplicates); only node crashes and pauses affect them. Outcomes are delivered back directly. | M2 checks replica agreement, not client-observed behaviour. Lossy client links only matter together with retries and dedup. | M4 (sessions, retries, linearizability checker) |
-| H2 | `RaftNodeCore.withMutationsForTesting` puts test-only `if`s into production code (DESIGN.md M2-C), now four; `WalOptions`/`StorageMutation` add two in storage (M3-F). | Production paths always use no mutations; each `if` is marked `// MUTATION (test only)`. | Kept |
+| H2 | `RaftNodeCore.withMutationsForTesting` puts test-only `if`s into production code (DESIGN.md M2-C), now six; `WalOptions`/`StorageMutation` add two in storage (M3-F); `KvStateMachine.withoutDedupForTesting` adds one (M4-F). | Production paths always use no mutations; each `if` is marked `// MUTATION (test only)`. | Kept |
 | H3 | `SimDisk` models one directory, whole-byte torn writes and a simple page cache; no reordering of writes *within* a file beyond "a prefix survives". | Matches what ext4/xfs with `data=ordered` give for appends; the WAL relies only on prefix survival plus CRCs. | M5 (real `kill -9` on Docker) |
+| H4 | The two ReadIndex mutations are measured under a leader-targeted fault mix (`FaultConfig.leaderHunting`) and a read-heavy workload, not the standard chaos mix. | A bad ReadIndex is stale only in the short window around a leadership change; the standard mix catches it in 7–14% of seeds, the targeted one in 20–75%. Same idea as batch size 1 for Figure 8. Control runs use the same configs. | Kept |
+| H5 | Invariant 7 is checked once, at the end of each run, not after every event. | It needs the whole history; the other invariants still run after every event. | Kept |
+
+Removed in M4: **H1** (client links were reliable; they are now lossy, DESIGN.md M4-A).
 
 ## Durability limits (M3)
 
@@ -36,9 +54,10 @@ AppendEntries are handled). `grep -rnE "M1 only|arrives? in M2" raft-*/src/main`
 | S1 | On macOS, `FileChannel.force` is `fsync(2)`, which doesn't flush the drive's write cache (`F_FULLFSYNC` does), and `RealDisk.fsyncDir` silently does nothing if the directory can't be opened as a channel. | Linux in Docker is the deployment target; the simulator tests the protocol's use of fsync independently. | M5 |
 | S2 | Memory: the core holds the latest snapshot's bytes (M3-C), and `FileWalStorage` keeps its own copy of the log after the base (`LogImage`, for checkpoints). | The KV store lives in RAM anyway; both copies are bounded by snapshotting. | Kept (a production system would stream snapshots from disk) |
 | S3 | Serializing a snapshot runs on the driver thread and blocks the event loop. | Fine at this size; etcd/TiKV use copy-on-write state and background snapshots. | Later, if measured to matter |
-| S4 | `ProposalOutcome.Unknown`: a pending proposal covered by an installed snapshot can't be resolved, and the client must retry. | Retries become safe with M4 sessions and dedup. | M4 |
+
+Removed in M4: **S4** (`ProposalOutcome.Unknown` could not be retried safely; with sessions the client retries
+with the same seq and dedup makes it exactly-once).
 
 ## Open (to decide at the named milestone)
 
 - **M5:** `compose.yaml` is written but can't run yet. The node `main` and `raft-node/Dockerfile` must honour its env contract (`RAFT_NODE_ID`, `RAFT_PEERS`, `RAFT_PEER_PORT`, `RAFT_CLIENT_PORT`, `RAFT_DATA_DIR`).
-- **M4:** client sessions never expire (unbounded table) vs. deterministic expiry (thesis §6.3).

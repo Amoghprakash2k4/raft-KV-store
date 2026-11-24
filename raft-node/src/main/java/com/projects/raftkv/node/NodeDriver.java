@@ -19,9 +19,12 @@ import com.projects.raftkv.statemachine.StateMachine;
 import com.projects.raftkv.storage.Storage;
 import com.projects.raftkv.storage.StorageException;
 import com.projects.raftkv.transport.Transport;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.random.RandomGenerator;
@@ -29,7 +32,7 @@ import java.util.random.RandomGenerator;
 /**
  * Executes the core's effects in the order required by DESIGN.md E1:
  * persist all ops, fsync, send messages, apply committed entries (or restore an installed snapshot),
- * then report client outcomes. Between two events it may take a snapshot (DESIGN.md M3-E).
+ * then report client outcomes, serving ReadIndex reads whose read index has been applied (M4). Between two events it may take a snapshot (DESIGN.md M3-E).
  *
  * <p>Synchronous and not thread-safe: exactly one thread calls {@link #handle}. The simulator calls it
  * directly; the real node (M5) wraps it in a single-threaded event loop with an inbound queue.
@@ -44,22 +47,31 @@ public final class NodeDriver {
     private final Transport transport;
     private final StateMachine stateMachine;
     private final Consumer<ProposalOutcome> outcomes;
+    private final Consumer<ReadOutcome> readOutcomes;
     /** Production default for M3-E: snapshot once this many entries were applied since the last one. */
     public static final long DEFAULT_SNAPSHOT_EVERY = 10_000;
 
     private final Map<Long, Pending> pendingByIndex = new HashMap<>();
+    /** Reads handed to the core, by readId: the query to run once released. */
+    private final Map<Long, Bytes> readQueries = new HashMap<>();
+    /** Released reads waiting for lastApplied >= readIndex (thesis §6.4 step 4), by readIndex. */
+    private final TreeMap<Long, List<Long>> readsWaitingForApply = new TreeMap<>();
+    /** Index of the last entry applied here, no-ops included (the state machine skips those). */
+    private long appliedIndex;
     private final long snapshotEvery;
     private boolean halted;
     private long snapshotsTaken;
     private long snapshotsInstalled;
 
     private NodeDriver(RaftCore core, Storage storage, Transport transport, StateMachine stateMachine,
-                       Consumer<ProposalOutcome> outcomes, long snapshotEvery) {
+                       Consumer<ProposalOutcome> outcomes, Consumer<ReadOutcome> readOutcomes, long snapshotEvery) {
         this.core = Objects.requireNonNull(core);
         this.storage = Objects.requireNonNull(storage);
         this.transport = Objects.requireNonNull(transport);
         this.stateMachine = Objects.requireNonNull(stateMachine);
         this.outcomes = Objects.requireNonNull(outcomes);
+        this.readOutcomes = Objects.requireNonNull(readOutcomes);
+        this.appliedIndex = stateMachine.lastAppliedIndex();   // the restored snapshot's index, or 0
         if (snapshotEvery < 0) throw new IllegalArgumentException("snapshotEvery < 0");
         this.snapshotEvery = snapshotEvery;
     }
@@ -75,7 +87,7 @@ public final class NodeDriver {
         PersistentState state = storage.loadAll();
         restoreFrom(state, stateMachine);
         RaftCore core = new RaftNodeCore(config, state, rng);
-        return new NodeDriver(core, storage, transport, stateMachine, outcomes, snapshotEvery);
+        return new NodeDriver(core, storage, transport, stateMachine, outcomes, NO_READS, snapshotEvery);
     }
 
     public static NodeDriver recover(RaftConfig config, Storage storage, Transport transport,
@@ -98,7 +110,31 @@ public final class NodeDriver {
     public static NodeDriver create(RaftCore core, Storage storage, Transport transport,
                                     StateMachine stateMachine, Consumer<ProposalOutcome> outcomes,
                                     long snapshotEvery) {
-        return new NodeDriver(core, storage, transport, stateMachine, outcomes, snapshotEvery);
+        return new NodeDriver(core, storage, transport, stateMachine, outcomes, NO_READS, snapshotEvery);
+    }
+
+    /** As above, with ReadIndex reads ({@link #read}) reported to {@code readOutcomes}. */
+    public static NodeDriver create(RaftCore core, Storage storage, Transport transport,
+                                    StateMachine stateMachine, Consumer<ProposalOutcome> outcomes,
+                                    Consumer<ReadOutcome> readOutcomes, long snapshotEvery) {
+        return new NodeDriver(core, storage, transport, stateMachine, outcomes, readOutcomes, snapshotEvery);
+    }
+
+    private static final Consumer<ReadOutcome> NO_READS = r -> {
+        throw new IllegalStateException("this driver was built without a read listener: " + r);
+    };
+
+    /**
+     * Starts a linearizable read (thesis §6.4): the core confirms leadership and picks a read index; this
+     * driver then runs {@code query} against the state machine once it has applied that far. The answer
+     * goes to the read listener as {@link ReadOutcome}. {@code readId} must not be in flight already.
+     */
+    public void read(long readId, Bytes query) {
+        Objects.requireNonNull(query);
+        if (halted) throw new NodeHaltedException("node halted after a storage failure", null);
+        if (readQueries.putIfAbsent(readId, query) != null)
+            throw new IllegalArgumentException("read " + readId + " is already in flight");
+        handle(new Event.ReadRequested(readId));
     }
 
     /** As above, without snapshots. */
@@ -139,12 +175,28 @@ public final class NodeDriver {
             switch (n) {
                 case ClientNotice.ProposalAccepted a -> { }   // tracked above; completes at apply time
                 case ClientNotice.ProposalRejected r -> outcomes.accept(new ProposalOutcome.Rejected(r.proposalId(), r.leaderHint()));
-                case ClientNotice.ReadReady r -> throw new IllegalStateException("ReadIndex arrives in M4: " + r);
-                case ClientNotice.ReadRejected r -> throw new IllegalStateException("ReadIndex arrives in M4: " + r);
+                case ClientNotice.ReadReady r -> readsWaitingForApply.computeIfAbsent(r.readIndex(), k -> new ArrayList<>()).add(r.readId());
+                case ClientNotice.ReadRejected r -> {
+                    if (readQueries.remove(r.readId()) == null) throw new IllegalStateException("unknown read " + r);
+                    readOutcomes.accept(new ReadOutcome.Rejected(r.readId(), r.leaderHint()));
+                }
             }
         }
+        serveReads();
         // Between two events: maybe take a snapshot.
         maybeSnapshot();
+    }
+
+    /** Thesis §6.4 step 4: answer every released read whose readIndex has been applied. */
+    private void serveReads() {
+        while (!readsWaitingForApply.isEmpty() && readsWaitingForApply.firstKey() <= appliedIndex) {
+            Map.Entry<Long, List<Long>> e = readsWaitingForApply.pollFirstEntry();
+            for (long readId : e.getValue()) {
+                Bytes query = readQueries.remove(readId);
+                if (query == null) throw new IllegalStateException("unknown read " + readId);
+                readOutcomes.accept(new ReadOutcome.Ok(readId, e.getKey(), stateMachine.query(query)));
+            }
+        }
     }
 
     /**
@@ -174,6 +226,7 @@ public final class NodeDriver {
      */
     private void restore(Snapshot s) {
         stateMachine.restore(s.index(), s.data());
+        appliedIndex = Math.max(appliedIndex, s.index());
         snapshotsInstalled++;
         for (Iterator<Map.Entry<Long, Pending>> it = pendingByIndex.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<Long, Pending> p = it.next();
@@ -194,6 +247,9 @@ public final class NodeDriver {
 
     public LogView log() { return core.log(); }
 
+    /** Reads started here and not yet answered (for tests and metrics). */
+    public int pendingReads() { return readQueries.size(); }
+
     /** Proposals accepted here and not yet resolved (for tests and metrics). */
     public int pendingProposals() { return pendingByIndex.size(); }
 
@@ -212,6 +268,7 @@ public final class NodeDriver {
      * term means a different leader's entry was committed there instead (thesis §6.3).
      */
     private void apply(LogEntry e) {
+        appliedIndex = e.index();
         Bytes result = switch (e.payload()) {
             case EntryPayload.Noop n -> null;
             case EntryPayload.Command c -> stateMachine.apply(e.index(), c.data());
