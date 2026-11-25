@@ -89,6 +89,6 @@ class Figure8Test {
     @Test
     void normalConstructorHasNoMutations() {
         assertThat(core(N1, THREE, PersistentState.EMPTY, 1).mutations()).isEmpty();
-        assertThat(List.of(ProtocolMutation.values())).hasSize(6);   // M2: 3, M3: 1, M4: 2
+        assertThat(List.of(ProtocolMutation.values())).hasSize(8);   // M2: 3, M3: 1, M4: 2
     }
 }

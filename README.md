@@ -17,7 +17,7 @@ flowchart TB
         SM["raft-statemachine: KvStateMachine<br/>PUT / GET / DELETE / CAS + client sessions"]
         ST["raft-storage: FileWalStorage<br/>CRC32C WAL, torn-tail cut, atomic snapshots"]
     end
-    NET["raft-transport<br/>(gRPC in M5)"]
+    NET["raft-transport<br/>gRPC streams, one per peer"]
     SIM["raft-sim: deterministic simulator<br/>virtual time, faults, 8 invariant checkers,<br/>linearizability checker"]
     CL -- "requests / answers" --> DRV
     DRV -- "events" --> CORE
@@ -36,7 +36,7 @@ flowchart TB
 | M2 | Log replication, KV state machine, fast log backup | done |
 | M3 | Write-ahead log, crash recovery, snapshots, InstallSnapshot | done |
 | M4 | Client sessions (exactly-once writes), ReadIndex reads, linearizability checker | done |
-| M5 | PreVote, CheckQuorum, gRPC, metrics, CLI | next |
+| M5 | PreVote, CheckQuorum, gRPC, real server, HTTP API + CLI, Prometheus metrics, kill -9 tests, Docker | built, awaiting acceptance |
 | M6 | Benchmarks and report | later |
 
 Each milestone ends with a gate of 5,000 seeds × {3, 5} nodes × {chaos, crash loop} with zero
@@ -52,6 +52,29 @@ violations, plus deliberately injected bugs ("mutations") that the checkers must
 ```
 
 Requires JDK 21 (Gradle's toolchain finds or downloads it).
+
+## Run a cluster
+
+```
+docker compose up -d --build                                   # 3 nodes: clients on :8081, :8082, :8083
+curl -X PUT localhost:8081/kv/x -d '{"value":"1"}'             # a follower answers 421 {"leaderId":N}
+curl -X PUT localhost:808N/kv/x -d '{"value":"1"}'             # the leader: {"previous":null}
+curl localhost:8081/kv/x                                       # linearizable read (ReadIndex)
+curl -X POST localhost:808N/kv/x/cas -d '{"expected":"1","value":"2"}'
+curl localhost:8081/status ; curl localhost:8081/metrics       # role, term, commitIndex; Prometheus
+docker compose kill node2 && docker compose start node2        # SIGKILL and recover from the WAL
+docker compose down -v                                         # stop and wipe the data volumes
+```
+
+Without Docker: `./gradlew :raft-server:installDist`, then start
+`raft-server/build/install/raft-server/bin/raft-server` three times with `RAFT_NODE_ID`, `RAFT_PEERS`,
+`RAFT_PEER_PORT`, `RAFT_CLIENT_PORT` and `RAFT_DATA_DIR` set (see `ServerConfig`). The same folder has
+`bin/raft-cli` (`raft-cli put x 1`, `get x`, `del x`, `cas x 1 2`, `status`), which retries with the same
+sequence number and follows leader redirects.
+
+```
+./gradlew :raft-server:integrationTest                         # 3 JVMs, kill -9 loop, linearizability
+```
 
 ## Documents
 

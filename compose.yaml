@@ -1,18 +1,16 @@
 # 3-node Raft KV cluster for real-process tests (kill -9, restart, recovery from the file WAL).
 #
-# STATUS: target for M5. It will not start until raft-node has a main class, gRPC transport
-# and raft-node/Dockerfile. The environment variables below are the contract that main must honour.
+# The environment variables below are read by raft-server's ServerConfig.fromEnv.
 #
-#   docker compose up -d            # start the cluster
+#   docker compose up -d --build    # build the image and start the cluster
+#   curl -X PUT localhost:8081/kv/x -d '{"value":"1"}'   # any node; a follower answers 421 + leaderId
+#   curl localhost:8082/status ; curl localhost:8083/metrics
 #   docker compose kill node2       # SIGKILL == kill -9: no shutdown hooks, no final fsync
 #   docker compose start node2      # restart; the node must recover from its own volume
 #   docker compose down -v          # stop and WIPE all data volumes
 
 x-raft-node: &raft-node
-  image: raft-kv-node:dev
-  build:
-    context: .
-    dockerfile: raft-node/Dockerfile
+  image: raft-kv-node:dev   # built once, by node1 below (three builds of one tag would collide)
   environment: &raft-env
     RAFT_PEERS: "1=node1:7000,2=node2:7000,3=node3:7000"   # fixed membership (no reconfiguration in v1)
     RAFT_PEER_PORT: "7000"                                 # node-to-node gRPC, internal network only
@@ -28,6 +26,9 @@ services:
   node1:
     <<: *raft-node
     container_name: raft-node1
+    build:
+      context: .
+      dockerfile: raft-server/Dockerfile
     hostname: node1
     environment:
       <<: *raft-env

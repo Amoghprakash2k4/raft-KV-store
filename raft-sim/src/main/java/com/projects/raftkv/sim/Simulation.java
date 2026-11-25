@@ -45,6 +45,13 @@ public final class Simulation {
      * commands still commit, and every node has applied what was committed one window before the end.
      */
     private static final long LIVENESS_WINDOW_MS = 1_000;
+    /**
+     * Every client must complete an operation within this window at the end (DEVIATIONS.md H6). Client
+     * links keep dropping 5% of messages in the quiet period, so a client can be unlucky for a while:
+     * over 4 × 5,000 seeds its idle time at the end peaked at 1,089 ms (p99.9 ≈ 790 ms) whether or not
+     * PreVote/CheckQuorum were on. 1 s (M4) sat at that tail; 2 s does not.
+     */
+    private static final long CLIENT_LIVENESS_WINDOW_MS = Long.getLong("sim.clientWindow", 2_000);
 
     /** Search budget for the end-of-run linearizability check (exceeding it fails the run). */
     private static final long LINEARIZABILITY_STEP_BUDGET = 20_000_000;
@@ -123,6 +130,12 @@ public final class Simulation {
     private long duplicatesAnswered;
     private long linkDuplicates;
     private long linearizabilitySteps;
+    // The scripted scenario (SimConfig.Scenario, DESIGN.md M5-A).
+    private SimNode scenarioNode;
+    private long scenarioStartedAt = -1;
+    private long termAtScenarioStart = -1;
+    private int newLeadersSinceScenario;
+    private long scenarioStepDownMs = -1;
 
     private Simulation(long seed, SimConfig cfg) {
         this.seed = seed;
@@ -163,6 +176,10 @@ public final class Simulation {
         }
         if (cfg.faults().enabled()) scheduleNextFault();
         if (cfg.chaosMs() > 0) at(cfg.chaosMs(), this::endChaos);
+        if (cfg.scenario() != SimConfig.Scenario.NONE) {
+            at(SimConfig.Scenario.START_MS, this::startScenario);
+            at(SimConfig.Scenario.HEAL_MS, this::endScenario);
+        }
         workload.start();
 
         long end = cfg.chaosMs() + cfg.quietMs();
@@ -191,7 +208,9 @@ public final class Simulation {
                 workload.timeouts, workload.redirects, workload.retryReplies, history.unknown(),
                 lostProposals, unknownProposals, duplicatesAnswered, linkDuplicates, linearizabilitySteps,
                 maxCommitIndex(), midWriteCrashes, tornTailsCut, durability.restartsChecked(),
-                snapshotsTaken, snapshotsInstalled, maxLogEntries);
+                snapshotsTaken, snapshotsInstalled, maxLogEntries,
+                termAtScenarioStart, newLeadersSinceScenario, scenarioStepDownMs,
+                cfg.workload().clients() > 0 ? end - workload.slowestClientLastCompletedAt() : 0);
     }
 
     /**
@@ -216,8 +235,8 @@ public final class Simulation {
             throw new InvariantViolation("Liveness: no client write completed in the last " + LIVENESS_WINDOW_MS
                     + "ms of the quiet period (last at " + workload.lastWriteCompletedAt + "ms)");
         }
-        if (workload.slowestClientLastCompletedAt() < end - LIVENESS_WINDOW_MS) {
-            throw new InvariantViolation("Liveness: a client completed nothing in the last " + LIVENESS_WINDOW_MS
+        if (workload.slowestClientLastCompletedAt() < end - CLIENT_LIVENESS_WINDOW_MS) {
+            throw new InvariantViolation("Liveness: a client completed nothing in the last " + CLIENT_LIVENESS_WINDOW_MS
                     + "ms of the quiet period (its last completion at " + workload.slowestClientLastCompletedAt() + "ms)");
         }
         for (SimNode n : nodes) {
@@ -251,7 +270,7 @@ public final class Simulation {
     private void start(SimNode n) {
         n.incarnation++;
         RaftConfig rc = new RaftConfig(n.id, members, cfg.electionTimeoutTicks(), cfg.heartbeatTicks(),
-                cfg.maxEntriesPerAppend(), cfg.storage().snapshotChunkBytes());
+                cfg.maxEntriesPerAppend(), cfg.storage().snapshotChunkBytes(), cfg.preVote(), cfg.checkQuorum());
         FileWalStorage wal;
         try {
             wal = FileWalStorage.open(n.disk, new WalOptions(cfg.storage().walSegmentBytes(), cfg.storage().mutations()));
@@ -346,6 +365,11 @@ public final class Simulation {
             if (s.soft().role() == Role.LEADER) {
                 if (firstLeaderAt < 0) firstLeaderAt = now;
                 lastNewLeaderAt = now;
+                if (scenarioStartedAt >= 0) newLeadersSinceScenario++;
+            }
+            if (n == scenarioNode && cfg.scenario() == SimConfig.Scenario.ISOLATE_LEADER
+                    && scenarioStepDownMs < 0 && s.soft().role() != Role.LEADER) {
+                scenarioStepDownMs = now - scenarioStartedAt;
             }
             n.lastSoft = s.soft();
         }
@@ -556,6 +580,35 @@ public final class Simulation {
                 at(now + between(faultRng, f.minDownMs(), f.maxDownMs()), () -> restart(leader));
             }
         }
+    }
+
+    /**
+     * Cut one node off from every other node (client links stay up). Waits for a leader first: both
+     * scenarios are about a healthy cluster with a leader.
+     */
+    private void startScenario() {
+        java.util.Optional<SimNode> leader = currentLeader();
+        if (leader.isEmpty()) {
+            at(now + 50, this::startScenario);
+            return;
+        }
+        SimNode target = cfg.scenario() == SimConfig.Scenario.ISOLATE_LEADER ? leader.get()
+                : nodes.stream().filter(n -> n != leader.get() && n.up()).findFirst().orElseThrow();
+        for (NodeId other : members) {
+            if (other.equals(target.id)) continue;
+            blocked[target.id.value()][other.value()] = true;
+            blocked[other.value()][target.id.value()] = true;
+        }
+        scenarioNode = target;
+        scenarioStartedAt = now;
+        termAtScenarioStart = maxLiveTerm();
+        partitions++;
+        trace.add(now, "sim", "SCENARIO " + cfg.scenario() + ": isolate " + target.name());
+    }
+
+    private void endScenario() {
+        healLinks();
+        trace.add(now, "sim", "SCENARIO heal");
     }
 
     private void partitionSymmetric() {

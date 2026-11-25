@@ -23,6 +23,22 @@ sealed interface RoleState {
         @Override public Role role() { return Role.FOLLOWER; }
     }
 
+    /**
+     * PreVote (thesis §9.6): the nodes (including itself) that said they would vote for it in
+     * currentTerm + 1. Its term and vote are unchanged; nothing about this role is persisted.
+     */
+    record PreCandidate(Set<NodeId> grants) implements RoleState {
+        public PreCandidate { grants = Set.copyOf(grants); }
+
+        PreCandidate withGrant(NodeId voter) {
+            Set<NodeId> next = new HashSet<>(grants);
+            next.add(voter);
+            return new PreCandidate(next);
+        }
+
+        @Override public Role role() { return Role.PRE_CANDIDATE; }
+    }
+
     /** Candidate with the set of nodes (including itself) that granted a vote in the current term. */
     record Candidate(Set<NodeId> votes) implements RoleState {
         public Candidate { votes = Set.copyOf(votes); }
@@ -60,6 +76,9 @@ sealed interface RoleState {
         final List<Long> waitingReads = new ArrayList<>();
         /** Reads with a read index, waiting for a majority to echo their round. In arrival order. */
         final List<PendingRead> readsInRound = new ArrayList<>();
+
+        /** CheckQuorum (thesis §6.2): peers heard from in this term since the last quorum check. */
+        final Set<NodeId> recentlyActive = new HashSet<>();
 
         /** Figure 2: nextIndex = leader last log index + 1 (before the no-op), matchIndex = 0. */
         Leader(List<NodeId> peers, long nextIndex) {

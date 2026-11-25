@@ -1,0 +1,100 @@
+// Peer-to-peer Raft messages on the wire (DESIGN.md M5-B). One message type per record in
+// com.projects.raftkv.core.Message; ProtoMapping converts both ways and its round-trip property test
+// checks that nothing is lost. Field numbers are part of the format: never reuse or renumber them.
+syntax = "proto3";
+
+package raftkv;
+
+option java_package = "com.projects.raftkv.proto";
+option java_multiple_files = true;
+
+// The envelope: who it is from and for, the sender's term, and exactly one body.
+message RaftMessage {
+  int32 from = 1;
+  int32 to = 2;
+  uint64 term = 3;
+  oneof body {
+    RequestVote request_vote = 10;
+    RequestVoteResponse request_vote_response = 11;
+    AppendEntries append_entries = 12;
+    AppendEntriesResponse append_entries_response = 13;
+    InstallSnapshot install_snapshot = 14;
+    InstallSnapshotResponse install_snapshot_response = 15;
+    PreVote pre_vote = 16;
+    PreVoteResponse pre_vote_response = 17;
+  }
+}
+
+// Figure 2.
+message RequestVote {
+  uint64 last_log_index = 1;
+  uint64 last_log_term = 2;
+}
+
+message RequestVoteResponse {
+  bool vote_granted = 1;
+}
+
+// Thesis §9.6. term in the envelope = the proposed term.
+message PreVote {
+  uint64 last_log_index = 1;
+  uint64 last_log_term = 2;
+}
+
+message PreVoteResponse {
+  bool granted = 1;
+}
+
+// Figure 2, plus the fast-backup hints (M2) and the ReadIndex round (M4-B).
+message AppendEntries {
+  uint64 prev_log_index = 1;
+  uint64 prev_log_term = 2;
+  repeated LogEntry entries = 3;
+  uint64 leader_commit = 4;
+  uint64 read_round = 5;
+}
+
+message AppendEntriesResponse {
+  bool success = 1;
+  uint64 match_index = 2;
+  uint64 rejected_index = 3;
+  uint64 conflict_term = 4;
+  uint64 conflict_index = 5;
+  uint64 read_round = 6;
+}
+
+// Figure 13, one chunk (M3-D).
+message InstallSnapshot {
+  uint64 last_included_index = 1;
+  uint64 last_included_term = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  bool done = 5;
+  uint64 read_round = 6;
+}
+
+message InstallSnapshotResponse {
+  uint64 last_included_index = 1;
+  uint64 next_offset = 2;
+  bool done = 3;
+  uint64 read_round = 4;
+}
+
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  oneof payload {
+    Noop noop = 3;
+    bytes command = 4;
+  }
+}
+
+message Noop {}
+
+message Ack {}
+
+// One long-lived client stream per (sender, receiver) pair. Raft messages are one-way, so the server
+// answers only when the stream ends; replies travel as ordinary messages on the receiver's own stream.
+service RaftPeer {
+  rpc Stream(stream RaftMessage) returns (Ack);
+}

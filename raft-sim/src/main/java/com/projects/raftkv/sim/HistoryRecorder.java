@@ -15,13 +15,14 @@ import java.util.Optional;
  * unanswered when the run ends is recorded with {@link #UNKNOWN_RETURN} and no output: it may have
  * taken effect (at any time after its invocation) or not at all.
  */
-final class HistoryRecorder {
+public final class HistoryRecorder {
 
     /** The return time of an operation that never got an answer. */
-    static final long UNKNOWN_RETURN = Long.MAX_VALUE;
+    public static final long UNKNOWN_RETURN = Long.MAX_VALUE;
 
-    record Operation(int id, String client, KvCommand command, long invokeMs, long returnMs, Optional<KvResult> output) {
-        Operation {
+    /** Public for the real-cluster kill -9 test (raft-server), which records real histories. */
+    public record Operation(int id, String client, KvCommand command, long invokeMs, long returnMs, Optional<KvResult> output) {
+        public Operation {
             Objects.requireNonNull(command);
             Objects.requireNonNull(output);
             if (returnMs < invokeMs) throw new IllegalArgumentException("returns before it was invoked");

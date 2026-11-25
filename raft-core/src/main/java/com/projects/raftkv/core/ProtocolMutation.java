@@ -26,5 +26,16 @@ public enum ProtocolMutation {
      * ReadIndex without step 1 (thesis §6.4): take readIndex = commitIndex before this leader has committed
      * an entry of its own term. A new leader's commitIndex can lag behind writes already acknowledged.
      */
-    READ_BEFORE_CURRENT_TERM_COMMIT
+    READ_BEFORE_CURRENT_TERM_COMMIT,
+    /**
+     * PreVote that raises (and persists) the pre-candidate's term on every attempt, as a real election
+     * would (thesis §9.6). An isolated node inflates its term and deposes a healthy leader when it rejoins.
+     * Liveness, not safety: caught by the disruption scenario, not by the invariant checkers.
+     */
+    PREVOTE_BUMPS_TERM,
+    /**
+     * PreVote granted without the up-to-date check (§5.4.1). A teaching control: it must cause NO safety
+     * violation, because the real RequestVote that follows still checks the log.
+     */
+    PREVOTE_SKIPS_LOG_CHECK
 }

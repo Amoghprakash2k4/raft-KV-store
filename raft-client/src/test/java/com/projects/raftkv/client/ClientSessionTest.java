@@ -138,4 +138,23 @@ class ClientSessionTest {
         assertThat(other.write(new KvCommand.Put("x", "1")).attemptId())
                 .isNotEqualTo(s.write(new KvCommand.Put("x", "1")).attemptId());
     }
+
+    /** M5: a network client that gives up on an operation can start the next one, with a new seq. */
+    @Test
+    void anAbandonedOperationFreesTheSessionAndTheNextWriteGetsANewSeq() {
+        Attempt first = s.write(new KvCommand.Put("x", "1"));
+        s.abandon(first.attemptId());
+        assertThat(s.busy()).isFalse();
+        assertThat(s.onReply(first.attemptId(), new Reply.Ok(OK))).isInstanceOf(Decision.Ignore.class);   // too late
+
+        Attempt second = s.write(new KvCommand.Put("x", "2"));
+        assertThat(request(second).seq()).isEqualTo(request(first).seq() + 1);
+    }
+
+    @Test
+    void abandoningAnUnknownAttemptChangesNothing() {
+        Attempt a = s.write(new KvCommand.Put("x", "1"));
+        s.abandon(a.attemptId() + 999);
+        assertThat(s.busy()).isTrue();
+    }
 }

@@ -154,6 +154,17 @@ public final class ClientSession {
         return new Decision.Send(attempt(otherThan(latestTarget), 0));
     }
 
+    /**
+     * The caller gave up on the current operation (its own deadline passed). Its outcome stays unknown: a
+     * write may still take effect, once. The next write gets a new seq, so the session table moves past it.
+     */
+    public void abandon(long attemptId) {
+        if (current != null && attemptsOfCurrent.containsKey(attemptId)) {
+            current = null;
+            attemptsOfCurrent.clear();
+        }
+    }
+
     private Attempt start(boolean read, Bytes payload) {
         current = new Op(++opNumber, read, payload);
         NodeId target = leaderGuess.orElseGet(() -> members.get(rng.nextInt(members.size())));

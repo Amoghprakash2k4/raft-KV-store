@@ -202,3 +202,81 @@ interview answers in EXPLANATION.md M4 §2–§3, list in DEVIATIONS.md K1–K5)
 - [x] Gate over 5,000 seeds (bug at seed 4811 found and fixed, regression pinned)
 - [x] Docs: DESIGN, DEVIATIONS, CLAUDE.md, README, EXPLANATION.md `# M4`
 - [x] Accepted by the owner 2026-11-25; committed and pushed
+
+## M5: Hardening 🟡 built and verified, waiting for the owner's acceptance (2026-11-25)
+
+**Exit criterion (brief):** PreVote, CheckQuorum, gRPC transport, metrics (term, role, commitIndex,
+lastApplied, election count, replication lag, fsync latency), a CLI client, and kill -9 integration
+tests on real processes. Invariants 1–7 keep holding.
+
+**Built:** PreVote + CheckQuorum + leader stickiness in the core behind flags (on in the simulator and the
+server); `raft-proto` + gRPC `GrpcTransport`/`GrpcPeerServer` (one stream per peer, bounded queue, drop
+when full); `raft-server` (one event-loop thread over a mailbox, file WAL on the real disk, fail-stop);
+HTTP client API (JSON + binary), `HttpClusterClient` and `raft-cli` on `ClientSession`; Micrometer +
+Prometheus at `/metrics`; `KillNineIntegrationTest`; `raft-server/Dockerfile` + working `compose.yaml`.
+
+```mermaid
+flowchart LR
+    CLI["raft-cli / curl"] -- "HTTP: 200 / 421 leaderId" --> S1["raft-server n1"]
+    S1 <-- "gRPC streams" --> S2["raft-server n2"]
+    S1 <-- "gRPC streams" --> S3["raft-server n3"]
+    S2 <-- "gRPC streams" --> S3
+    P["Prometheus"] -. "scrape /metrics" .-> S1
+```
+
+**PreVote / CheckQuorum, measured** (`HardeningScenarioTest`, 100 seeds per row, one node cut off for 3 s):
+
+| Scenario | PreVote | CheckQuorum | Result |
+|---|---|---|---|
+| isolate a follower (3 and 5 nodes) | on | on | 0/100 disrupted, term growth 0 |
+| isolate a follower (5 nodes) | off | on | 100/100 disrupted, term +26 |
+| isolate the leader (3 and 5 nodes) | on | on | steps down after 98–204 ms |
+| isolate the leader (3 nodes) | on | off | keeps the role 3,001–3,013 ms (until the heal) |
+| isolate the leader (3 nodes) | off | on | steps down in 98–204 ms, term +24 |
+| mutation `PREVOTE_BUMPS_TERM` | | | caught: 100/100 disrupted, term +25 |
+
+**Gate** (5,000 seeds × {3, 5} × {chaos, crash loop}, hardening on): 0 violations of invariants 1–7, vote
+durability, replica state, commit and client liveness. Runtime 3 min 39 s. Max term in chaos: 18 / 20
+(M4: up to 62). The first run failed on seed 3064 (chaos, 5 nodes): client liveness, not safety. A
+stable leader and five lost round trips on a 5%-lossy client link. The idle-time distribution, measured
+over 20,000 runs, maxed at 1,089 ms with the features on or off, so the client window became 2 s
+(DEVIATIONS.md H6). The seed is pinned in `RegressionSeedsTest`.
+
+| Config | Elections | Max term | Crashes | Client ops | Dedup hits |
+|---|---|---|---|---|---|
+| chaos, 3 | 32,792 | 18 | 41,813 | 2,717,114 | 559,220 |
+| chaos, 5 | 32,118 | 20 | 45,214 | 3,617,108 | 1,062,344 |
+| crash loop, 3 | 42,240 | 25 | 255,991 | 1,585,290 | 522,169 |
+| crash loop, 5 | 61,617 | 32 | 300,777 | 2,449,733 | 1,308,437 |
+
+**Mutations** (all M2–M4 ones still caught; the ones PreVote/CheckQuorum would mask run with them off):
+
+| Mutation | Config, seeds | Caught by |
+|---|---|---|
+| SKIP_UP_TO_DATE_CHECK, hardening off | chaos, 100 | Leader Completeness 89 |
+| same, PreVote on (masking control) | chaos, 100 | 0: PreVote's log check hides it |
+| SKIP_UP_TO_DATE_CHECK + PREVOTE_SKIPS_LOG_CHECK | chaos, 100 | Leader Completeness 56 |
+| PREVOTE_SKIPS_LOG_CHECK alone | chaos, 300 | 0, expected: safety still holds (PreVote is liveness only) |
+| READ_WITHOUT_QUORUM_CHECK, CheckQuorum off / on | leader faults, 100 | Linearizability 76 / 11 |
+| READ_BEFORE_CURRENT_TERM_COMMIT | leader faults, 200 | Linearizability 34 |
+| SKIP_DEDUP | chaos, 100 | Linearizability 100 |
+| Figure 8 (batch 1, hardening off), lying disk, torn-tail, truncate on match, snapshot fsync, naive install | as before | 4/1000, 50/50, 98/100, 100/100, 58/100, 98/100 |
+| Controls (batch 1, crash loop, both leader-fault mixes) | 100 + 100 + 100 + 200 | no violations |
+
+**Real processes** (`./gradlew :raft-server:integrationTest`): 6 runs, 162 SIGKILLs (116 of the leader),
+109,288 client operations, every history linearizable, every node caught up, no operation lost to a
+timeout. Docker: `docker compose up -d --build`, a 421 redirect, a SIGKILL of the leader and a restart,
+checked by hand (EXPLANATION.md M5 §9.3).
+
+`./gradlew build`: 369 tests, green.
+
+### Checklist
+- [x] PreVote, CheckQuorum, stickiness: unit tests first, then core, behind flags
+- [x] Measured on/off in the simulator; masking findings pinned as tests
+- [x] `raft.proto`, `ProtoMapping` (round-trip property), `GrpcTransport` + `GrpcPeerServer`
+- [x] `raft-server`: config from env, event loop, fail-stop, client API, metrics
+- [x] `HttpClusterClient`, `raft-cli`
+- [x] Gate over 5,000 seeds (seed 3064 investigated: harness window, H6)
+- [x] kill -9 integration test, Dockerfile, compose verified
+- [x] Docs: DESIGN M5, DEVIATIONS (H3, H6, R1–R4), README, CLAUDE.md, EXPLANATION.md `# M5`
+- [ ] Accepted by the owner

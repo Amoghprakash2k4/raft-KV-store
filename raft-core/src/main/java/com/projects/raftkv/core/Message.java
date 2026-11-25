@@ -18,6 +18,19 @@ public sealed interface Message {
             implements Message {}
 
     /**
+     * PreVote (thesis §9.6): "would you vote for me in {@code term}?", where term = the sender's
+     * currentTerm + 1. Neither side changes its term or vote because of it: a receiver never adopts this
+     * term, and the sender only raises its own once a majority has answered yes.
+     */
+    record PreVote(NodeId from, NodeId to, long term, long lastLogIndex, long lastLogTerm) implements Message {}
+
+    /**
+     * The answer to a {@link PreVote}. A yes carries the proposed term (so the sender can match it to
+     * its current round); a no carries the receiver's currentTerm, so a sender that is behind catches up.
+     */
+    record PreVoteResponse(NodeId from, NodeId to, long term, boolean granted) implements Message {}
+
+    /**
      * Figure 2 AppendEntries arguments. leaderId == from. Empty entries == heartbeat.
      * {@code readRound} (thesis §6.4, DESIGN.md M4-B): the leader's ReadIndex round when it sent this;
      * the reply echoes it, which proves the follower still accepted this leader's term after the round

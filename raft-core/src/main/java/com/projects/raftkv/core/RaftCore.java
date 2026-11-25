@@ -12,4 +12,7 @@ public interface RaftCore {
     RaftStatus status();
 
     LogView log();
+
+    /** Leader only: each peer's matchIndex (Figure 2), for the replication-lag metric. Empty otherwise. */
+    default java.util.Map<NodeId, Long> matchIndexes() { return java.util.Map.of(); }
 }
