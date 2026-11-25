@@ -19,6 +19,7 @@ up everywhere.
 clusters.
 
 ## Contents
+0. [Words you need first](#m1-0-words)
 1. [The big picture](#1-the-big-picture)
 2. [Project setup decisions](#2-project-setup-decisions)
 3. [The two core design decisions (D1, E1)](#3-the-two-core-design-decisions-d1-e1)
@@ -32,6 +33,59 @@ clusters.
 11. [Shortcuts taken and what M2 must fix](#11-shortcuts-taken-and-what-m2-must-fix)
 12. [Study questions (with answers)](#12-study-questions-with-answers)
 13. [Glossary](#13-glossary)
+
+---
+
+<a id="m1-0-words"></a>
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **distributed system** | several computers working together over a network, which can fail independently of each other |
+| **node (server)** | one of those computers, running one copy of our program |
+| **cluster** | the fixed group of nodes (3 or 5 here) that together act as one key-value store |
+| **replication** | keeping a copy of the same data on several nodes, so losing one node loses nothing |
+| **consensus** | getting nodes to agree on one value (here: one sequence of commands) even when some crash or messages get lost |
+| **Raft** | a consensus algorithm designed to be easy to understand (Ongaro & Ousterhout, 2014). It works by electing one leader that makes all the decisions |
+| **crash-recovery fault** | a node stops (power loss, kill -9) and may later restart with whatever was on its disk. Raft tolerates these |
+| **Byzantine fault** | a node that lies or acts maliciously. Raft does **not** handle these, and neither do we |
+| **asynchronous network** | messages can be delayed by any amount, lost, duplicated or arrive out of order. There is no upper bound on delay, so "no answer yet" never proves a node is dead |
+| **network partition** | the network splits into groups that can't reach each other. A **one-way** (asymmetric) partition lets A reach B but not B reach A |
+| **role** | what a node is doing right now: **follower** (listens), **candidate** (asking for votes) or **leader** (in charge) |
+| **leader** | the one node that accepts client commands and tells the others what to store. At most one per term |
+| **term** | an election number: 1, 2, 3… Each election starts a new term. Terms only go up, and act as a **logical clock**: a message with an older term is out of date |
+| **election** | a follower that hears nothing from a leader becomes a candidate, raises the term by 1, votes for itself and asks the others for votes |
+| **RequestVote** | the message a candidate sends to ask for a vote (Figure 2) |
+| **vote / votedFor** | each node votes for at most **one** candidate per term and remembers whom (`votedFor`) |
+| **quorum / majority** | more than half the nodes: 2 of 3, 3 of 5. A candidate needs a majority of votes to win |
+| **heartbeat** | an empty AppendEntries the leader sends regularly to say "I'm still here", which stops followers from starting elections |
+| **election timeout** | how long a follower waits without hearing from a leader before starting an election. **Random** (in [T, 2T)) so nodes rarely time out together |
+| **split vote** | several candidates split the votes and nobody gets a majority. Random timeouts make the next try likely to succeed |
+| **step down** | a node that sees a higher term in any message updates its term and becomes a follower |
+| **Election Safety** | invariant 1: at most one leader per term, ever |
+| **hard state** | `currentTerm` and `votedFor`: what must survive a crash, or a restarted node could vote twice in one term |
+| **fsync** | the call that forces written data from memory onto the physical disk. Only then is it safe to reply |
+| **tick** | one unit of logical time (10 ms in the simulator). Timeouts are counted in ticks, not read from a clock |
+| **safety vs liveness** | safety: nothing bad ever happens (two leaders). Liveness: something good eventually happens (a leader gets elected). In Raft, **safety never depends on timing**; only liveness does |
+| **deterministic simulation** | running all nodes in one program with a fake clock and fake network, driven by a seeded random generator |
+| **seed** | the number that starts the random generator. Same seed, same run, so any failure can be replayed exactly |
+| **invariant** | a property that must hold in every state the system can ever reach |
+| **mutation test** | breaking one rule on purpose to prove the checkers notice |
+
+### Why a majority makes two leaders in one term impossible: an example
+
+```
+5 nodes: A B C D E. Term 7. Each node votes at most once in term 7.
+
+  candidate A gets votes from:  A B C        (3 of 5: wins)
+  candidate E would need 3:     E D + ???    (A, B, C already voted for A)
+
+Any two majorities of 5 overlap in at least one node. That node voted only once,
+so it can't have helped both A and E win term 7.
+```
+
+That's why `votedFor` must be on disk (fsynced) before the vote is sent. A node that forgot its vote
+after a crash could vote again, and the overlap argument would break.
 
 ---
 
@@ -751,6 +805,7 @@ seeds each on 3-node and 5-node clusters, with clients proposing commands the wh
 deliberately broken rule was caught.
 
 ## Contents
+0. [Words you need first](#m2-0-words)
 1. [What M2 adds, in one picture](#m2-1-what-m2-adds-in-one-picture)
 2. [The decisions you approved (M2-A to M2-E)](#m2-2-the-decisions-you-approved)
 3. [The four new invariants and why Raft guarantees them](#m2-3-the-four-new-invariants)
@@ -766,6 +821,58 @@ deliberately broken rule was caught.
 13. [Shortcuts and what is left for later](#m2-13-shortcuts-and-what-is-left)
 14. [Study questions (with answers)](#m2-14-study-questions)
 15. [Glossary additions](#m2-15-glossary-additions)
+
+---
+
+<a id="m2-0-words"></a>
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **command** | one client request that changes data, e.g. `PUT x=5` |
+| **state machine** | the thing the commands act on: here a key-value map. Given the same commands in the same order, every copy ends in the same state, so it must be **deterministic** (no clocks, no randomness) |
+| **state machine replication** | the core idea of Raft: agree on one ordered list of commands (the log), and let every node apply that list to its own copy |
+| **log** | a numbered list of entries, the same order on every node once agreed |
+| **log entry** | one slot in the log: its **index** (position 1, 2, 3…), its **term** (the term of the leader that created it) and its **payload** (a command, or a no-op) |
+| **append** | add entries to the end of a log |
+| **AppendEntries** | the message the leader uses to send entries to a follower (also used empty, as a heartbeat) |
+| **proposal** | a client command handed to the leader, which appends it to its log |
+| **replicate** | copy an entry from the leader's log to the followers' logs |
+| **committed** | an entry stored on a majority, in a way no future leader can undo. Only then may it be applied |
+| **apply** | run a committed command on the state machine and produce its result |
+| **commitIndex** | the highest index a node knows is committed |
+| **lastApplied** | the highest index a node has applied to its state machine (always ≤ commitIndex) |
+| **nextIndex** | per follower, on the leader: the index of the next entry to send |
+| **matchIndex** | per follower, on the leader: the highest index known to be identical on that follower |
+| **consistency check** | AppendEntries carries `prevLogIndex` and `prevLogTerm`, the entry just before the new ones. The follower accepts only if it has that same entry; otherwise it rejects and the leader backs up |
+| **conflict** | the follower has an entry at the same index but with a different term. That entry was never committed, so the follower deletes it and everything after it (**truncate**) |
+| **Log Matching** | invariant 3: if two logs have an entry with the same index and term, the logs are identical up to that index |
+| **Leader Append-Only** | invariant 2: a leader never deletes or overwrites its own entries, it only appends |
+| **Leader Completeness** | invariant 4: every committed entry is in the log of every later leader |
+| **State Machine Safety** | invariant 5: no two nodes ever apply different commands at the same index |
+| **up-to-date check** | a node votes only for a candidate whose log is at least as up to date as its own (higher last term, or same last term and at least as long). It is what makes Leader Completeness true |
+| **no-op entry** | an empty entry a new leader appends in its own term, so it can commit the older entries it inherited |
+| **Figure 8** | the paper's example of why a leader must not commit an entry from an older term just by counting copies |
+| **fast backup** | on a conflict, the follower tells the leader which term conflicts and where it starts, so the leader can skip a whole term at once instead of one entry per round trip |
+| **codec / serialization** | turning commands into bytes and back. Ours is hand-written and **canonical**: one value has exactly one byte form |
+| **CAS (compare-and-set)** | "set x to 7 only if it is currently 5". Returns whether it swapped and the old value |
+
+### One command, start to finish: an example
+
+```
+Client: PUT x=5 → leader L (term 3)
+
+            index:  1    2    3
+leader L    log:   [1]  [3]  [3 PUT x=5]   ← appended at index 3
+follower F1 log:   [1]  [3]  [3 PUT x=5]   ← AppendEntries(prevLogIndex=2, prevLogTerm=3): match → accepted
+follower F2 log:   [1]  [3]                ← message lost; will get it on the next heartbeat
+
+L's matchIndex: F1=3, F2=2. Index 3 is on L and F1 = 2 of 3 = majority, and its term is
+L's own term (3), so commitIndex = 3. L applies it: x=5, and answers the client.
+F1 and F2 learn commitIndex=3 on the next AppendEntries and apply it too.
+```
+
+(Numbers in brackets are entry terms.)
 
 ---
 
@@ -1616,6 +1723,7 @@ up to date with chunked InstallSnapshot. Invariants 1–6 held over 5,000 seeds 
 clusters, under the M2 chaos and under crash loops.
 
 ## Contents
+0. [Words you need first](#m3-0-words)
 1. [What M3 adds, in one picture](#m3-1-what-m3-adds)
 2. [The decisions you approved (M3-A to M3-F)](#m3-2-decisions)
 3. [Invariant 6: Durability, and what a crash really loses](#m3-3-durability)
@@ -1633,6 +1741,50 @@ clusters, under the M2 chaos and under crash loops.
 15. [Shortcuts and what is left for later](#m3-15-shortcuts)
 16. [Study questions (with answers)](#m3-16-study-questions)
 17. [Glossary additions](#m3-17-glossary)
+
+---
+
+<a id="m3-0-words"></a>
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **durability** | once the cluster says "committed", the data survives crashes. Invariant 6 |
+| **volatile vs persistent** | volatile state is in memory and lost on a crash (commitIndex, roles); persistent state is on disk and survives (term, vote, log, snapshot) |
+| **page cache** | the operating system's in-memory copy of file data. `write()` only puts bytes here; a crash before fsync can lose them |
+| **fsync** | wait until a file's bytes are on the physical disk. Slow (milliseconds), but the only real guarantee |
+| **directory fsync** | creating or renaming a file changes the *directory*. That change is durable only after the directory itself is fsynced |
+| **torn write** | a crash in the middle of a write: only part of the bytes reach the disk, sometimes followed by junk |
+| **write-ahead log (WAL)** | an append-only file of changes. Every change is written and fsynced here *before* the node acts on it (replies, votes, acks) |
+| **record** | one entry in the WAL: a type (hard state, log entries, truncate, snapshot marker…), a length, the data and a checksum |
+| **checksum / CRC32C** | a short number computed from the bytes. On read, recompute it; a mismatch means the bytes are damaged or incomplete |
+| **segment** | one WAL file. The WAL is a series of segments; a new one starts when the current one is full |
+| **torn tail** | an incomplete or damaged record at the very end of the last segment: what a crash during a write leaves. It was never acknowledged, so recovery just cuts it off |
+| **corruption** | damaged bytes anywhere else (an older, fully synced segment). That should never happen, so the node **stops** (fail-stop) rather than guess |
+| **recovery** | on restart, read the snapshot and replay the WAL to rebuild exactly the state that was fsynced |
+| **lying disk** | a disk (or setting) whose fsync returns success without really writing. Used as a mutation to prove the checkers notice |
+| **snapshot** | a copy of the whole state machine as of some index, plus that index and its term (`lastIncludedIndex`, `lastIncludedTerm`) |
+| **log compaction** | once a snapshot is safely on disk, the log entries it covers can be deleted, so the log stops growing forever |
+| **log base** | the index the snapshot covers. The log in memory holds only entries after it |
+| **atomic replace** | write a new file under a temporary name, fsync it, rename it over the old one, fsync the directory. A crash leaves either the old file or the new one, never half of each |
+| **checkpoint** | a new WAL segment that restates the whole current state, so the older segments can be deleted |
+| **InstallSnapshot** | the message (Figure 13) a leader uses to send its snapshot to a follower that is so far behind it needs entries the leader already deleted |
+| **chunk / offset** | the snapshot is sent in pieces; the offset says where each piece belongs, so a lost piece is simply re-sent |
+| **crash loop** | a fault mix where nodes crash very often, most of the time during an fsync |
+| **shadow model** | the checker's own independent record of what each node made durable, used to verify recovery |
+
+### What survives a crash: an example
+
+```
+node writes the WAL record "vote for B in term 9"
+
+  write() done, fsync NOT done, crash   → record may be gone, or torn  → the vote was never sent: fine
+  write() done, fsync done, crash       → record survives               → after restart: still voted for B
+  fsync done, vote sent, crash          → record survives               → it can't vote for C in term 9
+
+The rule that makes this safe: persist + fsync FIRST, then send (decision E1).
+A reply is a promise, and a promise may only be made about data already on disk.
+```
 
 ---
 
