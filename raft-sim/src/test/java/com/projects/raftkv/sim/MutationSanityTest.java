@@ -79,11 +79,33 @@ class MutationSanityTest {
     // ---------------------------------------------------------------- M2 protocol mutations
 
     /** §5.4.1: voting for candidates with stale logs lets a leader without committed entries win. */
+    /**
+     * §5.4.1 without the up-to-date check. Measured on the plain protocol (PreVote off): with PreVote on,
+     * the pre-vote's own log check stops a stale candidate before it ever sends RequestVote, so the
+     * mutation is masked (see the next test).
+     */
     @Test
     void skippingTheUpToDateCheckIsCaught() {
-        Tally t = run("skip up-to-date check", SimConfig.chaos(3).withMutation(ProtocolMutation.SKIP_UP_TO_DATE_CHECK), 100);
+        Tally t = run("skip up-to-date check", SimConfig.chaos(3).withHardening(false, false)
+                .withMutation(ProtocolMutation.SKIP_UP_TO_DATE_CHECK), 100);
         assertThat(t.count("Leader Completeness")).isPositive();
         assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(75);
+    }
+
+    /**
+     * M5: PreVote checks the log too, so it hides a missing check in RequestVote. Skip both checks and
+     * the bug is back: the pre-vote is a second gate, not a replacement for §5.4.1.
+     */
+    @Test
+    void preVoteMasksTheMissingUpToDateCheckUntilItSkipsItToo() {
+        Tally masked = run("skip up-to-date check (preVote on)",
+                SimConfig.chaos(3).withMutation(ProtocolMutation.SKIP_UP_TO_DATE_CHECK), 100);
+        assertThat(masked.safetyCatches()).isZero();
+        Tally both = run("skip up-to-date check in RequestVote and PreVote",
+                SimConfig.chaos(3).withMutation(ProtocolMutation.SKIP_UP_TO_DATE_CHECK)
+                        .withMutation(ProtocolMutation.PREVOTE_SKIPS_LOG_CHECK), 100);
+        assertThat(both.count("Leader Completeness")).isPositive();
+        assertThat(both.safetyCatches()).isGreaterThanOrEqualTo(40);   // measured 56/100
     }
 
     /**
@@ -95,7 +117,8 @@ class MutationSanityTest {
      */
     @Test
     void committingAnOldTermEntryByCountingIsCaught() {
-        SimConfig cfg = SimConfig.chaos(3).withMutation(ProtocolMutation.COMMIT_OLD_TERM_BY_COUNT).withMaxEntriesPerAppend(1);
+        SimConfig cfg = SimConfig.chaos(3).withHardening(false, false)
+                .withMutation(ProtocolMutation.COMMIT_OLD_TERM_BY_COUNT).withMaxEntriesPerAppend(1);
         Tally t = run("commit old term by count (batch 1)", cfg, 1000);
         assertThat(t.count("Leader Completeness") + t.count("State Machine Safety")).isPositive();
     }
@@ -160,12 +183,27 @@ class MutationSanityTest {
                 .withWorkload(new WorkloadConfig(5, 5, 30, keys, 150, 10, readPercent));
     }
 
-    /** Thesis §6.4 step 3: a deposed leader that never confirms its leadership serves stale reads. */
+    /**
+     * Thesis §6.4 step 3: a deposed leader that never confirms its leadership serves stale reads.
+     * Measured with CheckQuorum off, as in M4: CheckQuorum makes a cut-off leader step down within about
+     * two election timeouts, which shrinks the window (next test) but does not close it.
+     */
     @Test
     void readingWithoutAQuorumCheckIsCaughtByLinearizability() {
         Tally t = run("read without quorum check (leader faults, 80% reads)",
-                leaderHunting(80, 2).withMutation(ProtocolMutation.READ_WITHOUT_QUORUM_CHECK), 100);
+                leaderHunting(80, 2).withHardening(true, false).withMutation(ProtocolMutation.READ_WITHOUT_QUORUM_CHECK), 100);
         assertThat(t.count("Linearizability")).isGreaterThanOrEqualTo(60);   // measured 75/100
+    }
+
+    /**
+     * M5: CheckQuorum is not a substitute for the ReadIndex round. A leader that was paused wakes up still
+     * believing it leads and answers before its next quorum check, so stale reads still get through.
+     */
+    @Test
+    void checkQuorumNarrowsButDoesNotCloseTheStaleReadWindow() {
+        Tally t = run("read without quorum check (leader faults, 80% reads, checkQuorum on)",
+                leaderHunting(80, 2).withMutation(ProtocolMutation.READ_WITHOUT_QUORUM_CHECK), 100);
+        assertThat(t.count("Linearizability")).isPositive();
     }
 
     /**
@@ -181,6 +219,17 @@ class MutationSanityTest {
     }
 
     /** Control: the same runs without a mutation are clean, so the catches above are caused by the mutations. */
+    /**
+     * Teaching control (M5): PreVote without the up-to-date check grants pre-votes it should refuse, yet
+     * nothing unsafe can follow, because the real RequestVote still checks the log (§5.4.1). PreVote is a
+     * liveness feature only, so this "mutation" must cause no safety violation.
+     */
+    @Test
+    void preVoteWithoutTheLogCheckIsStillSafe() {
+        Tally t = run("prevote skips log check (control)", SimConfig.chaos(3).withMutation(ProtocolMutation.PREVOTE_SKIPS_LOG_CHECK), 300);
+        assertThat(t.safetyCatches()).isZero();
+    }
+
     @Test
     void unmutatedControlRunsAreClean() {
         Tally t = run("control (batch 1)", SimConfig.chaos(3).withMaxEntriesPerAppend(1), 100);

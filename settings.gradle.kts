@@ -9,8 +9,10 @@ include(
     "raft-core",
     "raft-storage",
     "raft-statemachine",
+    "raft-proto",
     "raft-transport",
     "raft-node",
     "raft-client",
     "raft-sim",
+    "raft-server",
 )

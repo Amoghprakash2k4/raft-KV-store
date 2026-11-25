@@ -18,4 +18,15 @@ class RegressionSeedsTest {
     void seed4811StaleTermReadRoundEcho() {
         Simulation.run(4811, SimConfig.chaos(5));
     }
+
+    /**
+     * M5 gate, chaos 5 nodes: not a protocol bug. One client lost five round trips in a row to the stable
+     * leader on its 5%-lossy link and completed nothing in the last 1,089 ms, failing a 1 s client-liveness
+     * window that measurements showed was too tight (DEVIATIONS.md H6).
+     */
+    @Test
+    void seed3064UnluckyClientLink() {
+        SimResult r = Simulation.run(3064, SimConfig.chaos(5));
+        org.assertj.core.api.Assertions.assertThat(r.slowestClientIdleMs()).isBetween(1_000L, 2_000L);
+    }
 }

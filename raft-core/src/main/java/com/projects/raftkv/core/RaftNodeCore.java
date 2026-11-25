@@ -45,6 +45,8 @@ public final class RaftNodeCore implements RaftCore {
     private int electionElapsed;
     private int randomizedElectionTimeout;
     private int heartbeatElapsed;
+    /** CheckQuorum (thesis §6.2): ticks since the leader last checked that a majority is answering. */
+    private int quorumElapsed;
 
     // Output being collected for the current step.
     private HardState lastEmittedHardState;
@@ -116,6 +118,14 @@ public final class RaftNodeCore implements RaftCore {
         return log;
     }
 
+    @Override
+    public java.util.Map<NodeId, Long> matchIndexes() {
+        if (!(role instanceof RoleState.Leader l)) return java.util.Map.of();
+        java.util.Map<NodeId, Long> out = new java.util.LinkedHashMap<>();
+        for (NodeId p : config.peers()) out.put(p, l.progress(p).matchIndex());
+        return java.util.Collections.unmodifiableMap(out);
+    }
+
     /** Visible for tests: the current randomized election timeout in ticks. */
     int randomizedElectionTimeout() {
         return randomizedElectionTimeout;
@@ -141,16 +151,22 @@ public final class RaftNodeCore implements RaftCore {
     private void onTick() {
         switch (role) {
             case RoleState.Follower f -> tickElection();
+            case RoleState.PreCandidate p -> tickElection();
             case RoleState.Candidate c -> tickElection();
             case RoleState.Leader l -> tickHeartbeat(l);
         }
     }
 
-    /** Figure 2 Followers/Candidates: election timeout elapses without valid leader contact → new election. */
+    /**
+     * Figure 2 Followers/Candidates: election timeout elapses without valid leader contact → new election.
+     * With PreVote (thesis §9.6) the timeout starts a pre-vote round instead; a pre-candidate whose round
+     * went unanswered starts another one, still in the same term.
+     */
     private void tickElection() {
         electionElapsed++;
         if (electionElapsed >= randomizedElectionTimeout) {
-            startElection();
+            if (config.preVote()) startPreVote();
+            else startElection();
         }
     }
 
@@ -159,6 +175,10 @@ public final class RaftNodeCore implements RaftCore {
      * Per M2-A the same message also carries any entries a follower is missing.
      */
     private void tickHeartbeat(RoleState.Leader l) {
+        if (config.checkQuorum() && checkQuorumFails(l)) {
+            stepDownLostQuorum(l);
+            return;
+        }
         heartbeatElapsed++;
         if (heartbeatElapsed >= config.heartbeatIntervalTicks()) {
             heartbeatElapsed = 0;
@@ -171,6 +191,45 @@ public final class RaftNodeCore implements RaftCore {
      * Called only when granting a vote, on valid AppendEntries from the current leader, when starting
      * an election, and when a leader steps down (its timer was not running).
      */
+    /**
+     * CheckQuorum (thesis §6.2): every election timeout, the leader must have heard from a majority
+     * (itself included) during the period that just ended; then the record starts over. "Heard from" =
+     * an AppendEntries or InstallSnapshot reply in this term, which proves the peer received this leader's
+     * message and answered: the link works both ways.
+     */
+    private boolean checkQuorumFails(RoleState.Leader l) {
+        if (++quorumElapsed < config.electionTimeoutTicks()) return false;
+        quorumElapsed = 0;
+        boolean fails = l.recentlyActive.size() + 1 < config.quorum();
+        l.recentlyActive.clear();
+        return fails;
+    }
+
+    /**
+     * Thesis §6.2: a leader cut off from the majority steps down by itself, in the same term (its vote
+     * stays), instead of accepting client requests it can never commit. Pending reads are rejected so their
+     * clients retry elsewhere; accepted proposals are resolved by the driver at apply time, as always.
+     */
+    private void stepDownLostQuorum(RoleState.Leader l) {
+        rejectPendingReads(l);
+        role = new RoleState.Follower(Optional.empty());
+        resetElectionTimer();
+    }
+
+    /**
+     * Leader stickiness (thesis §4.2.3, §9.6): this node heard from a live leader less than the minimum
+     * election timeout ago, so it will not help anyone replace that leader. A leader counts as having
+     * heard from itself; with CheckQuorum it steps down within an election timeout if it lost its majority.
+     */
+    private boolean heardFromLeaderRecently() {
+        return switch (role) {
+            case RoleState.Leader l -> true;
+            case RoleState.Follower f -> f.leader().isPresent() && electionElapsed < config.electionTimeoutTicks();
+            case RoleState.PreCandidate p -> false;
+            case RoleState.Candidate c -> false;
+        };
+    }
+
     private void resetElectionTimer() {
         electionElapsed = 0;
         int t = config.electionTimeoutTicks();
@@ -194,6 +253,28 @@ public final class RaftNodeCore implements RaftCore {
         maybeBecomeLeader();
     }
 
+    /**
+     * PreVote (thesis §9.6): ask every peer whether it would vote for us in currentTerm + 1, without
+     * changing currentTerm or votedFor. Nothing is persisted, so a node cut off from the cluster can time
+     * out forever without inflating its term.
+     */
+    private void startPreVote() {
+        if (mutations.contains(ProtocolMutation.PREVOTE_BUMPS_TERM)) { currentTerm++; votedFor = Optional.empty(); }   // MUTATION (test only)
+        role = new RoleState.PreCandidate(Set.of(self));
+        resetElectionTimer();
+        for (NodeId peer : config.peers()) {
+            send(new Message.PreVote(self, peer, currentTerm + 1, log.lastIndex(), log.lastTerm()));
+        }
+        maybeStartElectionAfterPreVote();
+    }
+
+    /** A majority said it would vote for us: now raise the term and hold the real election (Figure 2). */
+    private void maybeStartElectionAfterPreVote() {
+        if (role instanceof RoleState.PreCandidate p && p.grants().size() >= config.quorum()) {
+            startElection();
+        }
+    }
+
     private void maybeBecomeLeader() {
         if (role instanceof RoleState.Candidate c && c.votes().size() >= config.quorum()) {
             becomeLeader();
@@ -210,6 +291,7 @@ public final class RaftNodeCore implements RaftCore {
         RoleState.Leader l = new RoleState.Leader(config.peers(), log.lastIndex() + 1);
         role = l;
         heartbeatElapsed = 0;
+        quorumElapsed = 0;
         appendAsLeader(new EntryPayload.Noop());
         broadcastAppend(l);
     }
@@ -342,17 +424,60 @@ public final class RaftNodeCore implements RaftCore {
         if (m.from().equals(self) || !config.members().contains(m.from()))
             throw new IllegalArgumentException(self + " received message from invalid sender: " + m);
 
-        if (m.term() > currentTerm) {
+        if (m instanceof Message.RequestVote && m.term() > currentTerm && config.checkQuorum()
+                && heardFromLeaderRecently()) {
+            return;   // leader stickiness (§4.2.3): neither vote nor adopt the term while a leader is alive
+        }
+        if (m.term() > currentTerm && adoptsTerm(m)) {
             stepDownToHigherTerm(m.term());
+        }
+        if (role instanceof RoleState.Leader l && m.term() == currentTerm
+                && (m instanceof Message.AppendEntriesResponse || m instanceof Message.InstallSnapshotResponse)) {
+            l.recentlyActive.add(m.from());   // CheckQuorum evidence
         }
         switch (m) {
             case Message.RequestVote rv -> onRequestVote(rv);
             case Message.RequestVoteResponse r -> onRequestVoteResponse(r);
+            case Message.PreVote pv -> onPreVote(pv);
+            case Message.PreVoteResponse r -> onPreVoteResponse(r);
             case Message.AppendEntries ae -> onAppendEntries(ae);
             case Message.AppendEntriesResponse r -> onAppendEntriesResponse(r);
             case Message.InstallSnapshot is -> onInstallSnapshot(is);
             case Message.InstallSnapshotResponse r -> onInstallSnapshotResponse(r);
         }
+    }
+
+    /**
+     * §5.1 "if a message has a higher term, adopt it" applies to every message except pre-votes (thesis
+     * §9.6): a PreVote's term is only proposed, and a yes answer carries that proposed term back. A
+     * rejection carries the receiver's real term, so a pre-candidate that is behind does catch up.
+     */
+    private static boolean adoptsTerm(Message m) {
+        return switch (m) {
+            case Message.PreVote pv -> false;
+            case Message.PreVoteResponse r -> !r.granted();
+            default -> true;
+        };
+    }
+
+    /**
+     * PreVote receiver (thesis §9.6): say yes only if the proposed term is newer than ours, we have not
+     * heard from a live leader recently, and the candidate's log is at least as up to date as ours
+     * (§5.4.1). Nothing changes here: no term, no vote, no timer reset.
+     */
+    private void onPreVote(Message.PreVote pv) {
+        boolean grant = pv.term() > currentTerm
+                && !heardFromLeaderRecently()
+                && (log.isAtLeastAsUpToDateAsMine(pv.lastLogIndex(), pv.lastLogTerm())
+                    || mutations.contains(ProtocolMutation.PREVOTE_SKIPS_LOG_CHECK));   // MUTATION (test only)
+        send(new Message.PreVoteResponse(self, pv.from(), grant ? pv.term() : currentTerm, grant));
+    }
+
+    /** Count a yes for the current round only (term = currentTerm + 1); duplicates are idempotent (a set). */
+    private void onPreVoteResponse(Message.PreVoteResponse r) {
+        if (!(role instanceof RoleState.PreCandidate p) || !r.granted() || r.term() != currentTerm + 1) return;
+        role = p.withGrant(r.from());
+        maybeStartElectionAfterPreVote();
     }
 
     /**
@@ -454,6 +579,7 @@ public final class RaftNodeCore implements RaftCore {
                     "Election Safety violated: " + self + " is leader of term " + currentTerm
                             + " but received " + what + " from " + leader + " for the same term");
             case RoleState.Candidate c -> role = new RoleState.Follower(Optional.of(leader));
+            case RoleState.PreCandidate p -> role = new RoleState.Follower(Optional.of(leader));
             case RoleState.Follower f -> {
                 if (f.leader().isPresent() && !f.leader().get().equals(leader)) {
                     throw new IllegalStateException("Election Safety violated: " + self + " saw leaders "
@@ -744,6 +870,7 @@ public final class RaftNodeCore implements RaftCore {
             case RoleState.Leader l -> Optional.of(self);
             case RoleState.Follower f -> f.leader();
             case RoleState.Candidate c -> Optional.empty();
+            case RoleState.PreCandidate p -> Optional.empty();
         };
         return new SoftState(role.role(), currentTerm, leader);
     }

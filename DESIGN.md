@@ -267,3 +267,105 @@ unique and a stale or duplicated effect cannot hide behind an equal value.
 control runs. A bad ReadIndex is stale only in the short window around a leadership change. So the
 read mutations run under `FaultConfig.leaderHunting()`, where 70% of faults isolate, pause or crash the
 current leader. This plays the same role as batch size 1 for the Figure 8 mutation.
+
+## M5. Hardening decisions (approved 2026-11-25)
+
+```mermaid
+flowchart TB
+    subgraph proc["one raft-server process"]
+        direction TB
+        HTTP["ClientApi<br/>JDK HttpServer, virtual threads<br/>JSON /kv, binary /v1, /status, /metrics"]
+        GRPCIN["GrpcPeerServer<br/>gRPC threads"]
+        TICK["ticker thread<br/>every 10 ms, coalesced"]
+        MB[["mailbox<br/>one bounded queue"]]
+        LOOP["event-loop thread<br/>NodeDriver → RaftNodeCore<br/>FileWalStorage on RealDisk<br/>KvStateMachine"]
+        OUT["GrpcTransport<br/>one queue + sender thread per peer"]
+        VIEW["View (immutable)<br/>published after every event"]
+        HTTP -- "write / read → CompletableFuture" --> MB
+        GRPCIN -- "Message" --> MB
+        TICK -- "Tick" --> MB
+        MB --> LOOP
+        LOOP -- "send (never blocks)" --> OUT
+        LOOP -- "complete futures" --> HTTP
+        LOOP --> VIEW
+        VIEW -. "read by /status and /metrics" .-> HTTP
+    end
+    OUT -- "client-streaming RPC" --> PEERS["other nodes"]
+    PEERS -- "client-streaming RPC" --> GRPCIN
+```
+
+### M5-A. PreVote, CheckQuorum and leader stickiness, behind flags (thesis §9.6, §6.2, §4.2.3)
+- **PreVote.** When its election timer fires, a node first becomes `PRE_CANDIDATE` and asks
+  `PreVote(term = currentTerm + 1, lastLogIndex, lastLogTerm)` **without** incrementing or persisting its
+  term. A receiver says yes only if that term is above its own, it has **not** heard from a leader within
+  an election timeout, and the candidate's log is at least as up to date. Neither side changes its term,
+  its vote or its timer because of a PreVote. With a majority of yeses the node starts a normal election.
+- **CheckQuorum.** A leader records which peers answered (AppendEntries or InstallSnapshot response, in its
+  term). Every election timeout it checks: fewer than a majority including itself → it steps down to
+  follower **in the same term** and rejects pending reads.
+- **Stickiness.** With CheckQuorum on, a RequestVote with a higher term is ignored (no term change, no
+  reply) by a node that heard from a leader within an election timeout. Without this an isolated node
+  that skipped PreVote, or a restarted one, could still depose a healthy leader.
+- **Flags.** `RaftConfig.preVote/checkQuorum` default to **off**, so the M1–M4 unit tests keep testing
+  Figure 2 exactly. The simulator and the server turn both on. `SimConfig.withHardening(false, false)`
+  reproduces the M4 protocol exactly; the mutation tests that PreVote or CheckQuorum would mask use it.
+- **Measured** (`HardeningScenarioTest`, healthy cluster plus one scripted 3 s isolation, 100 seeds each):
+
+| Scenario | PreVote | CheckQuorum | Result |
+|---|---|---|---|
+| isolate a follower | on | on | 0/100 runs disrupted, term growth 0 |
+| isolate a follower | off | on | 100/100 runs: the rejoining node deposed the leader, term +26 |
+| isolate the leader | on | on | old leader steps down after 99–204 ms (p50 ≈ 120 ms), term +1 to +2 |
+| isolate the leader | on | off | old leader keeps the role 3,001–3,015 ms, until the heal |
+| isolate the leader | off | on | steps down after 98–204 ms, but the old leader's elections push the term +24 |
+
+**Rejected:** PreVote without stickiness (a restarted node's real RequestVote still disrupts); CheckQuorum
+by timer only, with no per-peer activity (a leader that hears only one peer would believe it has quorum);
+flags on in the core by default (would silently change what the M1–M4 unit tests verify).
+
+### M5-B. gRPC transport: one client-streaming RPC per peer, bounded queue, drop when full
+`raft.proto` (module `raft-proto`) mirrors `Message` one to one: `RaftMessage{from, to, term, oneof body}`.
+`ProtoMapping` converts both ways and throws on a malformed message, which the server counts and drops.
+`GrpcTransport.send` never blocks the event loop: it puts the message on that peer's
+`ArrayBlockingQueue` (10,000) or **drops it** when full. Raft already tolerates loss: heartbeats and
+retries resend what matters. One sender thread per peer drains its queue into a long-lived
+`Stream(stream RaftMessage) returns (Ack)` call. It waits for gRPC flow control (`isReady`, 200 ms) and
+on any error resets the stream and retries after 100 ms. Order within a stream is kept, but Raft doesn't
+rely on it.
+**Rejected:** unary RPC per message (a round trip per heartbeat, unbounded in-flight calls);
+request/response RPCs matching Raft's shape (replies are already ordinary messages in our core, so a
+one-way stream is simpler); blocking `send` (a slow peer would stall the whole node).
+
+### M5-C. Client API: HTTP on the JDK server; `HttpClusterClient` and `raft-cli` on `ClientSession`
+JSON for people (`PUT/GET/DELETE /kv/{key}`, `POST /kv/{key}/cas`, optional `Client-Id` + `Seq` headers
+for exactly-once) and KvCodec bytes for programs (`POST /v1/write`, `/v1/read`). Status codes:
+421 + `leaderId` = not the leader; 503 `retry` = outcome unknown, resend the same request; 503
+`unavailable`; 504 = no answer in time; 409 = stale seq. `HttpClusterClient` is the simulator-tested
+`ClientSession` driven over `java.net.http`, so the retry and seq rules are the same ones 5,000-seed
+gates exercised. `raft-cli` is one client per invocation with a random id below 2²³ (attempt ids are
+`clientId << 40 | n`).
+**Rejected:** gRPC for clients (curl-ability matters for a demo, and the session logic is transport-free
+anyway); Spring/Netty HTTP (a heavy dependency for five endpoints).
+
+### M5-D. Node runtime: one event-loop thread, one mailbox; metrics from published views
+Decision E1a, made real: gRPC threads, HTTP threads and the ticker only `offer` closures to one bounded
+mailbox (50,000). One thread runs them through `NodeDriver`, so the core, log, WAL and state machine stay
+single-threaded and effects keep the order persist + fsync → send → apply → notify. A full mailbox drops
+peer messages (like loss) and answers clients 503. Ticks coalesce: at most one waits in the mailbox, so
+a slow fsync delays timers instead of piling them up. After each event the loop publishes an immutable
+`View` (status, last log index, matchIndexes). `/status` and the Micrometer gauges read only that.
+Counters (elections, pre-vote rounds, leader changes, CheckQuorum step-downs) are derived from role
+changes between consecutive views. `TimedDisk` wraps `RealDisk` to time every fsync. A
+`NodeHaltedException` (failed fsync) or any unexpected exception halts the node: pending clients get
+503 and the process exits with status 1 (fail-stop, never continue on unknown durable state).
+**Rejected:** locks around the core (every rule would need re-proving under concurrency); metrics read
+straight from the driver (a data race).
+
+### M5-E. Real-process verification: kill -9 test and Docker
+`KillNineIntegrationTest` (`./gradlew :raft-server:integrationTest`, tagged, not part of `build`) starts
+three server JVMs on real files, runs four `HttpClusterClient`s with unique values, and SIGKILLs a node
+(half the time the leader) every 0.8–1.5 s, restarting it 0.3–1.2 s later from its data directory.
+After a quiet period it checks the history with the simulator's `LinearizabilityChecker`, and that every
+node applied up to the leader's commit index. `raft-server/Dockerfile` builds the distribution in a JDK
+stage and runs it on a JRE; `compose.yaml` starts three nodes with named volumes;
+`docker compose kill nodeN` is a SIGKILL.

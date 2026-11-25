@@ -16,6 +16,7 @@ tasks.test {
     providers.gradleProperty("sim.seeds").orNull?.let { systemProperty("sim.seeds", it) }
     providers.gradleProperty("sim.seed").orNull?.let { systemProperty("sim.seed", it) }
     providers.gradleProperty("sim.trace").orNull?.let { systemProperty("sim.trace", it) }
+    providers.gradleProperty("sim.clientWindow").orNull?.let { systemProperty("sim.clientWindow", it) }
     maxHeapSize = "1g"
     testLogging { events("failed", "standard_out") }
 }

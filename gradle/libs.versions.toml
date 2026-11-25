@@ -2,6 +2,13 @@
 junit = "5.11.4"
 jqwik = "1.9.2"
 assertj = "3.27.3"
+# M5 (DESIGN.md M5-B..D)
+grpc = "1.71.0"
+protobuf = "3.25.8"
+micrometer = "1.15.11"
+jackson = "2.21.2"
+slf4j = "2.0.17"
+logback = "1.5.25"
 
 [libraries]
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
@@ -9,3 +16,16 @@ junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
 jqwik = { module = "net.jqwik:jqwik", version.ref = "jqwik" }
 assertj = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+protobuf-java = { module = "com.google.protobuf:protobuf-java", version.ref = "protobuf" }
+grpc-protobuf = { module = "io.grpc:grpc-protobuf", version.ref = "grpc" }
+grpc-stub = { module = "io.grpc:grpc-stub", version.ref = "grpc" }
+grpc-api = { module = "io.grpc:grpc-api", version.ref = "grpc" }
+grpc-netty-shaded = { module = "io.grpc:grpc-netty-shaded", version.ref = "grpc" }
+grpc-inprocess = { module = "io.grpc:grpc-inprocess", version.ref = "grpc" }
+micrometer-prometheus = { module = "io.micrometer:micrometer-registry-prometheus", version.ref = "micrometer" }
+jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+
+[plugins]
+protobuf = { id = "com.google.protobuf", version = "0.9.6" }

@@ -245,6 +245,9 @@ public final class NodeDriver {
 
     public RaftStatus status() { return core.status(); }
 
+    /** Leader only: each peer's matchIndex (metrics). */
+    public java.util.Map<com.projects.raftkv.core.NodeId, Long> matchIndexes() { return core.matchIndexes(); }
+
     public LogView log() { return core.log(); }
 
     /** Reads started here and not yet answered (for tests and metrics). */

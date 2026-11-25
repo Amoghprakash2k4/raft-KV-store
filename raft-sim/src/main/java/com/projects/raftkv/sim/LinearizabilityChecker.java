@@ -33,14 +33,14 @@ import java.util.stream.Collectors;
  * output: it can be linearized anywhere after its invocation, including "after everything", which is
  * the same as never.
  */
-final class LinearizabilityChecker {
+public final class LinearizabilityChecker {
 
     /** {@code key} and {@code describe} explain the first failing key; {@code steps} is the search size. */
-    record Result(boolean linearizable, boolean budgetExceeded, String key, long steps, int operations, String describe) {}
+    public record Result(boolean linearizable, boolean budgetExceeded, String key, long steps, int operations, String describe) {}
 
     private LinearizabilityChecker() {}
 
-    static Result check(List<HistoryRecorder.Operation> history, long stepBudget) {
+    public static Result check(List<HistoryRecorder.Operation> history, long stepBudget) {
         Map<String, List<HistoryRecorder.Operation>> byKey = history.stream().collect(
                 Collectors.groupingBy(HistoryRecorder.Operation::key, LinkedHashMap::new, Collectors.toList()));
         long steps = 0;

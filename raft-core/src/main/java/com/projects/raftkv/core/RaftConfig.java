@@ -7,13 +7,18 @@ import java.util.Objects;
 /**
  * Static cluster configuration, in ticks.
  * Election timeout is drawn uniformly from [electionTimeoutTicks, 2*electionTimeoutTicks) (§5.2).
+ * {@code preVote} (thesis §9.6) and {@code checkQuorum} (thesis §6.2, with leader stickiness §4.2.3) are
+ * liveness features (DESIGN.md M5-A). They are off in the plain constructors, so the base algorithm's unit
+ * tests keep testing Figure 2 exactly; the simulator and the real server turn them on.
  */
 public record RaftConfig(NodeId self,
                          List<NodeId> members,
                          int electionTimeoutTicks,
                          int heartbeatIntervalTicks,
                          int maxEntriesPerAppend,
-                         int snapshotChunkBytes) {
+                         int snapshotChunkBytes,
+                         boolean preVote,
+                         boolean checkQuorum) {
     /** Figure 13 chunk size in production (DESIGN.md M3-D). */
     public static final int DEFAULT_SNAPSHOT_CHUNK_BYTES = 64 * 1024;
 
@@ -21,6 +26,22 @@ public record RaftConfig(NodeId self,
                       int maxEntriesPerAppend) {
         this(self, members, electionTimeoutTicks, heartbeatIntervalTicks, maxEntriesPerAppend,
                 DEFAULT_SNAPSHOT_CHUNK_BYTES);
+    }
+
+    public RaftConfig(NodeId self, List<NodeId> members, int electionTimeoutTicks, int heartbeatIntervalTicks,
+                      int maxEntriesPerAppend, int snapshotChunkBytes) {
+        this(self, members, electionTimeoutTicks, heartbeatIntervalTicks, maxEntriesPerAppend, snapshotChunkBytes,
+                false, false);
+    }
+
+    public RaftConfig withPreVote(boolean on) {
+        return new RaftConfig(self, members, electionTimeoutTicks, heartbeatIntervalTicks, maxEntriesPerAppend,
+                snapshotChunkBytes, on, checkQuorum);
+    }
+
+    public RaftConfig withCheckQuorum(boolean on) {
+        return new RaftConfig(self, members, electionTimeoutTicks, heartbeatIntervalTicks, maxEntriesPerAppend,
+                snapshotChunkBytes, preVote, on);
     }
 
     public RaftConfig {

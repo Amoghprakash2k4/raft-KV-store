@@ -19,6 +19,7 @@ up everywhere.
 clusters.
 
 ## Contents
+0. [Words you need first](#m1-0-words)
 1. [The big picture](#1-the-big-picture)
 2. [Project setup decisions](#2-project-setup-decisions)
 3. [The two core design decisions (D1, E1)](#3-the-two-core-design-decisions-d1-e1)
@@ -32,6 +33,59 @@ clusters.
 11. [Shortcuts taken and what M2 must fix](#11-shortcuts-taken-and-what-m2-must-fix)
 12. [Study questions (with answers)](#12-study-questions-with-answers)
 13. [Glossary](#13-glossary)
+
+---
+
+<a id="m1-0-words"></a>
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **distributed system** | several computers working together over a network, which can fail independently of each other |
+| **node (server)** | one of those computers, running one copy of our program |
+| **cluster** | the fixed group of nodes (3 or 5 here) that together act as one key-value store |
+| **replication** | keeping a copy of the same data on several nodes, so losing one node loses nothing |
+| **consensus** | getting nodes to agree on one value (here: one sequence of commands) even when some crash or messages get lost |
+| **Raft** | a consensus algorithm designed to be easy to understand (Ongaro & Ousterhout, 2014). It works by electing one leader that makes all the decisions |
+| **crash-recovery fault** | a node stops (power loss, kill -9) and may later restart with whatever was on its disk. Raft tolerates these |
+| **Byzantine fault** | a node that lies or acts maliciously. Raft does **not** handle these, and neither do we |
+| **asynchronous network** | messages can be delayed by any amount, lost, duplicated or arrive out of order. There is no upper bound on delay, so "no answer yet" never proves a node is dead |
+| **network partition** | the network splits into groups that can't reach each other. A **one-way** (asymmetric) partition lets A reach B but not B reach A |
+| **role** | what a node is doing right now: **follower** (listens), **candidate** (asking for votes) or **leader** (in charge) |
+| **leader** | the one node that accepts client commands and tells the others what to store. At most one per term |
+| **term** | an election number: 1, 2, 3… Each election starts a new term. Terms only go up, and act as a **logical clock**: a message with an older term is out of date |
+| **election** | a follower that hears nothing from a leader becomes a candidate, raises the term by 1, votes for itself and asks the others for votes |
+| **RequestVote** | the message a candidate sends to ask for a vote (Figure 2) |
+| **vote / votedFor** | each node votes for at most **one** candidate per term and remembers whom (`votedFor`) |
+| **quorum / majority** | more than half the nodes: 2 of 3, 3 of 5. A candidate needs a majority of votes to win |
+| **heartbeat** | an empty AppendEntries the leader sends regularly to say "I'm still here", which stops followers from starting elections |
+| **election timeout** | how long a follower waits without hearing from a leader before starting an election. **Random** (in [T, 2T)) so nodes rarely time out together |
+| **split vote** | several candidates split the votes and nobody gets a majority. Random timeouts make the next try likely to succeed |
+| **step down** | a node that sees a higher term in any message updates its term and becomes a follower |
+| **Election Safety** | invariant 1: at most one leader per term, ever |
+| **hard state** | `currentTerm` and `votedFor`: what must survive a crash, or a restarted node could vote twice in one term |
+| **fsync** | the call that forces written data from memory onto the physical disk. Only then is it safe to reply |
+| **tick** | one unit of logical time (10 ms in the simulator). Timeouts are counted in ticks, not read from a clock |
+| **safety vs liveness** | safety: nothing bad ever happens (two leaders). Liveness: something good eventually happens (a leader gets elected). In Raft, **safety never depends on timing**; only liveness does |
+| **deterministic simulation** | running all nodes in one program with a fake clock and fake network, driven by a seeded random generator |
+| **seed** | the number that starts the random generator. Same seed, same run, so any failure can be replayed exactly |
+| **invariant** | a property that must hold in every state the system can ever reach |
+| **mutation test** | breaking one rule on purpose to prove the checkers notice |
+
+### Why a majority makes two leaders in one term impossible: an example
+
+```
+5 nodes: A B C D E. Term 7. Each node votes at most once in term 7.
+
+  candidate A gets votes from:  A B C        (3 of 5: wins)
+  candidate E would need 3:     E D + ???    (A, B, C already voted for A)
+
+Any two majorities of 5 overlap in at least one node. That node voted only once,
+so it can't have helped both A and E win term 7.
+```
+
+That's why `votedFor` must be on disk (fsynced) before the vote is sent. A node that forgot its vote
+after a crash could vote again, and the overlap argument would break.
 
 ---
 
@@ -751,6 +805,7 @@ seeds each on 3-node and 5-node clusters, with clients proposing commands the wh
 deliberately broken rule was caught.
 
 ## Contents
+0. [Words you need first](#m2-0-words)
 1. [What M2 adds, in one picture](#m2-1-what-m2-adds-in-one-picture)
 2. [The decisions you approved (M2-A to M2-E)](#m2-2-the-decisions-you-approved)
 3. [The four new invariants and why Raft guarantees them](#m2-3-the-four-new-invariants)
@@ -766,6 +821,58 @@ deliberately broken rule was caught.
 13. [Shortcuts and what is left for later](#m2-13-shortcuts-and-what-is-left)
 14. [Study questions (with answers)](#m2-14-study-questions)
 15. [Glossary additions](#m2-15-glossary-additions)
+
+---
+
+<a id="m2-0-words"></a>
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **command** | one client request that changes data, e.g. `PUT x=5` |
+| **state machine** | the thing the commands act on: here a key-value map. Given the same commands in the same order, every copy ends in the same state, so it must be **deterministic** (no clocks, no randomness) |
+| **state machine replication** | the core idea of Raft: agree on one ordered list of commands (the log), and let every node apply that list to its own copy |
+| **log** | a numbered list of entries, the same order on every node once agreed |
+| **log entry** | one slot in the log: its **index** (position 1, 2, 3…), its **term** (the term of the leader that created it) and its **payload** (a command, or a no-op) |
+| **append** | add entries to the end of a log |
+| **AppendEntries** | the message the leader uses to send entries to a follower (also used empty, as a heartbeat) |
+| **proposal** | a client command handed to the leader, which appends it to its log |
+| **replicate** | copy an entry from the leader's log to the followers' logs |
+| **committed** | an entry stored on a majority, in a way no future leader can undo. Only then may it be applied |
+| **apply** | run a committed command on the state machine and produce its result |
+| **commitIndex** | the highest index a node knows is committed |
+| **lastApplied** | the highest index a node has applied to its state machine (always ≤ commitIndex) |
+| **nextIndex** | per follower, on the leader: the index of the next entry to send |
+| **matchIndex** | per follower, on the leader: the highest index known to be identical on that follower |
+| **consistency check** | AppendEntries carries `prevLogIndex` and `prevLogTerm`, the entry just before the new ones. The follower accepts only if it has that same entry; otherwise it rejects and the leader backs up |
+| **conflict** | the follower has an entry at the same index but with a different term. That entry was never committed, so the follower deletes it and everything after it (**truncate**) |
+| **Log Matching** | invariant 3: if two logs have an entry with the same index and term, the logs are identical up to that index |
+| **Leader Append-Only** | invariant 2: a leader never deletes or overwrites its own entries, it only appends |
+| **Leader Completeness** | invariant 4: every committed entry is in the log of every later leader |
+| **State Machine Safety** | invariant 5: no two nodes ever apply different commands at the same index |
+| **up-to-date check** | a node votes only for a candidate whose log is at least as up to date as its own (higher last term, or same last term and at least as long). It is what makes Leader Completeness true |
+| **no-op entry** | an empty entry a new leader appends in its own term, so it can commit the older entries it inherited |
+| **Figure 8** | the paper's example of why a leader must not commit an entry from an older term just by counting copies |
+| **fast backup** | on a conflict, the follower tells the leader which term conflicts and where it starts, so the leader can skip a whole term at once instead of one entry per round trip |
+| **codec / serialization** | turning commands into bytes and back. Ours is hand-written and **canonical**: one value has exactly one byte form |
+| **CAS (compare-and-set)** | "set x to 7 only if it is currently 5". Returns whether it swapped and the old value |
+
+### One command, start to finish: an example
+
+```
+Client: PUT x=5 → leader L (term 3)
+
+            index:  1    2    3
+leader L    log:   [1]  [3]  [3 PUT x=5]   ← appended at index 3
+follower F1 log:   [1]  [3]  [3 PUT x=5]   ← AppendEntries(prevLogIndex=2, prevLogTerm=3): match → accepted
+follower F2 log:   [1]  [3]                ← message lost; will get it on the next heartbeat
+
+L's matchIndex: F1=3, F2=2. Index 3 is on L and F1 = 2 of 3 = majority, and its term is
+L's own term (3), so commitIndex = 3. L applies it: x=5, and answers the client.
+F1 and F2 learn commitIndex=3 on the next AppendEntries and apply it too.
+```
+
+(Numbers in brackets are entry terms.)
 
 ---
 
@@ -1616,6 +1723,7 @@ up to date with chunked InstallSnapshot. Invariants 1–6 held over 5,000 seeds 
 clusters, under the M2 chaos and under crash loops.
 
 ## Contents
+0. [Words you need first](#m3-0-words)
 1. [What M3 adds, in one picture](#m3-1-what-m3-adds)
 2. [The decisions you approved (M3-A to M3-F)](#m3-2-decisions)
 3. [Invariant 6: Durability, and what a crash really loses](#m3-3-durability)
@@ -1633,6 +1741,50 @@ clusters, under the M2 chaos and under crash loops.
 15. [Shortcuts and what is left for later](#m3-15-shortcuts)
 16. [Study questions (with answers)](#m3-16-study-questions)
 17. [Glossary additions](#m3-17-glossary)
+
+---
+
+<a id="m3-0-words"></a>
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **durability** | once the cluster says "committed", the data survives crashes. Invariant 6 |
+| **volatile vs persistent** | volatile state is in memory and lost on a crash (commitIndex, roles); persistent state is on disk and survives (term, vote, log, snapshot) |
+| **page cache** | the operating system's in-memory copy of file data. `write()` only puts bytes here; a crash before fsync can lose them |
+| **fsync** | wait until a file's bytes are on the physical disk. Slow (milliseconds), but the only real guarantee |
+| **directory fsync** | creating or renaming a file changes the *directory*. That change is durable only after the directory itself is fsynced |
+| **torn write** | a crash in the middle of a write: only part of the bytes reach the disk, sometimes followed by junk |
+| **write-ahead log (WAL)** | an append-only file of changes. Every change is written and fsynced here *before* the node acts on it (replies, votes, acks) |
+| **record** | one entry in the WAL: a type (hard state, log entries, truncate, snapshot marker…), a length, the data and a checksum |
+| **checksum / CRC32C** | a short number computed from the bytes. On read, recompute it; a mismatch means the bytes are damaged or incomplete |
+| **segment** | one WAL file. The WAL is a series of segments; a new one starts when the current one is full |
+| **torn tail** | an incomplete or damaged record at the very end of the last segment: what a crash during a write leaves. It was never acknowledged, so recovery just cuts it off |
+| **corruption** | damaged bytes anywhere else (an older, fully synced segment). That should never happen, so the node **stops** (fail-stop) rather than guess |
+| **recovery** | on restart, read the snapshot and replay the WAL to rebuild exactly the state that was fsynced |
+| **lying disk** | a disk (or setting) whose fsync returns success without really writing. Used as a mutation to prove the checkers notice |
+| **snapshot** | a copy of the whole state machine as of some index, plus that index and its term (`lastIncludedIndex`, `lastIncludedTerm`) |
+| **log compaction** | once a snapshot is safely on disk, the log entries it covers can be deleted, so the log stops growing forever |
+| **log base** | the index the snapshot covers. The log in memory holds only entries after it |
+| **atomic replace** | write a new file under a temporary name, fsync it, rename it over the old one, fsync the directory. A crash leaves either the old file or the new one, never half of each |
+| **checkpoint** | a new WAL segment that restates the whole current state, so the older segments can be deleted |
+| **InstallSnapshot** | the message (Figure 13) a leader uses to send its snapshot to a follower that is so far behind it needs entries the leader already deleted |
+| **chunk / offset** | the snapshot is sent in pieces; the offset says where each piece belongs, so a lost piece is simply re-sent |
+| **crash loop** | a fault mix where nodes crash very often, most of the time during an fsync |
+| **shadow model** | the checker's own independent record of what each node made durable, used to verify recovery |
+
+### What survives a crash: an example
+
+```
+node writes the WAL record "vote for B in term 9"
+
+  write() done, fsync NOT done, crash   → record may be gone, or torn  → the vote was never sent: fine
+  write() done, fsync done, crash       → record survives               → after restart: still voted for B
+  fsync done, vote sent, crash          → record survives               → it can't vote for C in term 9
+
+The rule that makes this safe: persist + fsync FIRST, then send (decision E1).
+A reply is a promise, and a promise may only be made about data already on disk.
+```
 
 ---
 
@@ -3271,3 +3423,607 @@ ignores. The checker treats a recorded `Stale` as a violation, so a client bug h
 | **Wing & Gong / Lowe** | the backtracking search for a linearization, with memoization of (linearized set, state) |
 | **unknown operation** | one whose answer never arrived; may or may not have taken effect |
 | **leader-hunting faults** | a fault mix that aims most faults at the current leader, used for the read mutations |
+
+---
+
+# M5: Hardening (PreVote, CheckQuorum, gRPC, metrics, client API)
+
+**Status:** built and verified (2026-11-25), waiting for the owner's acceptance. §0–§1 were written
+before any code; §2 onward at the end of the milestone.
+
+## 0. Words you need first
+
+**Protocol words (PreVote and CheckQuorum)**
+
+| Term | Meaning |
+|---|---|
+| **disruptive server** | a node that was cut off from the others, kept timing out and raising its term, and on rejoining forces a perfectly healthy leader to step down just because its term is higher |
+| **term inflation** | terms climbing far higher than needed because isolated nodes keep starting elections they can't win |
+| **PreVote** (thesis §9.6) | a dry run before an election: "would you vote for me in term T+1?" The node does **not** raise its term or persist anything. Only after a majority says yes does it start a real election |
+| **pre-candidate** | the new role a node has while it waits for pre-vote answers. Like a candidate, but its term is unchanged |
+| **CheckQuorum** (thesis §6.2) | a leader that hasn't heard from a majority within one election timeout steps down by itself. Without it, a leader cut off with a minority keeps believing it leads |
+| **minority leader** | a leader on the small side of a partition. It can't commit anything, but without CheckQuorum it keeps accepting client requests that then time out |
+| **leader stickiness** (thesis §4.2.3) | a node that heard from a live leader recently (less than the minimum election timeout ago) refuses to vote for anyone else. Combined with CheckQuorum, so a leader that loses its majority does step down |
+| **asymmetric (one-way) partition** | A can send to B but B can't send to A. The tricky case: one side thinks everything is fine |
+| **liveness trap** | a situation where no rule is broken, yet the cluster can't make progress (for example, no node can win an election). PreVote alone, without CheckQuorum, has one: the 2020 Cloudflare outage on etcd |
+| **feature flag** | a config switch (`preVote`, `checkQuorum`) so the same code can run with and without a feature, and the two can be measured against each other |
+
+**Networking words (gRPC)**
+
+| Term | Meaning |
+|---|---|
+| **RPC (remote procedure call)** | calling a function on another machine as if it were local: the arguments are sent over the network, and the result comes back |
+| **gRPC** | Google's RPC framework. It runs over HTTP/2 and generates client and server code from a schema |
+| **Protocol Buffers (protobuf)** | a compact binary format plus a schema language (`.proto` files). You describe each message once, and code generators produce the Java classes |
+| **schema** | the description of every message's fields and their types. Both sides compile against the same schema, so they agree on the bytes |
+| **HTTP/2** | the HTTP version gRPC uses: many requests and streams multiplexed over one TCP connection |
+| **stream (client-streaming RPC)** | one long-lived call over which the client sends many messages. We open one per peer and push every Raft message through it |
+| **bounded queue** | a queue with a maximum size. When it's full, new messages are dropped instead of using unlimited memory |
+| **backpressure** | what happens when a receiver is slower than the sender. Our answer is to drop, which Raft already tolerates, because it retries through heartbeats |
+| **reconnect** | when a stream breaks (peer restarted), open a new one. Messages in flight are lost, which is fine |
+| **mapping** | the code that turns our `Message` records into protobuf messages and back |
+| **round trip** | a message out and its reply back. Our tests check that `Message → protobuf → Message` gives exactly what went in |
+
+**Node runtime words**
+
+| Term | Meaning |
+|---|---|
+| **process** | one running program with its own memory. In M5 each node is its own Java process (JVM) |
+| **thread** | a line of execution inside a process. Several threads share memory, which is where race conditions come from |
+| **event loop** | a single thread that takes events from a queue one at a time and handles each completely before the next. No locks are needed because only this thread touches the Raft state |
+| **mailbox** | the queue feeding the event loop. Network messages, client requests and timer ticks all go in here (decision E1a) |
+| **ticker** | a timer thread that puts a `Tick` into the mailbox every `tickMs` (for example, 10 ms) |
+| **future (`CompletableFuture`)** | a placeholder for a result that arrives later. The HTTP handler waits on one until the write is applied |
+| **environment variable** | a setting given to a process from outside, e.g. `RAFT_NODE_ID=2`. `compose.yaml` passes the cluster layout this way |
+
+**Client API words**
+
+| Term | Meaning |
+|---|---|
+| **HTTP API** | requests like `PUT /kv/x` with a body, answered with a status code and a body. Anything can call it: `curl`, a browser, a script |
+| **JSON** | the text format for the request and response bodies: `{"value":"5"}` |
+| **status code** | the number in an HTTP response: 200 OK, 404 not found, **421 Misdirected Request** (we use it for "I'm not the leader, try node 2"), 503 unavailable |
+| **CLI (command-line interface)** | a program used from the terminal: `raft-cli put x 5` |
+| **header** | extra key-value fields on an HTTP request. Ours carry `Client-Id` and `Seq`, so a retried write is deduplicated |
+
+**Metrics and operations words**
+
+| Term | Meaning |
+|---|---|
+| **metric** | a number the running system reports about itself, collected over time |
+| **gauge** | a metric that goes up and down: current term, commitIndex, replication lag |
+| **counter** | a metric that only goes up: elections started, leader changes |
+| **timer / histogram** | records how long something took, as a distribution (count, sum, percentiles): fsync latency |
+| **Micrometer** | a Java metrics library. Code records metrics through it, and it exports them in many formats |
+| **Prometheus** | a monitoring system that **scrapes** (fetches) `/metrics` from each node every few seconds and stores the time series |
+| **replication lag** | how far a follower is behind the leader: the leader's last log index minus that follower's matchIndex |
+| **fsync latency** | how long each fsync takes. It's usually the biggest cost of a write, and M6 benchmarks it |
+| **SIGKILL / `kill -9`** | stop a process instantly. No cleanup code runs, nothing is flushed. The harshest crash short of power loss |
+| **integration test** | a test of the real pieces together (processes, sockets, disks), slower than unit tests and run separately |
+| **Docker image / container** | an image is a packaged program with everything it needs; a container is one running copy of it |
+| **docker compose** | starts several containers from one file (`compose.yaml`): our 3-node cluster |
+| **volume** | a container's persistent disk. It survives the container being killed, so a restarted node finds its WAL |
+
+### The problem PreVote solves: an example
+
+```
+5 nodes, leader L in term 4, everything healthy.
+n5's network cable is pulled for 10 seconds.
+
+WITHOUT PreVote
+  n5 hears nothing, so it times out again and again: term 5, 6, 7 ... 40 (it can never win, it's alone)
+  cable back: n5 replies to L's heartbeat with term 40
+  L sees a higher term, so it steps down. Everyone goes to term 41 and holds a new election.
+  The cluster was healthy the whole time, yet it lost its leader for an election's worth of time.
+
+WITH PreVote
+  n5 times out and asks "would you vote for me in term 5?" Nobody answers (cut off), so it stays in term 4
+  and keeps asking.
+  cable back: the others answer "no, we heard from L just now" (stickiness). n5 is still in term 4,
+  L's heartbeat reaches it, and it simply follows L again. No election, no lost leader.
+```
+
+## 1. What M5 builds
+
+- **PreVote, CheckQuorum and leader stickiness** in the pure core, each behind a config flag. Measured
+  in the simulator with the flags on and off.
+- **gRPC transport:** a `raft.proto` schema, a mapping to our `Message` records, one stream per peer with
+  a bounded queue.
+- **A real node (`raft-server`):** `main`, a single-threaded event loop, a ticker, the file WAL on the
+  real disk, configured from environment variables.
+- **A client API:** HTTP/JSON with a 421 redirect, and a `raft-cli` built on the same `ClientSession`
+  the simulator verified.
+- **Metrics** with Micrometer + Prometheus at `/metrics`.
+- **kill -9 tests** on 3 real JVMs, checked by the same linearizability checker, plus a Dockerfile so
+  `docker compose up` runs a cluster.
+
+## 2. PreVote: ask before you raise your term
+
+### 2.1 The rule
+
+Plain Raft (Figure 2): when the election timer fires, a follower **immediately** does `currentTerm++`,
+votes for itself, persists both and sends RequestVote. A raised term never goes back down. That's the
+whole problem: a node that can't win (it's cut off) still raises its term every timeout, and when it
+comes back the higher term deposes a healthy leader (§1 example).
+
+PreVote (thesis §9.6) puts a question in front of that step:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Follower
+    Follower --> PreCandidate: election timeout<br/>(term unchanged, nothing persisted)
+    PreCandidate --> PreCandidate: timeout again, no majority<br/>(ask again, same term)
+    PreCandidate --> Candidate: majority said "yes"<br/>now term++, vote self, persist
+    PreCandidate --> Follower: AppendEntries from a leader<br/>or a "no" with a higher term
+    Candidate --> Leader: majority of real votes
+    Candidate --> Follower: higher term seen
+    Leader --> Follower: higher term seen,<br/>or CheckQuorum fails (§3)
+```
+
+**Sender** (`RaftNodeCore.startPreVote`, `raft-core/.../RaftNodeCore.java:261`): become `PRE_CANDIDATE`,
+reset the timer, send `PreVote(term = currentTerm + 1, lastLogIndex, lastLogTerm)`. `currentTerm` and
+`votedFor` don't change, so **nothing needs persisting**: no fsync, and a crash loses nothing.
+
+**Receiver** (`onPreVote`, line 468) says yes only if all three hold:
+1. `pv.term > currentTerm`: the proposed term is newer than mine;
+2. `!heardFromLeaderRecently()`: I haven't heard from a live leader within an election timeout
+   (line 224). This is the part that protects a healthy leader;
+3. the candidate's log is at least as up to date as mine (§5.4.1, the same check as RequestVote).
+
+And it **changes nothing** on its side: not its term, not its vote, not its timer.
+
+**Counting** (`onPreVoteResponse`, line 477): a yes counts only if it carries exactly `currentTerm + 1`,
+so a late yes from an earlier round can't count. Grants go in a `Set`, so a duplicated message counts
+once. With a majority (self included) it calls `startElection()`: the real Figure 2 election.
+
+### 2.2 Why "a yes carries the proposed term, a no carries the receiver's term"
+
+The §5.1 rule "any message with a higher term → adopt it and step down" would break PreVote if it were
+applied blindly:
+
+| Message | If we applied "adopt higher term" | So `adoptsTerm` (line 455) says |
+|---|---|---|
+| `PreVote(term = 8)` arriving at a node in term 7 | the receiver jumps to term 8: exactly the disruption PreVote exists to prevent | never adopt |
+| `PreVoteResponse(yes, term = 8)` | the pre-candidate jumps to 8 just because someone *would* vote for it | don't adopt a yes |
+| `PreVoteResponse(no, term = 12)` | the pre-candidate learns it's behind: correct | adopt a no |
+
+The last row matters. A node coming back from a partition in term 7, while the cluster is in term 12,
+learns term 12 from the first "no", and then follows the leader's heartbeats normally.
+
+### 2.3 A trace
+
+```mermaid
+sequenceDiagram
+    participant N5 as n5 (was cut off)
+    participant N1 as n1 (leader, term 4)
+    participant N2 as n2 (follower)
+    Note over N5: cut off: timeouts keep firing,<br/>but it stays in term 4
+    N5->>N2: PreVote(term 5)
+    Note over N2: heard from n1 30 ms ago
+    N2-->>N5: no (term 4)
+    N1->>N5: AppendEntries(term 4)
+    Note over N5: a leader of my term: follow it
+    N5-->>N1: success
+    Note over N1,N5: no election, no lost leader, term still 4
+```
+
+## 3. CheckQuorum and leader stickiness
+
+### 3.1 CheckQuorum: a leader checks that it's still heard
+
+A leader on the minority side of a partition can't commit anything, but in plain Raft it doesn't know
+that. It keeps its role, accepts client writes that will never commit, and its clients wait until they
+time out. CheckQuorum (thesis §6.2):
+
+- every AppendEntries or InstallSnapshot **reply in the leader's term** puts the sender into
+  `recentlyActive` (line 436). A reply, not a send: a reply proves the link works both ways;
+- every election timeout (`checkQuorumFails`, line 200): if `recentlyActive + 1 (itself) < quorum`, step
+  down; then the set starts over;
+- stepping down (`stepDownLostQuorum`, line 213) keeps the **same term** (the vote stays), rejects every
+  pending ReadIndex read, and starts the election timer.
+
+```mermaid
+sequenceDiagram
+    participant L as n1 (leader, term 4)
+    participant F2 as n2
+    participant F3 as n3
+    Note over L,F3: partition: n1 can't reach n2, n3
+    L-xF2: AppendEntries (lost)
+    L-xF3: AppendEntries (lost)
+    Note over L: 150 ms later: recentlyActive = {}<br/>1 < quorum 2 → step down (still term 4)
+    Note over F2,F3: n2/n3 time out → PreVote → n2 elected in term 5
+    Note over L: clients of n1 now get 421 instead of a timeout
+```
+
+### 3.2 Stickiness: why PreVote alone isn't enough
+
+PreVote stops a node from raising its term **while it's cut off**. It doesn't help when a node really
+reaches a real election, for example after a restart: its timer fires, it pre-votes, and nodes whose
+leader just went quiet for a moment say yes. Or, with PreVote off on one node, its RequestVote arrives
+with a higher term. Stickiness (thesis §4.2.3, `onMessage` line 427): with CheckQuorum on, a node that
+heard from a live leader within an election timeout **ignores** a higher-term RequestVote entirely. No
+reply, and it doesn't adopt the term either.
+
+Why is that safe for liveness? Because of CheckQuorum. If the leader really lost its majority, it steps
+down within an election timeout, its followers stop hearing heartbeats, `heardFromLeaderRecently()`
+turns false, and votes flow again. The two features need each other:
+
+| | without CheckQuorum | with CheckQuorum |
+|---|---|---|
+| **without stickiness** | plain Raft: a stale higher term deposes healthy leaders | minority leaders step down, but rejoining nodes still disrupt |
+| **with stickiness** | **dangerous**: followers stay loyal to a leader that may no longer be able to lead, and nobody makes it step down | ✓ what we run: loyal while the leader is healthy, released as soon as it isn't |
+
+### 3.3 The asymmetric-partition trap (reasoning, not measured separately)
+
+The dangerous cell is a leader whose **outgoing** links work but whose **incoming** links don't. Its
+heartbeats arrive, so followers keep resetting their timers and refusing pre-votes and votes. But it
+hears no replies, so it can't commit anything. Nothing in plain Raft or PreVote ever replaces it: the
+cluster is stuck with every rule obeyed (a liveness trap). CheckQuorum breaks it: no replies → the
+leader steps down → heartbeats stop → the others elect someone who can hear them. Our chaos mix includes
+one-way partitions, and the gates' commit-liveness checks pass with both features on.
+
+### 3.4 Unit tests (written first)
+
+`PreVoteTest` (15) and `CheckQuorumTest` (8), in `raft-core/src/test/.../core/`:
+
+| Test | Rule it pins |
+|---|---|
+| `aTimeoutStartsAPreVoteWithoutChangingTermOrVote` | the sender persists nothing |
+| `aMajorityOfPreVotesStartsTheRealElection` | only then term++ and RequestVote |
+| `duplicatedAndRejectedPreVotesDoNotMakeAMajority`, `aGrantFromAnEarlierPreVoteRoundDoesNotCount` | counting is per round, a set |
+| `anUnansweredPreCandidateRetriesInTheSameTerm` | a cut-off node never inflates its term |
+| `aReceiverGrantsWithoutChangingItsOwnState`, `aPreVoteNeverRaisesTheReceiversTerm` | the receiver changes nothing |
+| `aReceiverThatHeardFromALeaderRecentlySaysNo`, `aLeaderSaysNoToPreVotes` | stickiness on the PreVote side |
+| `aReceiverWithAMoreUpToDateLogSaysNo` | §5.4.1 still applies |
+| `aStalePreVoteIsRejectedWithTheNewerTermAndThePreCandidateCatchesUp` | a "no" carries the real term |
+| `aLeaderThatHearsFromNobodyStepsDownAfterOneElectionTimeout`, `aLeaderThatHearsFromAMajorityStays` | CheckQuorum |
+| `repliesFromAnOlderTermDoNotCount` | only current-term replies are evidence |
+| `steppingDownRejectsPendingReads` | ReadIndex reads don't hang |
+| `aFollowerWithALiveLeaderIgnoresRequestVote`, `aLeaderIgnoresRequestVoteWhileItHasItsQuorum` | stickiness on the RequestVote side |
+| `aHigherTermOnAReplyStillDeposesALeader` | stickiness filters only RequestVote, never §5.1 for other messages |
+| `withoutTheFlag...` (two) | flags off = Figure 2 exactly |
+
+## 4. Measuring them: flags on vs off
+
+`HardeningScenarioTest` runs a healthy cluster (reliable network, clients running) and, at 1 s, cuts one
+node off from every peer for 3 s (`SimConfig.Scenario`). 100 seeds per row:
+
+| Scenario | PreVote | CheckQuorum | Runs with a new leader | Max term growth | Old leader stepped down after |
+|---|---|---|---|---|---|
+| isolate a follower, 3 nodes | **on** | on | **0 / 100** | **0** | n/a |
+| isolate a follower, 5 nodes | **on** | on | **0 / 100** | **0** | n/a |
+| isolate a follower, 5 nodes | off | on | 100 / 100 | +26 | n/a |
+| isolate the leader, 3 nodes | on | **on** | 100 / 100 (expected: it's gone) | +2 | **98–204 ms** (p50 122) |
+| isolate the leader, 5 nodes | on | **on** | 100 / 100 | +1 | **99–202 ms** (p50 112) |
+| isolate the leader, 3 nodes | on | off | 100 / 100 | +2 | 3,001–3,013 ms: only at the heal |
+| isolate the leader, 3 nodes | off | on | 100 / 100 | +24 | 98–204 ms, but the cut-off old leader inflates the term |
+| mutation `PREVOTE_BUMPS_TERM` | "on" | on | 100 / 100 | +25 | caught: behaves like PreVote off |
+
+How to read it: the step-down time is between one and two election timeouts (150–300 ms here, with
+10 ms ticks), because the check runs at the end of each election-timeout window. With CheckQuorum off,
+the isolated leader believes it leads for the whole 3 s partition.
+
+### 4.1 They hide other bugs: a finding about our own tests
+
+Turning both features on in the chaos gate changed the M2–M4 mutation catch rates:
+
+| Mutation | Hardening off | Hardening on | Why |
+|---|---|---|---|
+| `SKIP_UP_TO_DATE_CHECK` (RequestVote) | 89 / 100 caught | **0 / 100** | PreVote's own log check filters stale candidates first, so the broken RequestVote check is never reached |
+| … and `PREVOTE_SKIPS_LOG_CHECK` too | | 56 / 100 | with both checks broken, the bug is visible again |
+| `PREVOTE_SKIPS_LOG_CHECK` alone | | 0 / 300 (safe) | the real RequestVote check still protects safety: PreVote is a liveness feature |
+| `READ_WITHOUT_QUORUM_CHECK` | 76 / 100 | 11 / 100 | CheckQuorum shrinks the window where a deposed leader still thinks it leads, but **doesn't close it** |
+
+Two lessons:
+- **Defence in depth masks bugs.** A mutation test must run with the masking layer off, or it passes
+  for the wrong reason. The original mutation tests now use `withHardening(false, false)`, and the
+  masking itself is pinned as a test (`preVoteMasksTheMissingUpToDateCheckUntilItSkipsItToo`).
+- **CheckQuorum is not a safety mechanism for reads.** It runs on a timer, so between "lost the
+  majority" and "noticed" there's a window. 11/100 runs still served a stale read without ReadIndex's
+  round. That's why ReadIndex stays (`checkQuorumNarrowsButDoesNotCloseTheStaleReadWindow`), and why
+  lease reads (which rely on exactly that kind of timing) were refused in M4.
+
+## 5. gRPC transport
+
+### 5.1 The schema and the mapping
+
+`raft-proto/src/main/proto/raft.proto` describes every message once:
+
+```
+message RaftMessage {
+  int32 from = 1;  int32 to = 2;  int64 term = 3;
+  oneof body {                       // exactly one of these is set
+    RequestVote request_vote = 10;   RequestVoteResponse request_vote_response = 11;
+    PreVote pre_vote = 12;           PreVoteResponse pre_vote_response = 13;
+    AppendEntries append_entries = 14; AppendEntriesResponse append_entries_response = 15;
+    InstallSnapshot install_snapshot = 16; InstallSnapshotResponse install_snapshot_response = 17;
+  }
+}
+service RaftPeer { rpc Stream(stream RaftMessage) returns (Ack); }
+```
+
+`ProtoMapping.toProto / fromProto` convert to and from our `Message` records. Every record constructor
+validates its fields, so a malformed message from the wire (missing body, negative index) throws, and
+the server counts it as malformed and drops it. The core never sees it. `ProtoMappingProperties` checks
+`fromProto(toProto(m)) == m` for 2,000 random messages of every type.
+
+### 5.2 One stream per peer, a bounded queue, drop when full
+
+```mermaid
+flowchart LR
+    subgraph n1["node n1"]
+        LOOP["event loop<br/>transport.send(m)"] -- "offer (never blocks)" --> Q2[["queue to n2<br/>10,000"]]
+        LOOP -- "offer" --> Q3[["queue to n3"]]
+        Q2 --> S2["sender thread n2<br/>waits for isReady"]
+        Q3 --> S3["sender thread n3"]
+    end
+    S2 == "one long-lived HTTP/2 stream" ==> R2["n2: GrpcPeerServer<br/>fromProto → mailbox"]
+    S3 == "stream" ==> R3["n3"]
+    Q2 -. "full → drop + count" .-> X(("dropped"))
+```
+
+The event loop must **never** block on the network: one slow peer would freeze the whole node,
+heartbeats to the healthy peers included. So `send` is `queue.offer(m)`, and if the queue is full the
+message is dropped and counted (`raft_transport_dropped_total`). That's safe because Raft already
+assumes a lossy network: the next heartbeat re-sends whatever a follower is missing. When the peer is
+down, the sender thread retries the stream every 100 ms; when it's up but slow, gRPC flow control
+(`isReady`) holds the sender back, the queue fills, and messages are dropped.
+`GrpcTransportTest.anUnreachablePeerCostsBoundedMemoryAndNeverBlocksTheSender` checks exactly that.
+
+## 6. The real node: one thread owns Raft
+
+```mermaid
+flowchart TB
+    subgraph threads["threads that only put things in the mailbox"]
+        H["HTTP handlers<br/>(virtual threads)"]
+        G["gRPC server threads"]
+        T["ticker (10 ms)"]
+    end
+    H -- "write(bytes) → future" --> M[["mailbox (50,000)"]]
+    G -- "peer Message" --> M
+    T -- "Tick (at most one waiting)" --> M
+    M --> L["raft-loop thread<br/>driver.handle(event):<br/>persist + fsync → send → apply → notify"]
+    L -- "complete future" --> H
+    L -- "publish View" --> V["volatile View<br/>(immutable)"]
+    V -. "read" .-> ST["/status, /metrics"]
+```
+
+`RaftServer` (`raft-server/.../RaftServer.java`) is decision E1a made real:
+
+- **One mailbox, one loop thread** (`runLoop`, line 188). Every input becomes a closure in the mailbox;
+  the loop runs each through the `NodeDriver` before taking the next. The core, the log, the WAL and the
+  state machine are touched by one thread only, so the simulator's single-threaded reasoning still holds.
+  No locks anywhere in Raft code.
+- **Clients wait on futures.** `write(bytes)` creates a `CompletableFuture`, puts "propose this with id
+  N" in the mailbox, and the HTTP handler waits (up to 3 s). When the driver reports
+  `ProposalOutcome.Committed/Rejected/Lost/Unknown` for id N, the loop completes the future.
+- **Ticks coalesce** (`tick`, line 175). If the loop falls behind (a slow fsync), at most one tick waits
+  in the mailbox, so the node doesn't come back to a burst of 50 ticks that would fire elections at
+  once.
+- **Others read a snapshot** (`publishView`, line 235). After every event the loop publishes an
+  immutable `View`; `/status` and metrics read only that, never the driver.
+- **Fail-stop** (`halt`, line 242). A failed fsync (`NodeHaltedException`) means the node can't know
+  what's durable. It stops, fails waiting clients, and `Main` exits the process with status 1. Restarting
+  then recovers from the WAL, which is the tested path.
+- **Inputs are checked at the edge.** A message not addressed to this node, or from a non-member, is
+  counted and dropped (`onPeerMessage`, line 164). In the core that would be an
+  `IllegalArgumentException`, a programming error.
+
+## 7. The client API and the CLI
+
+```mermaid
+sequenceDiagram
+    participant C as raft-cli (ClientSession)
+    participant N1 as n1 (follower)
+    participant N2 as n2 (leader)
+    C->>N1: POST /v1/write [clientId 4711, seq 1, Put x=5]
+    N1-->>C: 421 {"leaderId":2}
+    C->>N2: POST /v1/write [same bytes: same seq]
+    Note over N2: append → replicate → commit → apply<br/>session table: 4711 → (1, reply)
+    N2-->>C: 200 [previous: none]
+```
+
+- **`HttpClusterClient`** (raft-client) drives the same pure `ClientSession` the simulator used for 5,000
+  × 4 runs. Each HTTP outcome becomes a `Reply`: 200 → `Ok`, 421 → `NotLeader(hint)`, 503 "retry" →
+  `Retry`, anything else (timeout, refused, 504) → `onTimeout`, which tries another node. The retry rules
+  aren't re-implemented, just reused. If the whole operation takes too long, `abandon` frees the session
+  for the next operation (new seq) and the caller gets a `TimeoutException`: the write's outcome is
+  unknown, but it can't happen twice.
+- **JSON for people**, `curl`-able (`ClientApi`): `PUT /kv/x {"value":"5"}` → `{"previous":null}`.
+  Optional `Client-Id` + `Seq` headers give exactly-once over curl: `RaftServerTest.aRetryWithTheSameClientIdAndSeqIsExecutedOnce`
+  shows a retried PUT not undoing another client's write in between (the M4 §0 example, on a real
+  cluster).
+- **Status codes:** 421 not leader (+ `leaderId`); 503 `retry` (the entry was overwritten or covered by
+  a snapshot: resend the same request); 503 `unavailable`; 504 no answer in 3 s; 409 stale seq; 400 bad
+  request.
+
+## 8. Metrics
+
+`GET /metrics` serves Prometheus text. What each metric is for:
+
+| Metric | Type | Tells you |
+|---|---|---|
+| `raft_term`, `raft_role`, `raft_is_leader` | gauge | who leads; a term climbing fast means elections keep happening |
+| `raft_commit_index`, `raft_last_applied`, `raft_last_log_index` | gauge | progress; applied far behind commit = slow state machine |
+| `raft_replication_lag{peer}` | gauge (leader) | entries each follower is behind; one growing = a slow or broken follower |
+| `raft_elections_total`, `raft_prevote_rounds_total` | counter | pre-votes that never become elections = PreVote absorbing disruptions |
+| `raft_leader_changes_total`, `raft_checkquorum_stepdowns_total` | counter | instability; step-downs = this leader lost its majority |
+| `raft_fsync_seconds` (count, sum, p50, p99, histogram) | timer | the dominant write cost (M6 benchmarks it) |
+| `raft_transport_sent_total{peer}`, `..._dropped_total{peer}`, `raft_transport_queued{peer}` | counter / gauge | a full queue to one peer = that peer or its link is slow |
+| `raft_mailbox_size`, `raft_halted` | gauge | event-loop overload; fail-stop |
+
+The counters aren't incremented inside the core (it stays pure). `NodeMetrics.observe(prev, next)`
+compares two consecutive views: role went to `CANDIDATE` = an election, `LEADER → FOLLOWER` in the same
+term = a CheckQuorum step-down, and so on.
+
+Real example, after `docker compose kill node2` and a restart of node2:
+
+```
+raft_prevote_rounds_total{node="n2"} 1.0    ← it timed out once while starting up and asked
+raft_elections_total{node="n2"} 0.0         ← nobody said yes: n1 was leader, so no election
+raft_term{node="n2"} 2.0                    ← it simply followed the new leader's term
+```
+
+## 9. Verified with real processes
+
+### 9.1 In-process cluster tests (`RaftServerTest`, part of `./gradlew build`)
+
+Three `RaftServer`s in one JVM: real gRPC over localhost, real files. Six tests: writes and reads
+through any node; the JSON API and the 421 redirect; exactly-once with headers; `/status` and
+`/metrics`; stopping the leader (new leader, every acknowledged write still there, the old leader
+restarts from its files and catches up past several snapshots); and the CLI.
+
+### 9.2 kill -9 (`KillNineIntegrationTest`, `./gradlew :raft-server:integrationTest`)
+
+Three server **processes**. Four clients write unique values (`c3-17`) to three keys the whole time.
+Every 0.8–1.5 s a node gets `SIGKILL` (half the time the current leader) and is restarted from its
+data directory 0.3–1.2 s later. Then a 4 s quiet period. At the end:
+- the history the clients saw goes through the simulator's `LinearizabilityChecker` (invariant 7);
+- every node must have applied up to the leader's commit index;
+- no `Stale` answers.
+
+Measured (2026-11-25, on the owner's MacBook; the clients never stop during kills):
+
+| Run | Kills (of the leader) | Client ops | Timed out (unknown) | Commit index | Checker steps | Result |
+|---|---|---|---|---|---|---|
+| 1 | 12 (9) | 9,355 | 0 | 6,603 | 9,847 | linearizable, all nodes caught up |
+| 2 | 30 (20) | 20,634 | 0 | 14,529 | 21,878 | linearizable, all nodes caught up |
+| 3 | 30 (24) | 17,031 | 0 | 11,986 | 18,128 | linearizable, all nodes caught up |
+| 4 | 30 (21) | 18,680 | 0 | 13,120 | 19,848 | linearizable, all nodes caught up |
+| 5 | 30 (20) | 20,731 | 0 | 14,588 | 21,871 | linearizable, all nodes caught up |
+| 6 | 30 (22) | 22,857 | 0 | 16,062 | 24,019 | linearizable, all nodes caught up |
+
+In total: 162 SIGKILLs (116 of them on the leader), 109,288 client operations, 0 violations. No
+operation hit the client's 4 s give-up limit: every leader kill was followed by a new leader quickly
+enough for the retries to land. Each run takes about 90 s, which is why it isn't part of
+`./gradlew build`.
+
+### 9.3 Docker
+
+```
+docker compose up -d --build
+curl -X PUT localhost:8081/kv/city -d '{"value":"Bengaluru"}'   → 421 {"error":"not_leader","leaderId":2}
+curl -X PUT localhost:8082/kv/city -d '{"value":"Bengaluru"}'   → 200 {"previous":null}
+docker compose kill node2                                        # SIGKILL the leader
+curl localhost:8081/status   → {"id":1,"role":"LEADER","term":2,...,"commitIndex":3}
+raft-cli get city            → Bengaluru
+docker compose start node2   → {"id":2,"role":"FOLLOWER","term":2,"leaderId":1,"commitIndex":3,...}
+```
+
+(That's a real run from 2026-11-25. The Dockerfile builds with the project's Gradle wrapper in a JDK
+image and runs on a JRE image. Named volumes keep each node's WAL across kills.)
+
+## 10. The gate, and a failure that wasn't a bug
+
+The 5,000-seed gate runs with PreVote and CheckQuorum **on** (they're the simulator default now):
+
+| Config | Elections | Max term | Crashes (mid-write) | Client ops | Dedup hits | Result |
+|---|---|---|---|---|---|---|
+| chaos, 3 | 32,792 | 18 | 41,813 (18,739) | 2,717,114 | 559,220 | 0 violations |
+| chaos, 5 | 32,118 | 20 | 45,214 (21,717) | 3,617,108 | 1,062,344 | 0 violations |
+| crash loop, 3 | 42,240 | 25 | 255,991 (93,011) | 1,585,290 | 522,169 | 0 violations |
+| crash loop, 5 | 61,617 | 32 | 300,777 (135,155) | 2,449,733 | 1,308,437 | 0 violations |
+
+Runtime 3 min 39 s. The max term in chaos dropped from 62 (M4) to 18–20: PreVote at work.
+
+**The first run failed** on chaos, 5 nodes, seed 3064: *"a client completed nothing in the last 1000 ms
+of the quiet period"*. That's a liveness check, not safety. The investigation:
+
+1. The replayed trace (`-Psim.trace=3000000`) showed a **stable** leader (n2, term 8) for the last
+   3.5 s, with every node following it. No election, no PreVote involvement.
+2. Client c1 sent five attempts in a row to n2. Three requests were dropped on the client link, and the
+   replies to the other two were dropped on the way back. The link drops 5% each way, and one attempt
+   also took a long-delay hit.
+3. So was the 1 s window simply too tight? **Measured, not guessed:** the slowest client's idle time at
+   the end of every run, over 5,000 seeds × {3, 5} nodes × hardening {on, off}:
+
+| | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|
+| hardening on, 3 nodes | 161 ms | 509 ms | 730 ms | 786 ms |
+| hardening on, 5 nodes | 161 ms | 529 ms | 790 ms | **1,089 ms** (seed 3064) |
+| hardening off, 3 nodes | 160 ms | 506 ms | 783 ms | 880 ms |
+| hardening off, 5 nodes | 163 ms | 517 ms | 759 ms | 953 ms |
+
+The distribution is the same with the features on or off, so PreVote/CheckQuorum aren't the cause. The
+1 s window sat right at the tail of normal bad luck. The client window is now 2 s (harness note H6),
+the cluster liveness checks keep 1 s, and `RegressionSeedsTest.seed3064UnluckyClientLink` pins the
+seed at an idle time between 1 and 2 s. After that, the gate passed with the numbers above.
+
+## 11. All M5 tests
+
+| Where | Tests | What |
+|---|---|---|
+| `raft-core` `PreVoteTest`, `CheckQuorumTest` | 15 + 8 | the rules (§3.4) |
+| `raft-sim` `HardeningScenarioTest` | 10 | flags on/off measured, `PREVOTE_BUMPS_TERM` caught |
+| `raft-sim` `MutationSanityTest` | +3 | masking (§4.1) |
+| `raft-sim` `RegressionSeedsTest` | +1 | seed 3064 |
+| `raft-transport` `ProtoMappingProperties`, `GrpcTransportTest` | 4 + 5 | wire format; order, reconnect, bounded memory, malformed input |
+| `raft-client` `ClientSessionTest` | +2 | `abandon` |
+| `raft-server` `ServerConfigTest`, `RaftServerTest` | 3 + 6 | env contract; a real 3-node cluster in one JVM |
+| `raft-server` `KillNineIntegrationTest` | 1 (separate task) | 3 processes, SIGKILL, linearizability |
+
+## 12. What M5 doesn't build
+
+Listed in DEVIATIONS.md R1–R4. **No TLS or authentication** (anyone on the network could send Raft
+messages). **No membership changes** (the member list is fixed at start; thesis ch. 4's joint
+consensus is a milestone of its own). **No leadership transfer** (§3.10: a planned restart of the leader
+costs one election timeout). **No back-pressure** beyond "mailbox full → 503". And a SIGKILL isn't power
+loss: the OS page cache survives a killed process, so these runs test process crashes. Power loss is
+covered only by the simulator's `SimDisk` (H3).
+
+## 13. Study questions (with answers)
+
+1. **Why doesn't a PreVote raise the receiver's term, when every other message does?**
+   Because its term is only a proposal. If it raised the receiver's term, a cut-off node's pre-votes
+   would cause exactly the disruption PreVote exists to prevent.
+2. **A node is in term 7 and the cluster is in term 12. How does it catch up if it uses PreVote?**
+   Its pre-vote (term 8) is refused with a "no" carrying term 12, and a "no" *is* adopted, so it moves
+   to 12 and follows the leader's next heartbeat.
+3. **Is PreVote needed for safety?** No. `PREVOTE_SKIPS_LOG_CHECK` passed 300/300 seeds: the real
+   RequestVote check still enforces §5.4.1. PreVote is a liveness and stability feature.
+4. **Why does stickiness need CheckQuorum?** Without it, followers stay loyal to a leader that may have
+   lost its majority, and nothing would ever make that leader step down. With CheckQuorum it steps down
+   within an election timeout, and loyalty ends.
+5. **Why count replies, not sends, for CheckQuorum?** A send proves nothing: with a one-way partition
+   the leader's messages arrive but it hears nothing back. Only a reply proves both directions work.
+6. **CheckQuorum makes a minority leader step down within ~200 ms. Why still do ReadIndex?** Because
+   ~200 ms isn't zero. Measured: without ReadIndex's round, 11/100 runs still served a stale read with
+   CheckQuorum on. Safety can't rest on a timer.
+7. **Why did turning on PreVote make a mutation test pass?** PreVote checks the log before RequestVote
+   does, so breaking only the RequestVote check had no visible effect. Mutation tests must disable
+   layers that mask the bug under test.
+8. **Why doesn't `GrpcTransport.send` block when a peer is slow?** The event loop calls it. Blocking
+   would stop heartbeats to healthy peers too, and with them the whole node. Dropping is safe because
+   Raft re-sends through heartbeats.
+9. **Why one event-loop thread instead of locks?** Every rule was proven and tested for one-at-a-time
+   execution. Locks would bring races, deadlocks and a second set of reasoning. Throughput is bounded
+   by fsync anyway, not CPU.
+10. **What does a 421 tell the client, and why not forward the request to the leader?** "Not the
+    leader; try node N." Forwarding adds a hop and a new failure mode (the leader answers, but the
+    forwarding node crashes). Redirecting keeps the client's retry rules in one place.
+11. **A client times out on a write. Did it happen?** Unknown, maybe. But it can't happen twice: the
+    session table remembers (clientId, seq). That's why the kill -9 test records timeouts as "unknown"
+    operations, which the checker may place anywhere after their start, or nowhere.
+12. **What does `kill -9` test that the simulator doesn't?** Real threads, sockets, gRPC reconnects, the
+    real file system and the JVM. What it **doesn't** test: power loss (the page cache survives).
+13. **The seed 3064 failure: bug or not, and how did you decide?** Not a bug. A stable leader, and five
+    lost round trips on a 5%-lossy client link. Decided by measuring the idle-time distribution over
+    20,000 runs (max 1,089 ms, same with features off), not by guessing.
+
+## 14. Glossary additions
+
+| Term | Meaning |
+|---|---|
+| **pre-candidate** | the role between follower and candidate when PreVote is on; same term as before |
+| **`heardFromLeaderRecently`** | leader, or follower with a known leader and the election timer below the minimum timeout |
+| **`recentlyActive`** | peers whose replies the leader got in the current CheckQuorum window |
+| **masking** | one safety layer hiding a bug in another, so tests pass for the wrong reason |
+| **client-streaming RPC** | one gRPC call over which the client sends many messages and gets one reply at the end |
+| **flow control (`isReady`)** | gRPC telling the sender to wait because the receiver's buffer is full |
+| **event loop / mailbox** | one thread processing one queue of events, each to completion |
+| **coalescing** | merging repeated requests into one (at most one tick waiting) |
+| **View** | the immutable snapshot of node state the loop publishes for other threads |
+| **fail-stop** | on an error you can't reason about (failed fsync), stop completely rather than continue wrongly |
+| **integration test** | a test of the real pieces together; here 3 JVMs and SIGKILL |
+| **H6** | the harness note that widened the client-liveness window to 2 s, with the measurement behind it |

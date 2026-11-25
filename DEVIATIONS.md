@@ -41,9 +41,10 @@ detail, with diagrams, in EXPLANATION.md M4 §2.
 | # | What | Why it is acceptable now | Revisit |
 |---|------|--------------------------|---------|
 | H2 | `RaftNodeCore.withMutationsForTesting` puts test-only `if`s into production code (DESIGN.md M2-C), now six; `WalOptions`/`StorageMutation` add two in storage (M3-F); `KvStateMachine.withoutDedupForTesting` adds one (M4-F). | Production paths always use no mutations; each `if` is marked `// MUTATION (test only)`. | Kept |
-| H3 | `SimDisk` models one directory, whole-byte torn writes and a simple page cache; no reordering of writes *within* a file beyond "a prefix survives". | Matches what ext4/xfs with `data=ordered` give for appends; the WAL relies only on prefix survival plus CRCs. | M5 (real `kill -9` on Docker) |
+| H3 | `SimDisk` models one directory, whole-byte torn writes and a simple page cache; no reordering of writes *within* a file beyond "a prefix survives". | Matches what ext4/xfs with `data=ordered` give for appends; the WAL relies only on prefix survival plus CRCs. M5 adds real `kill -9` runs (`KillNineIntegrationTest`, Docker). A SIGKILL keeps the OS page cache, so it tests process crashes, not power loss. | Kept (power loss needs a VM or a fault-injecting filesystem) |
 | H4 | The two ReadIndex mutations are measured under a leader-targeted fault mix (`FaultConfig.leaderHunting`) and a read-heavy workload, not the standard chaos mix. | A bad ReadIndex is stale only in the short window around a leadership change; the standard mix catches it in 7–14% of seeds, the targeted one in 20–75%. Same idea as batch size 1 for Figure 8. Control runs use the same configs. | Kept |
 | H5 | Invariant 7 is checked once, at the end of each run, not after every event. | It needs the whole history; the other invariants still run after every event. | Kept |
+| H6 | Client liveness ("every client completed something in the last N ms") uses N = 2 s; the cluster liveness checks keep 1 s. | Client links keep losing 5% of messages in the quiet period, so one client can be unlucky for a while. Measured over 4 × 5,000 seeds: the slowest client's idle time at the end has p99.9 ≈ 790 ms and max 1,089 ms, the same with PreVote/CheckQuorum on or off. The M5 gate failed once at 1 s (chaos, 5 nodes, seed 3064: five lost round trips in a row to a stable leader, idle 1,089 ms). Pinned in `RegressionSeedsTest`. | Kept |
 
 Removed in M4: **H1** (client links were reliable; they are now lossy, DESIGN.md M4-A).
 
@@ -51,13 +52,22 @@ Removed in M4: **H1** (client links were reliable; they are now lossy, DESIGN.md
 
 | # | What | Why it is acceptable now | Revisit |
 |---|------|--------------------------|---------|
-| S1 | On macOS, `FileChannel.force` is `fsync(2)`, which doesn't flush the drive's write cache (`F_FULLFSYNC` does), and `RealDisk.fsyncDir` silently does nothing if the directory can't be opened as a channel. | Linux in Docker is the deployment target; the simulator tests the protocol's use of fsync independently. | M5 |
+| S1 | On macOS, `FileChannel.force` is `fsync(2)`, which doesn't flush the drive's write cache (`F_FULLFSYNC` does), and `RealDisk.fsyncDir` silently does nothing if the directory can't be opened as a channel. | Linux in Docker is the deployment target (compose uses named volumes on the Linux VM's disk, not macOS bind mounts); the simulator tests the protocol's use of fsync independently. | Kept |
 | S2 | Memory: the core holds the latest snapshot's bytes (M3-C), and `FileWalStorage` keeps its own copy of the log after the base (`LogImage`, for checkpoints). | The KV store lives in RAM anyway; both copies are bounded by snapshotting. | Kept (a production system would stream snapshots from disk) |
 | S3 | Serializing a snapshot runs on the driver thread and blocks the event loop. | Fine at this size; etcd/TiKV use copy-on-write state and background snapshots. | Later, if measured to matter |
 
 Removed in M4: **S4** (`ProposalOutcome.Unknown` could not be retried safely; with sessions the client retries
 with the same seq and dedup makes it exactly-once).
 
-## Open (to decide at the named milestone)
+## Not built in M5 (production concerns outside the brief)
 
-- **M5:** `compose.yaml` is written but can't run yet. The node `main` and `raft-node/Dockerfile` must honour its env contract (`RAFT_NODE_ID`, `RAFT_PEERS`, `RAFT_PEER_PORT`, `RAFT_CLIENT_PORT`, `RAFT_DATA_DIR`).
+| # | What | What we do instead | Cost |
+|---|------|--------------------|------|
+| R1 | TLS and authentication between nodes and for clients | Plaintext gRPC and HTTP on a private Docker network | Anyone on the network can read or send messages, including fake Raft messages |
+| R2 | Membership changes (joint consensus or single-server changes, thesis ch. 4) | Membership is fixed by `RAFT_PEERS` at start | Replacing a machine means a full cluster restart with a new config |
+| R3 | Back-pressure to clients beyond "mailbox full → 503" | Bounded mailbox and per-peer queues; clients retry | Under overload, latency is not shaped; requests are refused |
+| R4 | Leadership transfer (thesis §3.10) | A leader keeps its role until it fails or loses quorum | Planned restarts of the leader cost one election timeout of unavailability |
+
+## Open
+
+Nothing. M6 (benchmarks and report) is next.

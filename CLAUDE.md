@@ -17,7 +17,11 @@ consensus and end up with an interview-grade project. You act as a **senior dist
 - **M4 Clients and reads: DONE** (accepted by the owner 2026-11-25, committed on `m4`, merged to `main`, pushed).
   The gate found a real ReadIndex bug (seed 4811: a stale-term rejection echoed a read round); fixed.
   Sessions + dedup, `ClientSession` (raft-client), ReadIndex, linearizability checker (invariant 7),
-  lossy client links, three mutations caught. Gate numbers in MILESTONES.md. Not committed yet.
+  lossy client links, three mutations caught. Gate numbers in MILESTONES.md.
+- **M5 Hardening: built and verified, NOT yet accepted or committed** (branch `m5`). PreVote + CheckQuorum
+  + stickiness (flags), gRPC transport, `raft-server` (event loop, HTTP API, metrics), `raft-cli`,
+  kill -9 integration test (6 runs, 162 kills, all linearizable), Docker compose verified by hand. Gate
+  passed with hardening on after seed 3064 (client-liveness window too tight → H6, 2 s, measured).
 - **Git:** history rewritten 2026-11-24 (author → "Amogh P"): M1 `a645fa8`, docs `069cc15`, M2 `ec88c75`, M3 `be439fc`. M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
   2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 
@@ -73,8 +77,15 @@ consensus and end up with an interview-grade project. You act as a **senior dist
 - **Leader Completeness** gets its own checker class in M2, not folded into `ElectionSafetyChecker`.
   The owner asked for it to be checked once logs are non-empty.
 
+- **M5 choices (approved 2026-11-25, "Accept all"):** M5-A PreVote + CheckQuorum + stickiness behind
+  `RaftConfig` flags (off in the plain constructor so M1–M4 unit tests stay Figure 2; on in sim and
+  server); M5-B gRPC, one client-streaming RPC per peer, bounded queue, drop when full; M5-C HTTP/JSON on
+  the JDK server + binary `/v1/*` for `HttpClusterClient`/`raft-cli` (on `ClientSession`); M5-D one
+  event-loop thread + mailbox, Micrometer/Prometheus from published `View`s; M5-E kill -9 test with 3
+  JVMs + Dockerfile/compose.
+
 ## Still open (ask at the named milestone)
-- **M5:** PreVote, CheckQuorum, gRPC transport, metrics, CLI/HTTP client: ask before choosing approaches.
+- **M6:** benchmarks and report: ask before choosing tools and workloads.
 
 ## Layout
 ```
@@ -86,13 +97,17 @@ raft-storage/       com.projects.raftkv.storage    Storage, InMemoryStorage (uni
                                                    LogImage, SnapshotStore, StorageMutation
                     ...storage.disk                Disk, RealDisk, SimDisk (page-cache crash model)
                     ...storage.wal                 FileWalStorage, WalRecord, WalCodec, WalOptions
-raft-transport/     com.projects.raftkv.transport  Transport
+raft-proto/         com.projects.raftkv.proto      raft.proto (generated protobuf + gRPC stubs)
+raft-transport/     com.projects.raftkv.transport  Transport, GrpcTransport, GrpcPeerServer, ProtoMapping
 raft-node/          com.projects.raftkv.node       NodeDriver (apply, pending proposals, ReadIndex reads),
                                                    ProposalOutcome, ReadOutcome, NodeHaltedException
 raft-statemachine/  com.projects.raftkv.statemachine StateMachine (apply, query), KvStateMachine (data + session
                                                    table), KvCommand, KvRequest (clientId, seq), KvResult (+Stale),
                                                    KvCodec (snapshot v2 with sessions)
-raft-client/        com.projects.raftkv.client     ClientSession (pure: seq, retries, hints, timeouts)
+raft-client/        com.projects.raftkv.client     ClientSession (pure: seq, retries, hints, timeouts),
+                                                   HttpClusterClient, RaftCli
+raft-server/        com.projects.raftkv.server     Main, ServerConfig (env), RaftServer (event loop), ClientApi
+                                                   (HTTP), NodeMetrics, TimedDisk, ClientReply; Dockerfile
 raft-sim/           com.projects.raftkv.sim        Simulation, NetworkConfig, FaultConfig, SimConfig,
                                                    WorkloadConfig, StorageConfig, ClientWorkload, Trace,
                                                    NodeLogTracker, TrackedStorage, checkers: ElectionSafety,
@@ -104,7 +119,9 @@ compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_B
 
 ## Commands
 ```
-./gradlew build                                   # all modules, 312 tests, 300 seeds per chaos test
+./gradlew build                                   # all modules, 369 tests, 300 seeds per chaos test
+./gradlew :raft-server:integrationTest            # 3 JVMs + kill -9 loop (~40 s; -Pkill9.kills=30 ≈ 90 s)
+docker compose up -d --build                      # real 3-node cluster on :8081-8083 (Docker Desktop must run)
 ./gradlew :raft-sim:test --tests '*ChaosTest*' -Psim.seeds=5000   # milestone gate (chaos + crash loop × {3, 5})
 ./gradlew :raft-sim:test -Psim.seed=N             # replay one seed
 ```
@@ -148,6 +165,12 @@ is 25; the Gradle toolchain picks 21 automatically). Gradle 9.9.2 wrapper.
 - jqwik draws new random inputs every run. A property failing on an untouched module is a new input,
   not a flake: reproduce it from the "Sample" in the test report and pin it as an `@Test` regression
   (M4 found a wrong oracle in `WalTornTailProperties` this way).
+- M5: PreVote/CheckQuorum **mask** other bugs (PreVote's log check hides a broken RequestVote check;
+  CheckQuorum shrinks the stale-read window). Mutation tests for M2–M4 bugs run with
+  `SimConfig.withHardening(false, false)`; the masking itself is pinned as tests.
+- M5: client liveness window is 2 s (`-Psim.clientWindow=N` overrides), cluster liveness 1 s (H6).
+- M5: `HistoryRecorder`/`LinearizabilityChecker` are public because raft-server's kill -9 test uses them
+  (test dependency on raft-sim).
 - Git: the project repo is this folder (remote `origin` = GitHub `Distributed-Raft-based-KV-store`).
   `/Users/amoghp` also contains a stray `~/.git`; the owner was warned. Never run git from the home
   directory.
