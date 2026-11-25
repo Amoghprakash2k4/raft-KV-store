@@ -11,6 +11,7 @@ package com.projects.raftkv.sim;
  * long an isolated leader kept its role (-1 = never stepped down, or not that scenario).
  * {@code slowestClientIdleMs}: at the end, how long ago the least recently successful client completed
  * its last operation.
+ * {@code batches}/{@code batchedEvents}/{@code maxBatch}: group commit (M6-A), 0 when batching is off.
  */
 public record SimResult(long seed, long eventsProcessed, long traceHash,
                         int leadersElected, long maxTerm, long firstLeaderAtMs, long lastNewLeaderAtMs,
@@ -21,4 +22,4 @@ public record SimResult(long seed, long eventsProcessed, long traceHash,
                         int midWriteCrashes, int tornTailsCut, long restartsChecked,
                         long snapshotsTaken, long snapshotsInstalled, long maxLogEntries,
                         long termAtScenarioStart, int newLeadersSinceScenario, long scenarioStepDownMs,
-                        long slowestClientIdleMs) {}
+                        long slowestClientIdleMs, long batches, long batchedEvents, long maxBatch) {}

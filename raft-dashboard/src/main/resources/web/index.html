@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raft KV Lab</title>
+<link rel="stylesheet" href="style.css">
+<script src="echarts.min.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◆</span>
+    <div>
+      <h1>Raft KV Lab</h1>
+      <p class="sub">Run the simulator and real-cluster benchmarks, then explore the results</p>
+    </div>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="sim" class="active">Simulator</button>
+    <button role="tab" data-tab="blind">Blind bug test</button>
+    <button role="tab" data-tab="load">Throughput &amp; latency</button>
+    <button role="tab" data-tab="failover">Leader failover</button>
+    <button role="tab" data-tab="compare">Compare runs</button>
+  </nav>
+  <div id="jobPill" class="pill idle">idle</div>
+</header>
+
+<div id="busyBar" class="busybar" hidden></div>
+<main>
+  <!-- ============================================================ SIMULATOR -->
+  <section id="tab-sim" class="tab active">
+    <aside class="panel form">
+      <h2>Simulation settings</h2>
+      <p class="hint">Deterministic runs on a simulated network and disk. Every Raft safety property is checked after every event.</p>
+      <label>Cluster size
+        <div class="seg" data-name="nodes"><button value="3" class="on">3 nodes</button><button value="5">5 nodes</button></div>
+      </label>
+      <label>Number of seeds <span class="muted">(one seed = one full 13 s run)</span>
+        <input type="number" id="sim-seeds" min="1" max="20000" value="500">
+        <div class="chips"><button data-seeds="100">100</button><button data-seeds="500">500</button><button data-seeds="1000">1,000</button><button data-seeds="5000">5,000</button></div>
+      </label>
+      <label>First seed <input type="number" id="sim-first" min="1" value="1"></label>
+      <label>Fault mix
+        <select id="sim-mix"></select>
+        <span class="hint" id="sim-mix-help"></span>
+      </label>
+      <div class="toggles">
+        <label class="switch"><input type="checkbox" id="sim-prevote" checked><span></span> PreVote</label>
+        <label class="switch"><input type="checkbox" id="sim-cq" checked><span></span> CheckQuorum</label>
+        <label class="switch"><input type="checkbox" id="sim-batch"><span></span> Group commit</label>
+      </div>
+      <label>Deliberate bug (mutation)
+        <select id="sim-mutation"></select>
+        <span class="hint" id="sim-mutation-help"></span>
+      </label>
+      <div class="banner info" style="margin-top:10px;font-weight:500;font-size:12.5px;display:block">
+        This plants <b>one</b> bug in <b>every</b> seed. To tick several bugs, choose how many seeds get each, and plant them
+        at random among clean seeds, use the <a href="#" id="goto-blind"><b>Blind bug test</b></a> tab.</div>
+      <div class="actions">
+        <button class="primary" id="sim-run">Run simulation</button>
+        <button class="ghost" id="sim-cancel" hidden>Cancel</button>
+      </div>
+      <div class="progress" id="sim-progress" hidden><div class="bar"></div><span class="ptext"></span></div>
+      <h3>Saved simulator runs</h3>
+      <ul class="runlist" data-kind="sim"></ul>
+    </aside>
+    <div class="results" id="sim-results">
+      <div class="empty">Choose settings and press <b>Run simulation</b>. 500 seeds take about 15 seconds.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ BLIND BUG TEST -->
+  <section id="tab-blind" class="tab">
+    <aside class="panel form">
+      <h2>Blind bug test</h2>
+      <p class="hint">Pick bugs and how many seeds get each. They are planted in <b>random</b> seeds; the rest stay clean.
+        The plan stays hidden while it runs. At the end you see which bugs the checkers caught, which they missed,
+        and whether any clean seed was wrongly flagged.</p>
+      <label>Cluster size
+        <div class="seg" data-name="nodes"><button value="3" class="on">3 nodes</button><button value="5">5 nodes</button></div>
+      </label>
+      <div class="grid2">
+        <label>Total seeds <input type="number" id="bl-seeds" min="1" max="20000" value="1000"></label>
+        <label>First seed <input type="number" id="bl-first" min="1" value="1"></label>
+      </div>
+      <label>Settings
+        <div class="seg" data-name="blmode"><button value="custom" class="on">Same for every seed</button><button value="auto">Each bug's own</button></div>
+        <span class="hint" id="bl-mode-help"></span>
+      </label>
+      <div id="bl-custom">
+        <label>Fault mix
+          <select id="bl-mix"></select>
+          <span class="hint" id="bl-mix-help"></span>
+        </label>
+        <div class="toggles">
+          <label class="switch"><input type="checkbox" id="bl-prevote" checked><span></span> PreVote</label>
+          <label class="switch"><input type="checkbox" id="bl-cq" checked><span></span> CheckQuorum</label>
+          <label class="switch"><input type="checkbox" id="bl-batch"><span></span> Group commit</label>
+        </div>
+      </div>
+      <label>Bugs to plant <span class="muted">(count = seeds that get it)</span></label>
+      <div class="chips"><button id="bl-each10">select all</button><button id="bl-random">random counts</button><button id="bl-clear">clear</button></div>
+      <div id="bl-bugs" class="buglist"></div>
+      <p class="hint" id="bl-sum"></p>
+      <label>Plan seed <span class="muted">(blank = random; the same plan seed gives the same plan)</span>
+        <input type="number" id="bl-plan" min="1" placeholder="random"></label>
+      <div class="actions"><button class="primary" id="bl-run">Plant bugs and run</button></div>
+      <div class="progress" id="bl-progress" hidden><div class="bar"></div><span class="ptext"></span></div>
+      <h3>Saved blind tests</h3>
+      <ul class="runlist" data-kind="blind"></ul>
+    </aside>
+    <div class="results" id="bl-results">
+      <div class="empty">Choose bugs and counts, then press <b>Plant bugs and run</b>.<br>The answer key is revealed when the run ends.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ LOAD -->
+  <section id="tab-load" class="tab">
+    <aside class="panel form">
+      <h2>Benchmark settings</h2>
+      <p class="hint">Starts real <code>raft-server</code> processes on this machine (real gRPC, real fsync), then drives them with closed-loop clients.</p>
+      <label>Cluster size
+        <div class="seg" data-name="nodes"><button value="3" class="on">3 nodes</button><button value="5">5 nodes</button></div>
+      </label>
+      <label>Concurrent clients <input type="number" id="load-clients" min="1" max="512" value="16">
+        <div class="chips"><button data-clients="1">1</button><button data-clients="4">4</button><button data-clients="16">16</button><button data-clients="64">64</button></div>
+      </label>
+      <label>Writes <span class="muted">(the rest are linearizable reads)</span>
+        <div class="range"><input type="range" id="load-writes" min="0" max="100" step="10" value="100"><output id="load-writes-out">100%</output></div>
+      </label>
+      <div class="toggles">
+        <label class="switch"><input type="checkbox" id="load-batch" checked><span></span> Group commit (fsync batching)</label>
+      </div>
+      <div class="grid2">
+        <label>Measure (s) <input type="number" id="load-duration" min="1" max="600" value="15"></label>
+        <label>Warm-up (s) <input type="number" id="load-warmup" min="0" max="60" value="3"></label>
+        <label>Keys <input type="number" id="load-keys" min="1" value="1000"></label>
+        <label>Value bytes <input type="number" id="load-value" min="1" max="65536" value="100"></label>
+      </div>
+      <div class="actions"><button class="primary" id="load-run">Run benchmark</button></div>
+      <div class="progress" id="load-progress" hidden><div class="bar"></div><span class="ptext"></span></div>
+      <h3>Saved benchmark runs</h3>
+      <ul class="runlist" data-kind="load"></ul>
+    </aside>
+    <div class="results" id="load-results">
+      <div class="empty">Press <b>Run benchmark</b>. Throughput appears live, second by second.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ FAILOVER -->
+  <section id="tab-failover" class="tab">
+    <aside class="panel form">
+      <h2>Failover settings</h2>
+      <p class="hint">Kills the leader with <code>kill -9</code> again and again while a client keeps writing, and measures how long the cluster has no leader.</p>
+      <label>Cluster size
+        <div class="seg" data-name="nodes"><button value="3" class="on">3 nodes</button><button value="5">5 nodes</button></div>
+      </label>
+      <label>Leader kills <input type="number" id="fo-kills" min="1" max="1000" value="30">
+        <div class="chips"><button data-kills="10">10</button><button data-kills="30">30</button><button data-kills="100">100</button></div>
+      </label>
+      <div class="toggles">
+        <label class="switch"><input type="checkbox" id="fo-batch" checked><span></span> Group commit</label>
+      </div>
+      <div class="actions"><button class="primary" id="fo-run">Run failover test</button></div>
+      <div class="progress" id="fo-progress" hidden><div class="bar"></div><span class="ptext"></span></div>
+      <h3>Saved failover runs</h3>
+      <ul class="runlist" data-kind="failover"></ul>
+    </aside>
+    <div class="results" id="fo-results">
+      <div class="empty">Press <b>Run failover test</b>. Each kill takes about 1.5 s.</div>
+    </div>
+  </section>
+
+  <!-- ============================================================ COMPARE -->
+  <section id="tab-compare" class="tab">
+    <aside class="panel form">
+      <h2>Compare saved runs</h2>
+      <p class="hint">Tick runs of the same kind to put them on the same charts. Benchmarks with different client counts become a scaling curve.</p>
+      <div class="seg" id="cmp-kind"><button value="load" class="on">Throughput</button><button value="failover">Failover</button><button value="sim">Simulator</button></div>
+      <div class="actions">
+        <button class="ghost" id="cmp-all">Select all</button>
+        <button class="ghost" id="cmp-none">Clear</button>
+      </div>
+      <ul class="runlist checks" id="cmp-list"></ul>
+    </aside>
+    <div class="results" id="cmp-results">
+      <div class="empty">Tick two or more runs on the left.</div>
+    </div>
+  </section>
+</main>
+
+<div class="drawer" id="drawer" hidden>
+  <div class="drawer-card">
+    <button class="close" id="drawer-close" aria-label="Close">×</button>
+    <div id="drawer-body"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

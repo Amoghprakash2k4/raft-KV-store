@@ -9,6 +9,8 @@ micrometer = "1.15.11"
 jackson = "2.21.2"
 slf4j = "2.0.17"
 logback = "1.5.25"
+# M6
+hdrhistogram = "2.2.2"
 
 [libraries]
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
@@ -26,6 +28,7 @@ micrometer-prometheus = { module = "io.micrometer:micrometer-registry-prometheus
 jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+hdrhistogram = { module = "org.hdrhistogram:HdrHistogram", version.ref = "hdrhistogram" }
 
 [plugins]
 protobuf = { id = "com.google.protobuf", version = "0.9.6" }

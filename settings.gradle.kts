@@ -15,4 +15,6 @@ include(
     "raft-client",
     "raft-sim",
     "raft-server",
+    "raft-bench",
+    "raft-dashboard",
 )

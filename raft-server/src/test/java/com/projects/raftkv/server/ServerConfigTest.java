@@ -29,6 +29,8 @@ class ServerConfigTest {
         assertThat(c.preVote()).isTrue();
         assertThat(c.checkQuorum()).isTrue();
         assertThat(c.tickMs() * c.electionTicks()).isEqualTo(150);
+        assertThat(c.fsyncBatching()).isTrue();
+        assertThat(c.maxBatch()).isEqualTo(256);
     }
 
     @Test

@@ -8,7 +8,7 @@ A Raft-based replicated key-value store in plain Java 21, built from scratch as 
 for the owner: a new grad with about 6 months of Java/Spring experience who wants to deeply understand
 consensus and end up with an interview-grade project. You act as a **senior distributed-systems mentor**.
 
-## Status (last updated 2026-11-25)
+## Status (last updated 2026-11-26)
 - **M1 Leader Election: DONE.** Gate passed: 0 Election Safety violations over 5,000 seeds × {3, 5} nodes.
 - **M2 Log Replication: DONE** (accepted by the owner 2026-11-23). 0 violations of invariants 1–5 over
   5,000 seeds × {3, 5} nodes; all mutation checks caught (rates in MILESTONES.md).
@@ -18,10 +18,24 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   The gate found a real ReadIndex bug (seed 4811: a stale-term rejection echoed a read round); fixed.
   Sessions + dedup, `ClientSession` (raft-client), ReadIndex, linearizability checker (invariant 7),
   lossy client links, three mutations caught. Gate numbers in MILESTONES.md.
-- **M5 Hardening: built and verified, NOT yet accepted or committed** (branch `m5`). PreVote + CheckQuorum
-  + stickiness (flags), gRPC transport, `raft-server` (event loop, HTTP API, metrics), `raft-cli`,
-  kill -9 integration test (6 runs, 162 kills, all linearizable), Docker compose verified by hand. Gate
-  passed with hardening on after seed 3064 (client-liveness window too tight → H6, 2 s, measured).
+- **M5 Hardening: DONE, committed `8db8b6d` on `m5` and pushed to `origin/m5` (2026-11-25), not merged to
+  `main`** (ask the owner). PreVote + CheckQuorum + stickiness (flags), gRPC transport, `raft-server`
+  (event loop, HTTP API, metrics), `raft-cli`, kill -9 integration test (6 runs, 162 kills, all
+  linearizable), Docker compose verified by hand. Gate passed with hardening on after seed 3064
+  (client-liveness window too tight → H6, 2 s, measured).
+- **M6 Benchmarks: IN PROGRESS** (branch `m6`, work-in-progress commit 2026-11-26).
+  - **Built and tested** (410 tests green):
+    - group commit (mailbox drain, one fsync per batch) in the driver, server and simulator, with the
+      SEND_BEFORE_SYNC mutation; gate passed at 5,000 seeds × 8 configurations;
+    - `raft-bench` (load, failover, matrix);
+    - `raft-dashboard` (`MainApplication`, :8090): Simulator, Blind bug test, Throughput, Failover and
+      Compare tabs;
+    - failed seeds keep their stats (`SimulationFailure.partial()`).
+  - **Not done yet:**
+    - the measurements: `./gradlew :raft-bench:run --args="matrix --repeat 3"` (~35 min, idle Mac),
+      failover with 100 kills × {3, 5} nodes, one Docker run, and the macOS fsync check (S1);
+    - the docs (BENCHMARKS.md, DESIGN/DEVIATIONS/MILESTONES/README, the EXPLANATION `# M6` section).
+  - `results/` is left uncommitted until the owner decides.
 - **Git:** history rewritten 2026-11-24 (author → "Amogh P"): M1 `a645fa8`, docs `069cc15`, M2 `ec88c75`, M3 `be439fc`. M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
   2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 

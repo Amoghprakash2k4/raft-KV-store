@@ -19,18 +19,20 @@ import java.util.Objects;
  * optional:
  *   RAFT_TICK_MS=10  RAFT_ELECTION_TICKS=15  RAFT_HEARTBEAT_TICKS=5   (election timeout 150-300 ms)
  *   RAFT_PREVOTE=true  RAFT_CHECK_QUORUM=true  RAFT_SNAPSHOT_EVERY=10000  RAFT_REQUEST_TIMEOUT_MS=3000
+ *   RAFT_FSYNC_BATCH=true  RAFT_MAX_BATCH=256   group commit: one fsync for everything waiting (M6-A)
  * </pre>
  */
 public record ServerConfig(NodeId self, Map<NodeId, InetSocketAddress> members, int peerPort, int clientPort,
                            Path dataDir, int tickMs, int electionTicks, int heartbeatTicks, boolean preVote,
-                           boolean checkQuorum, long snapshotEvery, long requestTimeoutMs) {
+                           boolean checkQuorum, long snapshotEvery, long requestTimeoutMs, boolean fsyncBatching,
+                           int maxBatch) {
 
     public ServerConfig {
         Objects.requireNonNull(self);
         members = Map.copyOf(members);
         Objects.requireNonNull(dataDir);
         if (!members.containsKey(self)) throw new IllegalArgumentException(self + " is not in RAFT_PEERS " + members);
-        if (tickMs < 1 || electionTicks < 1 || heartbeatTicks < 1 || requestTimeoutMs < 1 || snapshotEvery < 0)
+        if (tickMs < 1 || electionTicks < 1 || heartbeatTicks < 1 || requestTimeoutMs < 1 || snapshotEvery < 0 || maxBatch < 1)
             throw new IllegalArgumentException("timing settings must be positive");
     }
 
@@ -57,7 +59,9 @@ public record ServerConfig(NodeId self, Map<NodeId, InetSocketAddress> members, 
                 Boolean.parseBoolean(env.getOrDefault("RAFT_PREVOTE", "true")),
                 Boolean.parseBoolean(env.getOrDefault("RAFT_CHECK_QUORUM", "true")),
                 Long.parseLong(env.getOrDefault("RAFT_SNAPSHOT_EVERY", "10000")),
-                Long.parseLong(env.getOrDefault("RAFT_REQUEST_TIMEOUT_MS", "3000")));
+                Long.parseLong(env.getOrDefault("RAFT_REQUEST_TIMEOUT_MS", "3000")),
+                Boolean.parseBoolean(env.getOrDefault("RAFT_FSYNC_BATCH", "true")),
+                Integer.parseInt(env.getOrDefault("RAFT_MAX_BATCH", "256")));
     }
 
     /** "1=node1:7000,2=node2:7000" → {n1 → node1:7000, n2 → node2:7000}. */
