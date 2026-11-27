@@ -52,7 +52,7 @@ and the only way to really learn the hard cases (split votes, the Figure 8 commi
 middle of a disk write) is to build it and have a tool that finds your mistakes.
 
 ### "How big is it?"
-About 9,500 lines of main code and 6,900 lines of tests in 12 Gradle modules, 411 automated tests, built in 6
+About 9,500 lines of main code and 6,900 lines of tests in 11 Gradle modules, 411 automated tests, built in 6
 milestones: election, replication, durability, clients, hardening, benchmarks.
 
 ### Architecture in one picture
@@ -170,7 +170,7 @@ sequenceDiagram
     Note over L: leader + F1 = majority → committed
     L->>L: apply to the map
     L-->>C: ok (previous value)
-    F2-->>L: ok (later; still fine)
+    F2-->>L: ok (arrives later, still fine)
 ```
 
 The client gets "ok" only after a majority has the entry **on disk**. That is why an acknowledged write
