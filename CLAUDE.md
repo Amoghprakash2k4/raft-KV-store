@@ -23,8 +23,9 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   (event loop, HTTP API, metrics), `raft-cli`, kill -9 integration test (6 runs, 162 kills, all
   linearizable), Docker compose verified by hand. Gate passed with hardening on after seed 3064
   (client-liveness window too tight → H6, 2 s, measured).
-- **M6 Benchmarks: IN PROGRESS** (branch `m6`, work-in-progress commit 2026-11-26).
-  - **Built and tested** (410 tests green):
+- **M6 Benchmarks: DONE** (2026-11-27; docs written, merged to `main` and pushed at the owner's request).
+  All six milestones are built. Results: BENCHMARKS.md; decisions DESIGN M6-A..D; limits DEVIATIONS BM1–BM5.
+  - **Built and tested** (411 tests green):
     - group commit (mailbox drain, one fsync per batch) in the driver, server and simulator, with the
       SEND_BEFORE_SYNC mutation; gate passed at 5,000 seeds × 8 configurations;
     - `raft-bench` (load, failover, matrix);
@@ -38,7 +39,7 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   - **Added 2026-11-27:** `raft-bench load --attach <ports>`, dashboard **Benchmarks** tab (`benchmarks.js`,
     fixed explained report; numbers are medians from `results/`), `INTERVIEW_PREP.md`.
   - `results/`: load-* and failover-* are committed; sim-* and blind-* are git-ignored (up to 299 MB each).
-  - **Not done yet:** the docs (BENCHMARKS.md, DESIGN/DEVIATIONS S1/MILESTONES, the EXPLANATION `# M6` section).
+  - Docs done: BENCHMARKS.md, DESIGN M6, DEVIATIONS (S1 corrected, BM1–BM5), MILESTONES M6, EXPLANATION `# M6`.
 - **Git:** history rewritten 2026-11-24 (author → "Amogh P"): M1 `a645fa8`, docs `069cc15`, M2 `ec88c75`, M3 `be439fc`. M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
   2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 
@@ -101,8 +102,9 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   event-loop thread + mailbox, Micrometer/Prometheus from published `View`s; M5-E kill -9 test with 3
   JVMs + Dockerfile/compose.
 
-## Still open (ask at the named milestone)
-- **M6:** benchmarks and report: ask before choosing tools and workloads.
+## Still open
+- Nothing planned. Possible extensions (ask first): membership changes (R2), follower reads (K4), a
+  multi-machine benchmark (BM1), verifying the reads-under-load hypothesis (BM5).
 
 ## Layout
 ```
@@ -131,12 +133,19 @@ raft-sim/           com.projects.raftkv.sim        Simulation, NetworkConfig, Fa
                                                    VoteDurability, LogMatching, LeaderAppendOnly,
                                                    LeaderCompleteness, StateMachineSafety, ReplicaState,
                                                    Durability; HistoryRecorder, LinearizabilityChecker
-compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md
+raft-bench/         com.projects.raftkv.bench      BenchMain (load, failover, matrix, --attach), ProcessCluster,
+                                                   LoadRun, FailoverRun, ServerMetrics, ResultStore, RunRecord
+raft-dashboard/     com.projects.raftkv.dashboard  MainApplication (:8090), DashboardServer, Jobs, SimJob, BlindTest;
+                                                   web/ index.html, app.js, benchmarks.js, style.css, echarts
+compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md, BENCHMARKS.md,
+INTERVIEW_PREP.md, results/ (load-*/failover-* committed)
 ```
 
 ## Commands
 ```
-./gradlew build                                   # all modules, 369 tests, 300 seeds per chaos test
+./gradlew build                                   # all modules, 411 tests, 300 seeds per chaos test
+./gradlew :raft-dashboard:run                     # the dashboard on http://localhost:8090
+./gradlew :raft-bench:run --args="matrix --repeat 3"   # the benchmark matrix (~37 min, idle machine)
 ./gradlew :raft-server:integrationTest            # 3 JVMs + kill -9 loop (~40 s; -Pkill9.kills=30 ≈ 90 s)
 docker compose up -d --build                      # real 3-node cluster on :8081-8083 (Docker Desktop must run)
 ./gradlew :raft-sim:test --tests '*ChaosTest*' -Psim.seeds=5000   # milestone gate (chaos + crash loop × {3, 5})

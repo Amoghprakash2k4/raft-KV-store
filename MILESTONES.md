@@ -203,7 +203,7 @@ interview answers in EXPLANATION.md M4 §2–§3, list in DEVIATIONS.md K1–K5)
 - [x] Docs: DESIGN, DEVIATIONS, CLAUDE.md, README, EXPLANATION.md `# M4`
 - [x] Accepted by the owner 2026-11-25; committed and pushed
 
-## M5: Hardening 🟡 built and verified, waiting for the owner's acceptance (2026-11-25)
+## M5: Hardening ✅ done (accepted by the owner 2026-11-25)
 
 **Exit criterion (brief):** PreVote, CheckQuorum, gRPC transport, metrics (term, role, commitIndex,
 lastApplied, election count, replication lag, fsync latency), a CLI client, and kill -9 integration
@@ -279,4 +279,65 @@ checked by hand (EXPLANATION.md M5 §9.3).
 - [x] Gate over 5,000 seeds (seed 3064 investigated: harness window, H6)
 - [x] kill -9 integration test, Dockerfile, compose verified
 - [x] Docs: DESIGN M5, DEVIATIONS (H3, H6, R1–R4), README, CLAUDE.md, EXPLANATION.md `# M5`
-- [ ] Accepted by the owner
+- [x] Accepted by the owner
+
+## M6: Benchmarks ✅ done (2026-11-27)
+
+**Exit criterion (brief):** benchmarks of throughput, latency and failover on real processes, reported with
+method and limits.
+
+**Built:** group commit (DESIGN.md M6-A) in `NodeDriver.handleBatch`, the server's mailbox drain and the
+simulator (`withBatching`), with the `SEND_BEFORE_SYNC` mutation; `raft-bench` (`load`, `failover`, `matrix`,
+`load --attach`); `raft-dashboard` (`MainApplication`, :8090: Simulator, Blind bug test, Throughput &
+latency, Leader failover, Compare runs, Benchmarks); the TCP_NODELAY fix (M6-D); BENCHMARKS.md;
+INTERVIEW_PREP.md.
+
+**Results** (full tables: [BENCHMARKS.md](BENCHMARKS.md)):
+
+| Measurement | Result |
+|---|---|
+| Group commit, 3 nodes, 64 clients, writes only | 148 → 2,075 writes/s, p99 541 → 50 ms, 45 writes per fsync |
+| Same, 5 nodes | 119 → 1,234 writes/s |
+| Idle read / write p50 | 0.4 / 8.0 ms |
+| Failover, 100 kills: 3 nodes / 5 nodes | election p50 199 / 186 ms, p99 386 / 247 ms |
+| Docker, 64 clients, after the fix | 4,655 writes/s (before: 1,396; 1 client 20 → 543) |
+| macOS fsync probe | `force(true)` 2.96 ms = `F_FULLFSYNC` 2.97 ms (plain fsync 0.03 ms): S1 corrected |
+| Matrix | 96 runs, 0 timeouts, spread mostly ≤ 15%, worst 39% |
+
+**Mutations:**
+
+| Mutation | Config, seeds | Caught by |
+|---|---|---|
+| SEND_BEFORE_SYNC | crash loop + batching, 3 nodes, 100 | 78 (Durability 74, Election Safety 4) |
+| SEND_BEFORE_SYNC, durability checkers off | same, 300 | 97 (Leader Completeness 75, Election Safety 22) |
+| Control (crash loop + batching) | 100 | no violations |
+
+**Gate:**
+
+5,000 seeds × {3, 5} nodes × {chaos, crash loop} × group commit {off, on} = **40,000 runs, 0 violations** of
+invariants 1–7, vote durability, replica state, commit and client liveness (re-run 2026-11-27, 7 min 40 s;
+hardening on).
+
+| Config | Elections | Max term | Crashes (mid-write) | Client ops | Avg / max batch |
+|---|---|---|---|---|---|
+| chaos, 3 | 32,792 | 18 | 41,813 (18,739) | 2,717,114 | – |
+| chaos, 5 | 32,118 | 20 | 45,214 (21,717) | 3,617,108 | – |
+| chaos + group commit, 3 | 32,600 | 16 | 41,810 (18,754) | 2,483,407 | 1.56 / 163 |
+| chaos + group commit, 5 | 32,120 | 20 | 45,131 (21,649) | 3,336,814 | 1.71 / 170 |
+| crash loop, 3 | 42,240 | 25 | 255,991 (93,011) | 1,585,290 | – |
+| crash loop, 5 | 61,617 | 32 | 300,777 (135,155) | 2,449,733 | – |
+| crash loop + group commit, 3 | 39,894 | 25 | 255,130 (91,920) | 1,426,608 | 1.45 / 165 |
+| crash loop + group commit, 5 | 59,840 | 33 | 301,089 (134,870) | 2,212,253 | 1.59 / 161 |
+
+`./gradlew build`: 411 tests, green. `./gradlew :raft-server:integrationTest`: 12 kills (9 of the leader),
+9,034 operations, linearizable (2026-11-27).
+
+### Checklist
+- [x] Group commit: unit tests first (`NodeDriverBatchTest`), driver, server, simulator
+- [x] `SEND_BEFORE_SYNC` mutation caught; control clean
+- [x] Gate over 5,000 seeds × 8 configurations (with and without batching)
+- [x] `raft-bench` + tests; `raft-dashboard` + tests; blind bug test
+- [x] Matrix (3 repeats), failover (100 kills × {3, 5}), Docker run, macOS fsync probe
+- [x] Docker benchmark finding fixed (TCP_NODELAY), pinned by a test
+- [x] Docs: BENCHMARKS.md, DESIGN M6, DEVIATIONS (S1 corrected, BM1–BM5), README, CLAUDE.md,
+      EXPLANATION.md `# M6`, INTERVIEW_PREP.md

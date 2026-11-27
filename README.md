@@ -36,8 +36,8 @@ flowchart TB
 | M2 | Log replication, KV state machine, fast log backup | done |
 | M3 | Write-ahead log, crash recovery, snapshots, InstallSnapshot | done |
 | M4 | Client sessions (exactly-once writes), ReadIndex reads, linearizability checker | done |
-| M5 | PreVote, CheckQuorum, gRPC, real server, HTTP API + CLI, Prometheus metrics, kill -9 tests, Docker | built, awaiting acceptance |
-| M6 | Benchmarks and report | later |
+| M5 | PreVote, CheckQuorum, gRPC, real server, HTTP API + CLI, Prometheus metrics, kill -9 tests, Docker | done |
+| M6 | Group commit, benchmarks ([BENCHMARKS.md](BENCHMARKS.md)), the localhost dashboard | done |
 
 Each milestone ends with a gate of 5,000 seeds × {3, 5} nodes × {chaos, crash loop} with zero
 violations, plus deliberately injected bugs ("mutations") that the checkers must catch. Numbers are in
@@ -94,6 +94,7 @@ ms); leader failover p50 199 ms, p99 386 ms over 100 `kill -9`s.
 ## Documents
 
 - [INTERVIEW_PREP.md](INTERVIEW_PREP.md): likely interview questions with plain-language answers, bug stories, demo script
+- [BENCHMARKS.md](BENCHMARKS.md): throughput, latency, failover and Docker numbers, with method and limits
 - [EXPLANATION.md](EXPLANATION.md): learning notes for every milestone, with diagrams and study questions
 - [DESIGN.md](DESIGN.md): decisions and rejected alternatives
 - [DEVIATIONS.md](DEVIATIONS.md): every shortcut, and what was skipped on purpose

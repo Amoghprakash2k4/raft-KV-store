@@ -369,3 +369,92 @@ After a quiet period it checks the history with the simulator's `Linearizability
 node applied up to the leader's commit index. `raft-server/Dockerfile` builds the distribution in a JDK
 stage and runs it on a JRE; `compose.yaml` starts three nodes with named volumes;
 `docker compose kill nodeN` is a SIGKILL.
+
+## M6. Benchmark decisions (approved 2026-11-25)
+
+Measured results, with charts and caveats: [BENCHMARKS.md](BENCHMARKS.md) and the dashboard's
+**Benchmarks** tab.
+
+### M6-A. Group commit: drain the mailbox, one fsync per batch (etcd's Ready batching)
+
+```mermaid
+sequenceDiagram
+    participant MB as mailbox
+    participant D as NodeDriver.handleBatch
+    participant W as WAL (disk)
+    participant T as transport
+    MB->>D: take one event, then drain everything waiting (≤ 256)
+    loop each event, in order
+        D->>D: core.step(event) → Ready
+        D->>W: write its persist ops (no fsync yet)
+    end
+    D->>W: ONE fsync for the whole batch
+    D->>T: send every message of every Ready
+    D->>D: apply, answer clients, serve reads (event order)
+```
+
+- **Rule E1 still holds per event:** nothing a step produced leaves the node before an fsync that covers
+  its persist ops. Stepping event k+1 before event k is synced is safe because the core never reads
+  storage (D1): it already assumed its own writes would be durable.
+- **No timer.** The server never waits for a batch to fill; it takes whatever arrived while the previous
+  fsync ran. One client sees the same latency as without batching; under load the batch grows by itself
+  (1.2 events per fsync at 1 client, 45 at 64).
+- **Server:** `RAFT_FSYNC_BATCH=true` (default), `RAFT_MAX_BATCH=256`. **Simulator:**
+  `SimConfig.withBatching(ms)` holds a node's events in an inbox for up to `ms`, then hands them over as
+  one batch, so crashes land inside batched fsyncs. The gate runs every fault mix with and without it.
+- **Mutation `SEND_BEFORE_SYNC`:** messages leave as each event is stepped, before the batch's fsync.
+  A crash inside that fsync then loses votes and entries other nodes already counted. Caught in 78/100
+  seeds (crash loop + batching; Durability 74, Election Safety 4), and in 97/300 with the durability
+  checkers off (Leader Completeness 75, Election Safety 22), so its real consequences are visible too.
+  The control (same config, no mutation) is clean.
+
+**Rejected:** a time window on the server (adds latency at low load for no gain; a drained mailbox is
+already the natural batch); fsync on a separate thread with the leader sending in parallel (thesis
+§10.2.1; faster, but changes the E1 ordering that every checker relies on, too large for the last
+milestone).
+
+### M6-B. `raft-bench`: real processes, closed-loop clients, medians of repeats
+- `ProcessCluster` starts 3 or 5 `raft-server` JVMs on localhost (own ports, own data directory),
+  SIGKILLs and restarts them, and polls `/status`. `ProcessCluster.attach(ports)` uses an
+  already-running cluster instead (`raft-bench load --attach 8081,8082,8083` for docker compose).
+- `LoadRun`: N closed-loop clients, each a real `HttpClusterClient` (sessions, redirects, retries), 1,000
+  keys, 100-byte values, warm-up then measured window. Latency is measured at the client, retries
+  included, in HdrHistogram. Server-side numbers (fsync time, events per fsync) come from the leader's
+  `/metrics` after the run.
+- `FailoverRun`: SIGKILL the leader N times while a probe client writes. **Election** = kill → another
+  node reports leader in a newer term (5 ms polling). **Client gap** = the longest pause between two
+  completed probe writes around the kill (not "kill → next success", which a write committed just before
+  the kill would hide).
+- `matrix`: nodes {3, 5} × group commit {off, on} × writes {100%, 50%} × clients {1, 4, 16, 64}, 3 repeats
+  of 15 s each, reported as medians. `ResultStore` saves every run as JSON in `results/` with the git
+  commit and machine.
+
+**Rejected:** JMH (measures code in one JVM, not a cluster); open-loop load generation (needs a
+coordinated-omission-aware setup; closed loop is simpler and Little's law checks it); an external tool
+such as YCSB (would need a client binding; ours reuses the tested client).
+
+### M6-C. `raft-dashboard`: a localhost lab (`MainApplication`, :8090)
+JDK `HttpServer` + plain HTML/JS + vendored ECharts, no build step, one job at a time. Tabs: **Simulator**
+(seeds, fault mix, toggles, a planted bug, per-seed drawer), **Blind bug test**, **Throughput & latency**
+and **Leader failover** (run `raft-bench` live), **Compare runs** (any saved runs on one chart; series
+keep Docker and local runs apart), **Benchmarks** (a fixed, explained report of the M6 numbers,
+`benchmarks.js`).
+
+**Blind bug test** (`BlindTest`): the user picks bugs and a count for each. They are dealt to random seeds
+(shuffled by a plan seed) among clean ones, each bugged seed running under that bug's own fault profile
+(or one fixed setting for all). The plan stays hidden until the end; then a confusion matrix (caught,
+missed, false alarm, clean pass), per-bug detection, which checker caught what, and every seed's stats.
+A failed seed keeps its stats up to the failure (`SimulationFailure.partial()`). **The number that
+matters is false alarms (always 0 so far).** A miss means that seed's faults never reached the situation
+the bug breaks.
+
+**Rejected:** Spring Boot / a JS framework (a heavy dependency for one page); a static report only (the
+owner wanted to explore runs interactively).
+
+### M6-D. TCP_NODELAY on the client API (a bug the Docker benchmark found)
+The JDK `HttpServer` writes a response's headers and body separately. With Nagle's algorithm the body waits
+for the headers' ACK, and Linux delays that ACK by up to 40 ms, so every request on a kept-alive connection
+took about 42 ms on Docker (20 ops/s for one client). macOS loopback never showed it. `ClientApi` sets
+`sun.net.httpserver.nodelay=true` before the server classes load (a `-D` on the command line wins);
+`ClientApiNoDelayTest` pins it. Docker: 20 → 543 ops/s at 1 client, 1,396 → 4,655 at 64. Local numbers
+unchanged (re-measured: 142 vs 149 and 2,140 vs 2,075 ops/s, within the spread).
