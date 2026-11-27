@@ -2662,7 +2662,7 @@ sequenceDiagram
     participant L2 as new leader
     Note over L1: takes a lease until t=100<br/>then a GC pause freezes it
     Note over L2: elected at t=150, commits PUT x=2
-    Note over L1: resumes; its clock wrongly says t=90<br/>"my lease is still valid"
+    Note over L1: resumes, its clock wrongly says t=90<br/>"my lease is still valid"
     C->>L1: GET x
     L1-->>C: x=1   ✗ stale: x=2 had already committed
 ```
