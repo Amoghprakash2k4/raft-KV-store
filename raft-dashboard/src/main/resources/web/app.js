@@ -44,7 +44,9 @@ function chart(el, option) {
   const axis = a => a && ({ ...a, axisLine: { lineStyle: { color: c.border } }, axisLabel: { color: c.muted, ...(a.axisLabel || {}) },
     splitLine: { lineStyle: { color: c.border, type: 'dashed' } }, nameTextStyle: { color: c.muted }, nameGap: a.nameGap ?? 30 });
   const fix = o => Array.isArray(o) ? o.map(axis) : axis(o);
-  inst.setOption({ ...base, ...option, xAxis: fix(option.xAxis), yAxis: fix(option.yAxis) }, true);
+  // legend/tooltip are merged, not replaced: a chart that only sets legend.data must keep the theme colours.
+  inst.setOption({ ...base, ...option, legend: { ...base.legend, ...(option.legend || {}) },
+    tooltip: { ...base.tooltip, ...(option.tooltip || {}) }, xAxis: fix(option.xAxis), yAxis: fix(option.yAxis) }, true);
   return inst;
 }
 function disposeIn(root) { for (const [el, inst] of charts) if (root.contains(el)) { inst.dispose(); charts.delete(el); } }
@@ -832,7 +834,9 @@ function compareLoad(root, sel) {
   const groups = new Map();
   for (const r of sel) {
     const s = r.settings;
-    const key = `${s.nodes} nodes · batching ${s.fsyncBatching ? 'on' : 'off'}${s.writePercent === 100 ? '' : ` · ${s.writePercent}% writes`}`;
+    // Where it ran is part of the series: a Docker run must never be averaged with a local-JVM run.
+    const env = (r.label.match(/\(([^)]+)\)\s*$/) || [])[1];
+    const key = `${s.nodes} nodes · batching ${s.fsyncBatching ? 'on' : 'off'}${s.writePercent === 100 ? '' : ` · ${s.writePercent}% writes`}${env ? ` · ${env}` : ''}`;
     if (!groups.has(key)) groups.set(key, new Map());
     const byClients = groups.get(key);
     if (!byClients.has(s.clients)) byClients.set(s.clients, []);
@@ -845,13 +849,14 @@ function compareLoad(root, sel) {
     root.appendChild(el);
     chart($('.chart', el), {
       tooltip: { trigger: 'axis', valueFormatter: v => v == null ? '–' : `${fmt(v, unit === 'ms' ? 2 : 0)} ${unit}` },
-      legend: { data: keys },
+      legend: { data: keys, type: 'scroll' },
       grid: { left: 64, right: 24, top: 48, bottom: 44 },
       xAxis: { type: 'category', data: clients, name: 'concurrent clients', nameLocation: 'middle' },
       yAxis: { type: 'value', name: unit },
       series: keys.map((k, i) => ({ name: k, type: 'line', symbolSize: 8, smooth: false, connectNulls: true,
         lineStyle: { width: 2.5, type: k.includes('batching off') ? 'dashed' : 'solid' }, itemStyle: { color: SERIES[i % SERIES.length] },
-        label: { show: true, position: 'top', fontSize: 10, color: C().muted, formatter: p => fmt(p.value, unit === 'ms' ? 1 : 0) },
+        // Point labels only while they can't pile up; the tooltip has every value.
+        label: { show: keys.length <= 3, position: 'top', fontSize: 10, color: C().muted, formatter: p => fmt(p.value, unit === 'ms' ? 1 : 0) },
         data: clients.map(cl => { const hs = groups.get(k).get(cl); return hs ? median(hs.map(pickFn)) : null; }) })),
     });
   };
@@ -865,14 +870,14 @@ function compareLoad(root, sel) {
   chart($('.chart', bar), {
     tooltip: { trigger: 'axis' }, legend: { data: ['ops/s', 'p99 ms'] },
     grid: { left: 64, right: 64, top: 36, bottom: 110 },
-    xAxis: { type: 'category', data: sel.map(r => r.label), axisLabel: { rotate: 30, fontSize: 10, interval: 0, width: 160, overflow: 'truncate' } },
+    xAxis: { type: 'category', data: sel.map(r => r.label), axisLabel: { rotate: 30, fontSize: 10, interval: sel.length <= 16 ? 0 : 'auto', width: 160, overflow: 'truncate' } },
     yAxis: [{ type: 'value', name: 'ops/s' }, { type: 'value', name: 'p99 ms', splitLine: { show: false } }],
     series: [{ name: 'ops/s', type: 'bar', data: sel.map(r => r.headline.opsPerSec), itemStyle: { color: SERIES[0], borderRadius: [4, 4, 0, 0] },
-               label: { show: true, position: 'top', fontSize: 10, color: C().muted, formatter: p => fmt(p.value) } },
+               label: { show: sel.length <= 16, position: 'top', fontSize: 10, color: C().muted, formatter: p => fmt(p.value) } },
              { name: 'p99 ms', type: 'scatter', yAxisIndex: 1, symbolSize: 10, data: sel.map(r => r.headline.writeP99 || r.headline.readP99), itemStyle: { color: SERIES[1] } }],
   });
   root.insertAdjacentHTML('beforeend', `<div class="card"><h3>Numbers</h3><div class="tablewrap"><table class="data"><thead><tr><th>Run</th><th>ops/s</th><th>write p50</th><th>write p99</th><th>read p50</th><th>read p99</th><th>fsync mean</th><th>events / fsync</th></tr></thead>
-    <tbody>${sel.map(r => { const h = r.headline; return `<tr><td>${esc(r.label)}</td><td>${fmt(h.opsPerSec)}</td><td>${ms(h.writeP50)}</td><td>${ms(h.writeP99)}</td><td>${ms(h.readP50)}</td><td>${ms(h.readP99)}</td><td>${ms(h.fsyncMeanMs)}</td><td>${fmt(h.batchMean, 1)}</td></tr>`; }).join('')}</tbody></table></div></div>`);
+    <tbody>${sel.map(r => { const h = r.headline; const m = v => v ? ms(v) : '–'; return `<tr><td>${esc(r.label)}</td><td>${fmt(h.opsPerSec)}</td><td>${m(h.writeP50)}</td><td>${m(h.writeP99)}</td><td>${m(h.readP50)}</td><td>${m(h.readP99)}</td><td>${ms(h.fsyncMeanMs)}</td><td>${fmt(h.batchMean, 1)}</td></tr>`; }).join('')}</tbody></table></div></div>`);
 }
 
 function compareFailover(root, sel) {

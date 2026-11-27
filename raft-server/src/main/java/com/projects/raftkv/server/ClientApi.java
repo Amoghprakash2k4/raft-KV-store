@@ -50,6 +50,20 @@ import java.util.concurrent.TimeoutException;
 public final class ClientApi implements AutoCloseable {
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /**
+     * TCP_NODELAY on client connections. The JDK server writes a response's headers and body separately.
+     * With Nagle's algorithm the body waits for the headers' ACK, and a Linux peer delays that ACK by up to
+     * 40 ms, so every request on a kept-alive connection stalled about 40 ms. Measured through Docker in M6:
+     * 42 ms → 1.1–1.8 ms per request, and 20 → several hundred ops/s for one client (BENCHMARKS.md).
+     * macOS loopback never showed it. The JDK reads this property once, when its HTTP server classes load,
+     * so it is set before the first {@link HttpServer#create}. An explicit -D on the command line wins.
+     */
+    static final String NODELAY = "sun.net.httpserver.nodelay";
+
+    static {
+        if (System.getProperty(NODELAY) == null) System.setProperty(NODELAY, "true");
+    }
+
     private final RaftServer node;
     private final HttpServer http;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();

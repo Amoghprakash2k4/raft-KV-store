@@ -1,0 +1,92 @@
+{
+  "id" : "load-20261126-001344-224",
+  "kind" : "load",
+  "label" : "3 nodes, 16 clients, writes, batching on",
+  "createdAt" : "2026-11-26T00:13:44.224530",
+  "gitCommit" : "8db8b6d-dirty",
+  "machine" : {
+    "os" : "Mac OS X 27.2.1 aarch64",
+    "cpus" : "11",
+    "java" : "21.0.11"
+  },
+  "settings" : {
+    "nodes" : 3,
+    "fsyncBatching" : true,
+    "clients" : 16,
+    "writePercent" : 100,
+    "keys" : 1000,
+    "valueBytes" : 100,
+    "warmupSec" : 1,
+    "durationSec" : 5
+  },
+  "result" : {
+    "spec" : {
+      "nodes" : 3,
+      "fsyncBatching" : true,
+      "clients" : 16,
+      "writePercent" : 100,
+      "keys" : 1000,
+      "valueBytes" : 100,
+      "warmupSec" : 1,
+      "durationSec" : 5
+    },
+    "opsPerSec" : 569.0,
+    "writesPerSec" : 569.0,
+    "readsPerSec" : 0.0,
+    "ops" : 2845,
+    "timeouts" : 0,
+    "writes" : {
+      "count" : 2845,
+      "meanMs" : 28.173,
+      "p50Ms" : 28.047,
+      "p90Ms" : 35.551,
+      "p99Ms" : 43.007,
+      "p999Ms" : 45.375,
+      "maxMs" : 45.439,
+      "distribution" : [ [ 13.551, 19.0 ], [ 16.939, 56.0 ], [ 21.174, 243.0 ], [ 26.468, 688.0 ], [ 33.086, 1349.0 ], [ 41.358, 454.0 ], [ 51.697, 36.0 ] ]
+    },
+    "reads" : {
+      "count" : 0,
+      "meanMs" : 0.0,
+      "p50Ms" : 0.0,
+      "p90Ms" : 0.0,
+      "p99Ms" : 0.0,
+      "p999Ms" : 0.0,
+      "maxMs" : 0.0,
+      "distribution" : [ ]
+    },
+    "perSecond" : [ {
+      "second" : 1,
+      "ops" : 546,
+      "p50Ms" : 28.495,
+      "p99Ms" : 43.551
+    }, {
+      "second" : 2,
+      "ops" : 585,
+      "p50Ms" : 27.855,
+      "p99Ms" : 39.167
+    }, {
+      "second" : 3,
+      "ops" : 550,
+      "p50Ms" : 28.031,
+      "p99Ms" : 43.839
+    }, {
+      "second" : 4,
+      "ops" : 591,
+      "p50Ms" : 27.599,
+      "p99Ms" : 38.239
+    }, {
+      "second" : 5,
+      "ops" : 557,
+      "p50Ms" : 29.471,
+      "p99Ms" : 38.591
+    } ],
+    "server" : {
+      "fsyncs" : 806,
+      "fsyncMeanMs" : 5.109,
+      "fsyncP99Ms" : 9.787,
+      "batchMean" : 10.768,
+      "batchP99" : 37.9375
+    }
+  }
+}

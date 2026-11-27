@@ -1,0 +1,745 @@
+{
+  "id" : "failover-20261127-143542-173",
+  "kind" : "failover",
+  "label" : "3 nodes, 100 leader kills, batching on",
+  "createdAt" : "2026-11-27T14:35:42.173401",
+  "gitCommit" : "7c9e13e",
+  "machine" : {
+    "os" : "Mac OS X 27.2.1 aarch64",
+    "cpus" : "11",
+    "java" : "25.0.3"
+  },
+  "settings" : {
+    "nodes" : 3,
+    "fsyncBatching" : true,
+    "kills" : 100
+  },
+  "result" : {
+    "spec" : {
+      "nodes" : 3,
+      "fsyncBatching" : true,
+      "kills" : 100
+    },
+    "kills" : [ {
+      "n" : 1,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 3,
+      "electionMs" : 408.864,
+      "clientGapMs" : 410.317
+    }, {
+      "n" : 2,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 4,
+      "electionMs" : 239.56,
+      "clientGapMs" : 242.913
+    }, {
+      "n" : 3,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 5,
+      "electionMs" : 168.459,
+      "clientGapMs" : 172.95
+    }, {
+      "n" : 4,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 6,
+      "electionMs" : 211.686,
+      "clientGapMs" : 224.286
+    }, {
+      "n" : 5,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 7,
+      "electionMs" : 198.218,
+      "clientGapMs" : 211.59
+    }, {
+      "n" : 6,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 8,
+      "electionMs" : 164.831,
+      "clientGapMs" : 176.201
+    }, {
+      "n" : 7,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 9,
+      "electionMs" : 212.42,
+      "clientGapMs" : 219.063
+    }, {
+      "n" : 8,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 10,
+      "electionMs" : 208.729,
+      "clientGapMs" : 228.716
+    }, {
+      "n" : 9,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 11,
+      "electionMs" : 178.375,
+      "clientGapMs" : 191.108
+    }, {
+      "n" : 10,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 12,
+      "electionMs" : 187.293,
+      "clientGapMs" : 198.985
+    }, {
+      "n" : 11,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 13,
+      "electionMs" : 207.187,
+      "clientGapMs" : 207.758
+    }, {
+      "n" : 12,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 14,
+      "electionMs" : 183.188,
+      "clientGapMs" : 192.295
+    }, {
+      "n" : 13,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 15,
+      "electionMs" : 203.258,
+      "clientGapMs" : 213.96
+    }, {
+      "n" : 14,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 16,
+      "electionMs" : 209.403,
+      "clientGapMs" : 220.946
+    }, {
+      "n" : 15,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 17,
+      "electionMs" : 286.244,
+      "clientGapMs" : 297.98
+    }, {
+      "n" : 16,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 18,
+      "electionMs" : 158.517,
+      "clientGapMs" : 170.859
+    }, {
+      "n" : 17,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 19,
+      "electionMs" : 164.987,
+      "clientGapMs" : 172.299
+    }, {
+      "n" : 18,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 20,
+      "electionMs" : 276.9,
+      "clientGapMs" : 290.451
+    }, {
+      "n" : 19,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 21,
+      "electionMs" : 184.029,
+      "clientGapMs" : 196.532
+    }, {
+      "n" : 20,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 22,
+      "electionMs" : 227.106,
+      "clientGapMs" : 233.793
+    }, {
+      "n" : 21,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 23,
+      "electionMs" : 241.53,
+      "clientGapMs" : 256.966
+    }, {
+      "n" : 22,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 24,
+      "electionMs" : 285.065,
+      "clientGapMs" : 296.244
+    }, {
+      "n" : 23,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 25,
+      "electionMs" : 225.754,
+      "clientGapMs" : 239.46
+    }, {
+      "n" : 24,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 26,
+      "electionMs" : 248.249,
+      "clientGapMs" : 266.349
+    }, {
+      "n" : 25,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 27,
+      "electionMs" : 157.758,
+      "clientGapMs" : 166.987
+    }, {
+      "n" : 26,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 28,
+      "electionMs" : 218.51,
+      "clientGapMs" : 229.972
+    }, {
+      "n" : 27,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 29,
+      "electionMs" : 158.841,
+      "clientGapMs" : 166.368
+    }, {
+      "n" : 28,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 30,
+      "electionMs" : 220.689,
+      "clientGapMs" : 223.31
+    }, {
+      "n" : 29,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 31,
+      "electionMs" : 188.681,
+      "clientGapMs" : 196.978
+    }, {
+      "n" : 30,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 32,
+      "electionMs" : 194.427,
+      "clientGapMs" : 199.43
+    }, {
+      "n" : 31,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 33,
+      "electionMs" : 265.56,
+      "clientGapMs" : 270.439
+    }, {
+      "n" : 32,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 34,
+      "electionMs" : 169.264,
+      "clientGapMs" : 175.779
+    }, {
+      "n" : 33,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 35,
+      "electionMs" : 225.009,
+      "clientGapMs" : 235.174
+    }, {
+      "n" : 34,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 36,
+      "electionMs" : 158.389,
+      "clientGapMs" : 167.014
+    }, {
+      "n" : 35,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 37,
+      "electionMs" : 279.471,
+      "clientGapMs" : 285.487
+    }, {
+      "n" : 36,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 39,
+      "electionMs" : 373.005,
+      "clientGapMs" : 387.997
+    }, {
+      "n" : 37,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 40,
+      "electionMs" : 207.799,
+      "clientGapMs" : 213.12
+    }, {
+      "n" : 38,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 42,
+      "electionMs" : 385.79,
+      "clientGapMs" : 399.119
+    }, {
+      "n" : 39,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 43,
+      "electionMs" : 226.255,
+      "clientGapMs" : 233.148
+    }, {
+      "n" : 40,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 44,
+      "electionMs" : 196.371,
+      "clientGapMs" : 207.041
+    }, {
+      "n" : 41,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 45,
+      "electionMs" : 155.169,
+      "clientGapMs" : 163.773
+    }, {
+      "n" : 42,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 46,
+      "electionMs" : 159.132,
+      "clientGapMs" : 169.744
+    }, {
+      "n" : 43,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 47,
+      "electionMs" : 182.291,
+      "clientGapMs" : 185.781
+    }, {
+      "n" : 44,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 48,
+      "electionMs" : 162.865,
+      "clientGapMs" : 170.946
+    }, {
+      "n" : 45,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 49,
+      "electionMs" : 268.758,
+      "clientGapMs" : 281.724
+    }, {
+      "n" : 46,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 50,
+      "electionMs" : 188.776,
+      "clientGapMs" : 194.081
+    }, {
+      "n" : 47,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 51,
+      "electionMs" : 175.793,
+      "clientGapMs" : 177.182
+    }, {
+      "n" : 48,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 52,
+      "electionMs" : 223.709,
+      "clientGapMs" : 229.375
+    }, {
+      "n" : 49,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 53,
+      "electionMs" : 225.359,
+      "clientGapMs" : 239.5
+    }, {
+      "n" : 50,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 54,
+      "electionMs" : 198.87,
+      "clientGapMs" : 206.894
+    }, {
+      "n" : 51,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 55,
+      "electionMs" : 232.892,
+      "clientGapMs" : 243.381
+    }, {
+      "n" : 52,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 56,
+      "electionMs" : 190.606,
+      "clientGapMs" : 202.34
+    }, {
+      "n" : 53,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 57,
+      "electionMs" : 198.965,
+      "clientGapMs" : 206.862
+    }, {
+      "n" : 54,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 58,
+      "electionMs" : 270.963,
+      "clientGapMs" : 280.867
+    }, {
+      "n" : 55,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 59,
+      "electionMs" : 203.079,
+      "clientGapMs" : 214.112
+    }, {
+      "n" : 56,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 60,
+      "electionMs" : 198.178,
+      "clientGapMs" : 211.297
+    }, {
+      "n" : 57,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 61,
+      "electionMs" : 213.263,
+      "clientGapMs" : 222.639
+    }, {
+      "n" : 58,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 62,
+      "electionMs" : 178.114,
+      "clientGapMs" : 184.166
+    }, {
+      "n" : 59,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 63,
+      "electionMs" : 210.194,
+      "clientGapMs" : 220.398
+    }, {
+      "n" : 60,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 64,
+      "electionMs" : 176.198,
+      "clientGapMs" : 189.16
+    }, {
+      "n" : 61,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 65,
+      "electionMs" : 159.758,
+      "clientGapMs" : 171.334
+    }, {
+      "n" : 62,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 66,
+      "electionMs" : 233.066,
+      "clientGapMs" : 237.753
+    }, {
+      "n" : 63,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 67,
+      "electionMs" : 253.34,
+      "clientGapMs" : 257.624
+    }, {
+      "n" : 64,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 68,
+      "electionMs" : 237.739,
+      "clientGapMs" : 249.275
+    }, {
+      "n" : 65,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 69,
+      "electionMs" : 212.242,
+      "clientGapMs" : 223.304
+    }, {
+      "n" : 66,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 70,
+      "electionMs" : 171.032,
+      "clientGapMs" : 181.352
+    }, {
+      "n" : 67,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 71,
+      "electionMs" : 230.307,
+      "clientGapMs" : 235.685
+    }, {
+      "n" : 68,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 72,
+      "electionMs" : 174.686,
+      "clientGapMs" : 184.669
+    }, {
+      "n" : 69,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 73,
+      "electionMs" : 176.664,
+      "clientGapMs" : 182.167
+    }, {
+      "n" : 70,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 74,
+      "electionMs" : 227.866,
+      "clientGapMs" : 234.809
+    }, {
+      "n" : 71,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 75,
+      "electionMs" : 237.492,
+      "clientGapMs" : 242.474
+    }, {
+      "n" : 72,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 76,
+      "electionMs" : 184.876,
+      "clientGapMs" : 191.204
+    }, {
+      "n" : 73,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 77,
+      "electionMs" : 188.827,
+      "clientGapMs" : 193.685
+    }, {
+      "n" : 74,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 78,
+      "electionMs" : 277.493,
+      "clientGapMs" : 284.141
+    }, {
+      "n" : 75,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 79,
+      "electionMs" : 169.337,
+      "clientGapMs" : 178.183
+    }, {
+      "n" : 76,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 80,
+      "electionMs" : 158.128,
+      "clientGapMs" : 165.814
+    }, {
+      "n" : 77,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 81,
+      "electionMs" : 159.766,
+      "clientGapMs" : 165.881
+    }, {
+      "n" : 78,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 82,
+      "electionMs" : 210.455,
+      "clientGapMs" : 219.522
+    }, {
+      "n" : 79,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 83,
+      "electionMs" : 163.462,
+      "clientGapMs" : 173.283
+    }, {
+      "n" : 80,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 84,
+      "electionMs" : 224.807,
+      "clientGapMs" : 238.314
+    }, {
+      "n" : 81,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 85,
+      "electionMs" : 231.626,
+      "clientGapMs" : 236.825
+    }, {
+      "n" : 82,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 86,
+      "electionMs" : 156.584,
+      "clientGapMs" : 169.654
+    }, {
+      "n" : 83,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 87,
+      "electionMs" : 174.748,
+      "clientGapMs" : 178.305
+    }, {
+      "n" : 84,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 88,
+      "electionMs" : 190.616,
+      "clientGapMs" : 203.265
+    }, {
+      "n" : 85,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 89,
+      "electionMs" : 187.074,
+      "clientGapMs" : 197.089
+    }, {
+      "n" : 86,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 90,
+      "electionMs" : 194.587,
+      "clientGapMs" : 207.225
+    }, {
+      "n" : 87,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 91,
+      "electionMs" : 165.219,
+      "clientGapMs" : 167.895
+    }, {
+      "n" : 88,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 92,
+      "electionMs" : 183.664,
+      "clientGapMs" : 196.025
+    }, {
+      "n" : 89,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 93,
+      "electionMs" : 242.264,
+      "clientGapMs" : 254.907
+    }, {
+      "n" : 90,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 94,
+      "electionMs" : 192.088,
+      "clientGapMs" : 344.089
+    }, {
+      "n" : 91,
+      "oldLeader" : 3,
+      "newLeader" : 2,
+      "newTerm" : 95,
+      "electionMs" : 227.848,
+      "clientGapMs" : 238.414
+    }, {
+      "n" : 92,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 96,
+      "electionMs" : 178.983,
+      "clientGapMs" : 192.823
+    }, {
+      "n" : 93,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 97,
+      "electionMs" : 167.315,
+      "clientGapMs" : 182.394
+    }, {
+      "n" : 94,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 98,
+      "electionMs" : 198.597,
+      "clientGapMs" : 208.825
+    }, {
+      "n" : 95,
+      "oldLeader" : 2,
+      "newLeader" : 1,
+      "newTerm" : 99,
+      "electionMs" : 248.673,
+      "clientGapMs" : 259.089
+    }, {
+      "n" : 96,
+      "oldLeader" : 1,
+      "newLeader" : 3,
+      "newTerm" : 100,
+      "electionMs" : 218.738,
+      "clientGapMs" : 220.553
+    }, {
+      "n" : 97,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 101,
+      "electionMs" : 205.356,
+      "clientGapMs" : 212.21
+    }, {
+      "n" : 98,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 102,
+      "electionMs" : 203.218,
+      "clientGapMs" : 218.318
+    }, {
+      "n" : 99,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 103,
+      "electionMs" : 180.999,
+      "clientGapMs" : 191.596
+    }, {
+      "n" : 100,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 104,
+      "electionMs" : 235.93,
+      "clientGapMs" : 247.978
+    } ],
+    "election" : {
+      "count" : 100,
+      "meanMs" : 209.548,
+      "p50Ms" : 199.039,
+      "p90Ms" : 265.727,
+      "p99Ms" : 385.791,
+      "p999Ms" : 409.087,
+      "maxMs" : 409.087,
+      "distribution" : [ [ 157.771, 3.0 ], [ 197.214, 42.0 ], [ 246.518, 41.0 ], [ 308.147, 11.0 ], [ 385.184, 1.0 ], [ 481.481, 2.0 ] ]
+    },
+    "clientGap" : {
+      "count" : 100,
+      "meanMs" : 220.218,
+      "p50Ms" : 211.711,
+      "p90Ms" : 281.087,
+      "p99Ms" : 399.359,
+      "p999Ms" : 410.367,
+      "maxMs" : 410.367,
+      "distribution" : [ [ 197.214, 38.0 ], [ 246.518, 43.0 ], [ 308.147, 15.0 ], [ 385.184, 1.0 ], [ 481.481, 3.0 ] ]
+    }
+  }
+}

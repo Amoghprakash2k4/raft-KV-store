@@ -24,3 +24,8 @@ bin/
 
 # Local runtime data (WAL segments, snapshots from manual runs)
 data/
+
+# Dashboard results: benchmark runs (load-*, failover-*) are committed as evidence for the Benchmarks tab.
+# Simulator and blind-test runs can be hundreds of MB and re-run from their seed in seconds, so they stay local.
+results/sim-*.json
+results/blind-*.json

@@ -22,6 +22,7 @@
     <button role="tab" data-tab="load">Throughput &amp; latency</button>
     <button role="tab" data-tab="failover">Leader failover</button>
     <button role="tab" data-tab="compare">Compare runs</button>
+    <button role="tab" data-tab="bench">Benchmarks</button>
   </nav>
   <div id="jobPill" class="pill idle">idle</div>
 </header>
@@ -188,6 +189,11 @@
       <div class="empty">Tick two or more runs on the left.</div>
     </div>
   </section>
+
+  <!-- ============================================================ BENCHMARKS (fixed report, benchmarks.js) -->
+  <section id="tab-bench" class="tab wide">
+    <div class="results" id="bench-results"></div>
+  </section>
 </main>
 
 <div class="drawer" id="drawer" hidden>
@@ -198,5 +204,6 @@
 </div>
 
 <script src="app.js"></script>
+<script src="benchmarks.js"></script>
 </body>
 </html>

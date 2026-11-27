@@ -23,7 +23,7 @@ public record LoadSpec(int nodes, boolean fsyncBatching, int clients, int writeP
     }
 
     public String label() {
-        return nodes + " nodes, " + clients + " clients, " + (writePercent == 100 ? "writes only" : writePercent == 0 ? "reads only" : writePercent + "% writes")
+        return nodes + " nodes, " + clients + (clients == 1 ? " client, " : " clients, ") + (writePercent == 100 ? "writes only" : writePercent == 0 ? "reads only" : writePercent + "% writes")
                 + ", batching " + (fsyncBatching ? "on" : "off");
     }
 }

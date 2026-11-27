@@ -63,6 +63,18 @@ public final class ProcessCluster implements AutoCloseable {
         return c;
     }
 
+    /**
+     * An already-running cluster reached by its client ports on localhost, for example
+     * {@code docker compose} on 8081..8083. Nothing is started, killed or deleted: {@link #close()} only
+     * lets go of it.
+     */
+    public static ProcessCluster attach(Map<Integer, Integer> clientPorts) throws InterruptedException {
+        ProcessCluster c = new ProcessCluster(clientPorts.size(), true, null);
+        c.clientPorts.putAll(clientPorts);
+        c.awaitLeader(Duration.ofSeconds(20));
+        return c;
+    }
+
     public int size() { return size; }
 
     public Map<NodeId, URI> clientUrls() {
@@ -118,7 +130,7 @@ public final class ProcessCluster implements AutoCloseable {
     }
 
     public Optional<Status> leader() throws InterruptedException {
-        for (int id : procs.keySet()) {
+        for (int id : clientPorts.keySet()) {   // a killed node simply has no status
             Optional<Status> s = status(id);
             if (s.isPresent() && s.get().leader()) return s;
         }
@@ -169,6 +181,7 @@ public final class ProcessCluster implements AutoCloseable {
             }
         }
         procs.clear();
+        if (dir == null) return;   // attached: not ours to delete
         try (Stream<Path> files = Files.walk(dir)) {
             files.sorted(java.util.Comparator.reverseOrder()).forEach(f -> f.toFile().delete());
         } catch (IOException ignored) {

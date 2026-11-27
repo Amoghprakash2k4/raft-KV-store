@@ -1,0 +1,101 @@
+{
+  "id" : "failover-20261127-150343-393",
+  "kind" : "failover",
+  "label" : "3 nodes, 8 leader kills, batching on",
+  "createdAt" : "2026-11-27T15:03:43.393293",
+  "gitCommit" : "7c9e13e-dirty",
+  "machine" : {
+    "os" : "Mac OS X 27.2.1 aarch64",
+    "cpus" : "11",
+    "java" : "21.0.11"
+  },
+  "settings" : {
+    "nodes" : 3,
+    "fsyncBatching" : true,
+    "kills" : 8
+  },
+  "result" : {
+    "spec" : {
+      "nodes" : 3,
+      "fsyncBatching" : true,
+      "kills" : 8
+    },
+    "kills" : [ {
+      "n" : 1,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 2,
+      "electionMs" : 246.771,
+      "clientGapMs" : 258.098
+    }, {
+      "n" : 2,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 3,
+      "electionMs" : 273.2,
+      "clientGapMs" : 287.189
+    }, {
+      "n" : 3,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 4,
+      "electionMs" : 207.029,
+      "clientGapMs" : 210.328
+    }, {
+      "n" : 4,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 5,
+      "electionMs" : 154.74,
+      "clientGapMs" : 166.115
+    }, {
+      "n" : 5,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 6,
+      "electionMs" : 169.122,
+      "clientGapMs" : 176.457
+    }, {
+      "n" : 6,
+      "oldLeader" : 2,
+      "newLeader" : 3,
+      "newTerm" : 7,
+      "electionMs" : 308.662,
+      "clientGapMs" : 321.645
+    }, {
+      "n" : 7,
+      "oldLeader" : 3,
+      "newLeader" : 1,
+      "newTerm" : 8,
+      "electionMs" : 213.087,
+      "clientGapMs" : 216.839
+    }, {
+      "n" : 8,
+      "oldLeader" : 1,
+      "newLeader" : 2,
+      "newTerm" : 9,
+      "electionMs" : 162.956,
+      "clientGapMs" : 168.727
+    } ],
+    "election" : {
+      "count" : 8,
+      "meanMs" : 216.944,
+      "p50Ms" : 207.103,
+      "p90Ms" : 308.735,
+      "p99Ms" : 308.735,
+      "p999Ms" : 308.735,
+      "maxMs" : 308.735,
+      "distribution" : [ [ 157.771, 1.0 ], [ 197.214, 2.0 ], [ 246.518, 2.0 ], [ 308.147, 2.0 ], [ 385.184, 1.0 ] ]
+    },
+    "clientGap" : {
+      "count" : 8,
+      "meanMs" : 225.68,
+      "p50Ms" : 210.431,
+      "p90Ms" : 321.791,
+      "p99Ms" : 321.791,
+      "p999Ms" : 321.791,
+      "maxMs" : 321.791,
+      "distribution" : [ [ 197.214, 3.0 ], [ 246.518, 2.0 ], [ 308.147, 2.0 ], [ 385.184, 1.0 ] ]
+    }
+  }
+}

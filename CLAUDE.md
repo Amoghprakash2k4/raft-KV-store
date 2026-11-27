@@ -31,11 +31,14 @@ consensus and end up with an interview-grade project. You act as a **senior dist
     - `raft-dashboard` (`MainApplication`, :8090): Simulator, Blind bug test, Throughput, Failover and
       Compare tabs;
     - failed seeds keep their stats (`SimulationFailure.partial()`).
-  - **Not done yet:**
-    - the measurements: `./gradlew :raft-bench:run --args="matrix --repeat 3"` (~35 min, idle Mac),
-      failover with 100 kills × {3, 5} nodes, one Docker run, and the macOS fsync check (S1);
-    - the docs (BENCHMARKS.md, DESIGN/DEVIATIONS/MILESTONES/README, the EXPLANATION `# M6` section).
-  - `results/` is left uncommitted until the owner decides.
+  - **Measured (2026-11-27):** matrix (96 runs), failover 100 kills × {3, 5}, Docker, macOS fsync probe
+    (Java `force(true)` = F_FULLFSYNC, ~3 ms, so DEVIATIONS S1 needs correcting). Docker found a real bug:
+    Nagle + delayed ACK stalled every kept-alive HTTP request 40 ms on Linux; fixed with
+    `sun.net.httpserver.nodelay` in `ClientApi` (20 → 543 ops/s, one client).
+  - **Added 2026-11-27:** `raft-bench load --attach <ports>`, dashboard **Benchmarks** tab (`benchmarks.js`,
+    fixed explained report; numbers are medians from `results/`), `INTERVIEW_PREP.md`.
+  - `results/`: load-* and failover-* are committed; sim-* and blind-* are git-ignored (up to 299 MB each).
+  - **Not done yet:** the docs (BENCHMARKS.md, DESIGN/DEVIATIONS S1/MILESTONES, the EXPLANATION `# M6` section).
 - **Git:** history rewritten 2026-11-24 (author → "Amogh P"): M1 `a645fa8`, docs `069cc15`, M2 `ec88c75`, M3 `be439fc`. M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
   2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 

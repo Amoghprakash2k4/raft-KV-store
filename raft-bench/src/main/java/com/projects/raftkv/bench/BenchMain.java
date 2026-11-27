@@ -32,7 +32,27 @@ public final class BenchMain {
             case "load" -> {
                 LoadSpec spec = new LoadSpec(i(o, "nodes", 3), b(o, "batching", true), i(o, "clients", 16),
                         i(o, "writes", 100), i(o, "keys", 1_000), i(o, "value", 100), i(o, "warmup", 3), i(o, "duration", 15));
-                for (int r = 0; r < i(o, "repeat", 1); r++) load(store, spec);
+                if (o.containsKey("attach")) {
+                    // An already-running cluster, e.g. docker compose: --attach 8081,8082,8083 --label docker
+                    Map<Integer, Integer> ports = new java.util.LinkedHashMap<>();
+                    String[] ps = o.get("attach").split(",");
+                    for (int k = 0; k < ps.length; k++) ports.put(k + 1, Integer.parseInt(ps[k].trim()));
+                    LoadSpec attached = new LoadSpec(ports.size(), spec.fsyncBatching(), spec.clients(), spec.writePercent(),
+                            spec.keys(), spec.valueBytes(), spec.warmupSec(), spec.durationSec());
+                    for (int r = 0; r < i(o, "repeat", 1); r++) {
+                        try (ProcessCluster cluster = ProcessCluster.attach(ports)) {
+                            LoadRun.Result res = LoadRun.run(attached, cluster, p -> { });
+                            String label = attached.label() + " (" + o.getOrDefault("label", "attached") + ")";
+                            RunRecord rec = store.save("load", label, attached, res);
+                            System.out.printf("%s: %.0f ops/s | write p50 %.2f p99 %.2f ms | read p50 %.2f p99 %.2f ms"
+                                            + " | fsync mean %.2f ms, batch mean %.1f | timeouts %d -> %s%n", label, res.opsPerSec(),
+                                    res.writes().p50Ms(), res.writes().p99Ms(), res.reads().p50Ms(), res.reads().p99Ms(),
+                                    res.server().fsyncMeanMs(), res.server().batchMean(), res.timeouts(), rec.id());
+                        }
+                    }
+                } else {
+                    for (int r = 0; r < i(o, "repeat", 1); r++) load(store, spec);
+                }
             }
             case "failover" -> {
                 FailoverRun.Spec spec = new FailoverRun.Spec(i(o, "nodes", 3), b(o, "batching", true), i(o, "kills", 50));
