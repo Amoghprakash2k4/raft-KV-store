@@ -1,5 +1,6 @@
 package com.projects.raftkv.sim;
 
+import com.projects.raftkv.core.Bytes;
 import com.projects.raftkv.client.ClientSession;
 import com.projects.raftkv.client.ClientSession.Reply;
 import com.projects.raftkv.core.Event;
@@ -58,6 +59,12 @@ public final class Simulation {
 
     private record Scheduled(long time, long seq, Runnable action) {}
 
+    /** A client read waiting in a node's inbox; registered with the driver only when the batch runs. */
+    private record PendingRead(long delivery, Bytes payload) {}
+
+    /** Largest batch one drain hands to the driver (the real server uses the same bound). */
+    private static final int MAX_BATCH = 256;
+
     private static final class SimNode {
         final NodeId id;
         final SimDisk disk;
@@ -71,6 +78,9 @@ public final class Simulation {
         long pausedUntil;
         SoftState lastSoft;
         long lastAppliedSeen = -1;
+        /** Group commit (M6-A): events waiting for the next batch; an Event or a PendingRead. */
+        final List<Object> inbox = new ArrayList<>();
+        boolean drainScheduled;
 
         SimNode(NodeId id, SplittableRandom diskRng, NodeLogTracker tracker, long snapshotEvery) {
             this.id = id;
@@ -113,6 +123,7 @@ public final class Simulation {
     private long now;
     private long seq;
     private long events;
+    private long batches, batchedEvents, maxBatch;   // group commit (M6-A)
     private long firstLeaderAt = -1;
     private long lastNewLeaderAt = -1;
     private long lastCurrentLeaderSeenAt = -1;
@@ -165,7 +176,13 @@ public final class Simulation {
         try {
             return sim.execute();
         } catch (RuntimeException e) {
-            throw new SimulationFailure(seed, cfg, sim.trace.format(), e);
+            SimResult partial;
+            try {
+                partial = sim.result(sim.now);
+            } catch (RuntimeException ignored) {
+                partial = null;   // statistics are a courtesy; the failure is what matters
+            }
+            throw new SimulationFailure(seed, cfg, sim.trace.format(), e, partial, sim.now);
         }
     }
 
@@ -200,6 +217,11 @@ public final class Simulation {
             checkClientLiveness(end);
         }
         for (SimNode n : nodes) if (n.up()) countSnapshots(n);
+        return result(end);
+    }
+
+    /** The run's counters as of {@code end} (the end of the run, or the moment it failed). */
+    private SimResult result(long end) {
         long maxTerm = nodes.stream().filter(SimNode::up)
                 .mapToLong(n -> n.driver.status().hard().currentTerm()).max().orElse(0);
         return new SimResult(seed, events, trace.hash(), electionSafety.leadersElected(), maxTerm,
@@ -210,7 +232,8 @@ public final class Simulation {
                 maxCommitIndex(), midWriteCrashes, tornTailsCut, durability.restartsChecked(),
                 snapshotsTaken, snapshotsInstalled, maxLogEntries,
                 termAtScenarioStart, newLeadersSinceScenario, scenarioStepDownMs,
-                cfg.workload().clients() > 0 ? end - workload.slowestClientLastCompletedAt() : 0);
+                cfg.workload().clients() > 0 ? end - workload.slowestClientLastCompletedAt() : 0,
+                batches, batchedEvents, maxBatch);
     }
 
     /**
@@ -293,7 +316,7 @@ public final class Simulation {
         n.stateMachine = cfg.skipDedup() ? KvStateMachine.withoutDedupForTesting() : new KvStateMachine();
         NodeDriver.restoreFrom(recovered, n.stateMachine);   // the snapshot; the rest is re-applied from the log
         n.driver = NodeDriver.create(core, n.trackedStorage, this::onSend, n.stateMachine, this::onOutcome,
-                this::onReadOutcome, n.snapshotEvery);
+                this::onReadOutcome, n.snapshotEvery).withMutationsForTesting(cfg.mutations());
         n.lastSoft = null;
         n.lastAppliedSeen = -1;
         trace.add(now, n.name(), "start #" + n.incarnation + " " + n.driver.status().hard());
@@ -307,6 +330,8 @@ public final class Simulation {
         n.disk.crash();
         n.midWriteCrashArmed = false;
         n.driver = null;
+        n.inbox.clear();          // the process's mailbox dies with it
+        n.drainScheduled = false;
         crashes++;
         trace.add(now, n.name(), "CRASH (" + why + ")");
     }
@@ -325,7 +350,47 @@ public final class Simulation {
 
     private void deliver(SimNode n, Event event) {
         if (!(event instanceof Event.Tick)) trace.add(now, n.name(), event);
-        run(n, d -> d.handle(event));
+        if (cfg.batchWindowMs() == 0) {
+            run(n, d -> d.handle(event));
+        } else {
+            enqueue(n, event);
+        }
+    }
+
+    /** Group commit: the event waits in the inbox; the first one schedules the drain. */
+    private void enqueue(SimNode n, Object item) {
+        n.inbox.add(item);
+        if (!n.drainScheduled) {
+            n.drainScheduled = true;
+            int incarnation = n.incarnation;
+            at(now + cfg.batchWindowMs(), () -> drain(n, incarnation));
+        }
+    }
+
+    /** Hands everything waiting (up to MAX_BATCH) to the driver as one batch: one fsync for all of it. */
+    private void drain(SimNode n, int incarnation) {
+        if (!n.up() || n.incarnation != incarnation) return;      // a drain of a dead incarnation
+        if (now < n.pausedUntil) {                                 // a paused process handles nothing
+            at(n.pausedUntil, () -> drain(n, incarnation));
+            return;
+        }
+        n.drainScheduled = false;
+        List<Object> items = new ArrayList<>(n.inbox.subList(0, Math.min(MAX_BATCH, n.inbox.size())));
+        n.inbox.subList(0, items.size()).clear();
+        if (!n.inbox.isEmpty()) {
+            n.drainScheduled = true;
+            at(now, () -> drain(n, incarnation));
+        }
+        batches++;
+        batchedEvents += items.size();
+        maxBatch = Math.max(maxBatch, items.size());
+        run(n, d -> {
+            List<Event> events = new ArrayList<>(items.size());
+            for (Object item : items) {
+                events.add(item instanceof PendingRead r ? d.prepareRead(r.delivery(), r.payload()) : (Event) item);
+            }
+            d.handleBatch(events);
+        });
     }
 
     /** Runs one driver call (an event, or a read) and then every invariant checker; a halted node crashes. */
@@ -412,7 +477,8 @@ public final class Simulation {
         attemptOfDelivery.put(delivery, a.attemptId());
         if (a.read()) {
             trace.add(now, n.name(), "read " + delivery + " (attempt " + Long.toHexString(a.attemptId()) + ")");
-            run(n, d -> d.read(delivery, a.payload()));
+            if (cfg.batchWindowMs() == 0) run(n, d -> d.read(delivery, a.payload()));
+            else enqueue(n, new PendingRead(delivery, a.payload()));
         } else {
             deliver(n, new Event.ProposeCommand(delivery, a.payload()));
         }

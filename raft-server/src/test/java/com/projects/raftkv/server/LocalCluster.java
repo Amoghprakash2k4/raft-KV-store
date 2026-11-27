@@ -43,7 +43,7 @@ final class LocalCluster implements AutoCloseable {
         Map<NodeId, InetSocketAddress> members = new LinkedHashMap<>();
         for (NodeId m : ids) members.put(m, InetSocketAddress.createUnresolved("localhost", peerPorts.get(m)));
         return new ServerConfig(id, members, peerPorts.get(id), clientPorts.get(id), dir.resolve("n" + id.value()),
-                10, 15, 5, true, true, 50, 3_000);
+                10, 15, 5, true, true, 50, 3_000, true, 256);
     }
 
     void start(NodeId id) {

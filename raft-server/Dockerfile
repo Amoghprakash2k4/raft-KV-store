@@ -15,6 +15,10 @@ COPY raft-statemachine raft-statemachine
 COPY raft-client raft-client
 COPY raft-sim raft-sim
 COPY raft-server raft-server
+# settings.gradle.kts includes every module, so Gradle needs these folders even though the image
+# only builds raft-server (M6).
+COPY raft-bench raft-bench
+COPY raft-dashboard raft-dashboard
 RUN --mount=type=cache,target=/root/.gradle ./gradlew --no-daemon :raft-server:installDist -x test
 
 FROM eclipse-temurin:21-jre

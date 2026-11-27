@@ -241,4 +241,32 @@ class MutationSanityTest {
         Tally mixed = run("control (leader faults, 50% reads, 1 key)", leaderHunting(50, 1), 200);
         assertThat(mixed.safetyCatches()).isZero();
     }
+
+    // ---------------------------------------------------------------- M6: group commit
+
+    /**
+     * E1 under group commit: a batch's messages must not leave before the batch's fsync. With
+     * SEND_BEFORE_SYNC, a node that crashes inside that fsync has already granted votes and acknowledged
+     * entries it no longer has after restart.
+     */
+    @Test
+    void sendingBeforeTheBatchFsyncIsCaught() {
+        Tally t = run("send before sync (crash loop, group commit)",
+                SimConfig.crashLoop(3).withBatching(2).withMutation(ProtocolMutation.SEND_BEFORE_SYNC), 100);
+        assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(60);   // measured 78 (Durability 74, Election Safety 4)
+    }
+
+    @Test
+    void sendingBeforeTheBatchFsyncIsCaughtByItsConsequencesAlone() {
+        Tally t = run("send before sync (crash loop, group commit, no durability checkers)",
+                SimConfig.crashLoop(3).withBatching(2).withMutation(ProtocolMutation.SEND_BEFORE_SYNC)
+                        .withoutDurabilityCheckers(), 300);
+        assertThat(t.safetyCatches()).isGreaterThanOrEqualTo(50);   // measured 97 (Leader Completeness 75, Election Safety 22)
+    }
+
+    @Test
+    void groupCommitControl() {
+        Tally t = run("control (crash loop, group commit)", SimConfig.crashLoop(3).withBatching(2), 100);
+        assertThat(t.count("passed")).isEqualTo(100);
+    }
 }

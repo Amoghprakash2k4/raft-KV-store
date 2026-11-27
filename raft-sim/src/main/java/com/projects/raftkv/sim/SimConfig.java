@@ -14,12 +14,15 @@ import java.util.Set;
  * {@code skipDedup} runs every replica's state machine without session dedup (mutation SKIP_DEDUP, M4-F).
  * {@code preVote} / {@code checkQuorum} switch the M5-A liveness features (on by default here);
  * {@code scenario} adds one scripted fault on top of everything else (DESIGN.md M5-A measurements).
+ * {@code batchWindowMs} > 0 turns on group commit (DESIGN.md M6-A): a node's events wait in an inbox for
+ * up to that long and are then handled as one batch with one fsync, like the real server's mailbox.
  */
 public record SimConfig(int clusterSize, int tickMs, int electionTimeoutTicks, int heartbeatTicks,
                         int maxEntriesPerAppend, long chaosMs, long quietMs, NetworkConfig network,
                         FaultConfig faults, WorkloadConfig workload, boolean lyingDisks,
                         boolean checkDurability, Set<ProtocolMutation> mutations, StorageConfig storage,
-                        boolean skipDedup, boolean preVote, boolean checkQuorum, Scenario scenario) {
+                        boolean skipDedup, boolean preVote, boolean checkQuorum, Scenario scenario,
+                        int batchWindowMs) {
 
     /**
      * A scripted fault for measuring PreVote and CheckQuorum. At {@link #START_MS} one node is cut off
@@ -43,18 +46,19 @@ public record SimConfig(int clusterSize, int tickMs, int electionTimeoutTicks, i
         Objects.requireNonNull(storage);
         Objects.requireNonNull(scenario);
         mutations = Set.copyOf(mutations);
+        if (batchWindowMs < 0) throw new IllegalArgumentException("batchWindowMs < 0");
     }
 
     public static SimConfig quiet(int nodes) {
         return new SimConfig(nodes, 10, 10, 2, 64, 0, 3_000, NetworkConfig.reliable(), FaultConfig.none(),
                 WorkloadConfig.standard(), false, true, Set.of(), StorageConfig.sim(), false, true, true,
-                Scenario.NONE);
+                Scenario.NONE, 0);
     }
 
     public static SimConfig chaos(int nodes) {
         return new SimConfig(nodes, 10, 10, 2, 64, 10_000, 3_000, NetworkConfig.chaotic(), FaultConfig.chaos(),
                 WorkloadConfig.standard(), false, true, Set.of(), StorageConfig.sim(), false, true, true,
-                Scenario.NONE);
+                Scenario.NONE, 0);
     }
 
     /** The chaos mix with a crash loop: frequent crashes, most of them in the middle of an fsync. */
@@ -69,7 +73,7 @@ public record SimConfig(int clusterSize, int tickMs, int electionTimeoutTicks, i
     public static SimConfig scenario(int nodes, Scenario s) {
         return new SimConfig(nodes, 10, 10, 2, 64, 0, Scenario.HEAL_MS + 3_000, NetworkConfig.reliable(),
                 FaultConfig.none(), WorkloadConfig.standard(), false, true, Set.of(), StorageConfig.sim(), false,
-                true, true, s);
+                true, true, s, 0);
     }
 
     /** Mutation: fsync acknowledges without persisting. */
@@ -125,10 +129,17 @@ public record SimConfig(int clusterSize, int tickMs, int electionTimeoutTicks, i
                 preVoteOn, checkQuorumOn);
     }
 
+    /** Group commit (M6-A): events wait up to {@code windowMs} in the node's inbox, then one batch, one fsync. */
+    public SimConfig withBatching(int windowMs) {
+        return new SimConfig(clusterSize, tickMs, electionTimeoutTicks, heartbeatTicks, maxEntriesPerAppend, chaosMs,
+                quietMs, network, faults, workload, lyingDisks, checkDurability, mutations, storage, skipDedup, preVote,
+                checkQuorum, scenario, windowMs);
+    }
+
     private SimConfig copy(FaultConfig f, WorkloadConfig w, boolean lying, boolean durability,
                            Set<ProtocolMutation> m, StorageConfig s, boolean noDedup, int maxEntries,
                            boolean pv, boolean cq) {
         return new SimConfig(clusterSize, tickMs, electionTimeoutTicks, heartbeatTicks, maxEntries, chaosMs, quietMs,
-                network, f, w, lying, durability, m, s, noDedup, pv, cq, scenario);
+                network, f, w, lying, durability, m, s, noDedup, pv, cq, scenario, batchWindowMs);
     }
 }

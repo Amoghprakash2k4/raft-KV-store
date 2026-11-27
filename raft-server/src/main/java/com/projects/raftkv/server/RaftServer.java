@@ -20,6 +20,8 @@ import com.projects.raftkv.storage.wal.WalOptions;
 import com.projects.raftkv.transport.GrpcPeerServer;
 import com.projects.raftkv.transport.GrpcTransport;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -40,7 +42,9 @@ import org.slf4j.LoggerFactory;
  * One real Raft node (DESIGN.md M5, "node runtime"): the same {@link NodeDriver} the simulator runs, now
  * fed by real threads. Everything that can happen to the node (a peer message from gRPC, a client request
  * from HTTP, a timer tick) is put into ONE bounded mailbox, and ONE event-loop thread takes events out and
- * hands them to the driver, completely, one at a time (decision E1a). So the core, the driver, the log and
+ * hands them to the driver (decision E1a). With group commit (M6-A, on by default) it takes everything
+ * waiting, up to {@code maxBatch}, and the driver handles it as one batch with one fsync; otherwise one
+ * event at a time. So the core, the driver, the log and
  * the state machine are only ever touched by that thread: no locks, the same order of effects as in the
  * simulator (persist + fsync → send → apply → notify).
  *
@@ -60,7 +64,13 @@ public final class RaftServer implements AutoCloseable {
     }
 
     private final ServerConfig cfg;
-    private final BlockingQueue<Runnable> mailbox = new ArrayBlockingQueue<>(MAILBOX_CAPACITY);
+    /** An input that becomes an event on the loop thread (where the driver and {@code waiting} live). */
+    @FunctionalInterface
+    private interface Input {
+        Event toEvent();
+    }
+
+    private final BlockingQueue<Input> mailbox = new ArrayBlockingQueue<>(MAILBOX_CAPACITY);
     private final AtomicBoolean tickPending = new AtomicBoolean();
     private final AtomicLong nextRequestId = new AtomicLong();
     private final AtomicLong droppedPeerMessages = new AtomicLong();
@@ -136,7 +146,7 @@ public final class RaftServer implements AutoCloseable {
         long id = nextRequestId.incrementAndGet();
         submit(f, () -> {
             waiting.put(id, f);
-            driver.handle(new Event.ProposeCommand(id, request));
+            return new Event.ProposeCommand(id, request);
         });
         return f;
     }
@@ -147,12 +157,12 @@ public final class RaftServer implements AutoCloseable {
         long id = nextRequestId.incrementAndGet();
         submit(f, () -> {
             waiting.put(id, f);
-            driver.read(id, query);
+            return driver.prepareRead(id, query);
         });
         return f;
     }
 
-    private void submit(CompletableFuture<ClientReply> f, Runnable task) {
+    private void submit(CompletableFuture<ClientReply> f, Input task) {
         if (!running || view.halted()) {
             f.complete(new ClientReply.Unavailable("node is not running"));
         } else if (!mailbox.offer(task)) {
@@ -166,7 +176,7 @@ public final class RaftServer implements AutoCloseable {
             rejectedPeerMessages.incrementAndGet();
             return;
         }
-        if (!mailbox.offer(() -> driver.handle(new Event.MessageReceived(m)))) {
+        if (!mailbox.offer(() -> new Event.MessageReceived(m))) {
             droppedPeerMessages.incrementAndGet();   // like a lost message: Raft resends what matters
         }
     }
@@ -176,7 +186,7 @@ public final class RaftServer implements AutoCloseable {
         if (tickPending.compareAndSet(false, true)) {
             if (!mailbox.offer(() -> {
                 tickPending.set(false);
-                driver.handle(new Event.Tick());
+                return new Event.Tick();
             })) {
                 tickPending.set(false);
             }
@@ -187,16 +197,28 @@ public final class RaftServer implements AutoCloseable {
 
     private void runLoop() {
         try {
+            List<Input> inputs = new ArrayList<>();
+            List<Event> events = new ArrayList<>();
             while (running) {
-                Runnable event;
+                Input first;
                 try {
-                    event = mailbox.poll(100, TimeUnit.MILLISECONDS);
+                    first = mailbox.poll(100, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException e) {
                     break;
                 }
-                if (event == null) continue;
+                if (first == null) continue;
+                inputs.clear();
+                events.clear();
+                inputs.add(first);
+                if (cfg.fsyncBatching()) mailbox.drainTo(inputs, cfg.maxBatch() - 1);
                 try {
-                    event.run();
+                    for (Input in : inputs) events.add(in.toEvent());
+                    if (cfg.fsyncBatching()) {
+                        driver.handleBatch(events);
+                    } else {
+                        for (Event e : events) driver.handle(e);
+                    }
+                    metrics.recordBatch(events.size());
                 } catch (NodeHaltedException e) {
                     halt("storage failure: " + e.getMessage(), e);
                     return;

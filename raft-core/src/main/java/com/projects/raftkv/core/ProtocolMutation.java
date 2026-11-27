@@ -37,5 +37,10 @@ public enum ProtocolMutation {
      * PreVote granted without the up-to-date check (§5.4.1). A teaching control: it must cause NO safety
      * violation, because the real RequestVote that follows still checks the log.
      */
-    PREVOTE_SKIPS_LOG_CHECK
+    PREVOTE_SKIPS_LOG_CHECK,
+    /**
+     * Driver, not core (E1, DESIGN.md M6-A): send each step's messages before the fsync that makes their
+     * state durable. A node that crashes in that fsync has promised votes or entries it no longer has.
+     */
+    SEND_BEFORE_SYNC
 }

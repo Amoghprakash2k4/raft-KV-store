@@ -13,6 +13,8 @@ import org.junit.jupiter.params.provider.ValueSource;
  * partitions, crash/restart, crashes in the middle of an fsync and process pauses, with closed-loop
  * clients (retries, sessions, ReadIndex reads) over lossy client links throughout. Every node runs the
  * real WAL on a simulated disk. Run with -Psim.seeds=5000 for the gate.
+ * The group-commit variants (M6-A) run the same mixes with events batched through a 2 ms inbox, one
+ * fsync per batch, as the real server does.
  */
 class ChaosTest {
 
@@ -26,6 +28,18 @@ class ChaosTest {
     @ValueSource(ints = {3, 5})
     void invariantsHoldUnderCrashLoops(int nodes) {
         check("crash loop", nodes, SimConfig.crashLoop(nodes));
+    }
+
+    @ParameterizedTest(name = "{0} nodes")
+    @ValueSource(ints = {3, 5})
+    void invariantsHoldUnderChaosWithGroupCommit(int nodes) {
+        check("chaos + group commit", nodes, SimConfig.chaos(nodes).withBatching(2));
+    }
+
+    @ParameterizedTest(name = "{0} nodes")
+    @ValueSource(ints = {3, 5})
+    void invariantsHoldUnderCrashLoopsWithGroupCommit(int nodes) {
+        check("crash loop + group commit", nodes, SimConfig.crashLoop(nodes).withBatching(2));
     }
 
     private static void check(String name, int nodes, SimConfig cfg) {
@@ -45,6 +59,9 @@ class ChaosTest {
             assertThat(results.stream().mapToInt(SimResult::tornTailsCut).sum()).as("torn WAL tails recovered").isPositive();
             assertThat(results.stream().mapToLong(SimResult::snapshotsTaken).sum()).as("snapshots taken").isPositive();
             assertThat(results.stream().mapToLong(SimResult::snapshotsInstalled).sum()).as("snapshots installed").isPositive();
+            if (cfg.batchWindowMs() > 0) {
+                assertThat(results.stream().mapToLong(SimResult::maxBatch).max().orElse(0)).as("batches of more than one event").isGreaterThan(1);
+            }
         }
         assertThat(results).allSatisfy(r -> {
             assertThat(r.writesCompleted()).isPositive();
@@ -54,7 +71,8 @@ class ChaosTest {
                         + " restarts checked %d) partitions=%d pauses=%d"
                         + " | ops=%d writes=%d reads=%d attempts=%d timeouts=%d redirects=%d retries=%d unanswered=%d"
                         + " lost=%d unknown=%d dedupHits=%d linkDups=%d linSteps(max)=%d maxCommitIndex=%d"
-                        + " | snapshots taken=%d installed=%d, longest in-memory log=%d entries%n",
+                        + " | snapshots taken=%d installed=%d, longest in-memory log=%d entries"
+                        + " | batches=%d avg batch=%.2f max batch=%d%n",
                 name, nodes, results.size(),
                 results.stream().mapToInt(SimResult::leadersElected).sum(),
                 results.stream().mapToLong(SimResult::maxTerm).max().orElse(0),
@@ -80,6 +98,10 @@ class ChaosTest {
                 results.stream().mapToLong(SimResult::maxCommitIndex).max().orElse(0),
                 results.stream().mapToLong(SimResult::snapshotsTaken).sum(),
                 results.stream().mapToLong(SimResult::snapshotsInstalled).sum(),
-                results.stream().mapToLong(SimResult::maxLogEntries).max().orElse(0));
+                results.stream().mapToLong(SimResult::maxLogEntries).max().orElse(0),
+                results.stream().mapToLong(SimResult::batches).sum(),
+                (double) results.stream().mapToLong(SimResult::batchedEvents).sum()
+                        / Math.max(1, results.stream().mapToLong(SimResult::batches).sum()),
+                results.stream().mapToLong(SimResult::maxBatch).max().orElse(0));
     }
 }

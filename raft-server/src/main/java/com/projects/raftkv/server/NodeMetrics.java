@@ -4,6 +4,7 @@ import com.projects.raftkv.core.NodeId;
 import com.projects.raftkv.core.Role;
 import com.projects.raftkv.transport.GrpcTransport;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.Tags;
@@ -29,6 +30,7 @@ public final class NodeMetrics {
     private final Counter leaderChanges;
     private final Counter checkQuorumStepDowns;
     private final Timer fsync;
+    private final DistributionSummary batchSize;
 
     NodeMetrics(NodeId self, Set<NodeId> peers, Supplier<RaftServer.View> view, IntSupplier mailboxSize) {
         this.view = view;
@@ -59,6 +61,9 @@ public final class NodeMetrics {
         leaderChanges = Counter.builder("raft.leader.changes").description("times this node saw a new leader").register(registry);
         checkQuorumStepDowns = Counter.builder("raft.checkquorum.stepdowns")
                 .description("times this node stepped down as leader without a higher term").register(registry);
+        batchSize = DistributionSummary.builder("raft.batch.size")
+                .description("events handled per loop iteration; with group commit, events per fsync at most")
+                .publishPercentiles(0.5, 0.99).register(registry);
         fsync = Timer.builder("raft.fsync").description("fsync latency (files and directory)")
                 .publishPercentiles(0.5, 0.99).publishPercentileHistogram().register(registry);
     }
@@ -70,6 +75,10 @@ public final class NodeMetrics {
             FunctionCounter.builder("raft.transport.dropped", t, x -> x.dropped(p)).tags(tags).register(registry);
             Gauge.builder("raft.transport.queued", t, x -> x.queued(p)).tags(tags).register(registry);
         }
+    }
+
+    void recordBatch(int events) {
+        batchSize.record(events);
     }
 
     void recordFsync(long nanos) {

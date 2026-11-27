@@ -1,0 +1,142 @@
+{
+  "id" : "load-20261127-142459-051",
+  "kind" : "load",
+  "label" : "5 nodes, 64 clients, writes only, batching on",
+  "createdAt" : "2026-11-27T14:24:59.051213",
+  "gitCommit" : "7c9e13e",
+  "machine" : {
+    "os" : "Mac OS X 27.2.1 aarch64",
+    "cpus" : "11",
+    "java" : "25.0.3"
+  },
+  "settings" : {
+    "nodes" : 5,
+    "fsyncBatching" : true,
+    "clients" : 64,
+    "writePercent" : 100,
+    "keys" : 1000,
+    "valueBytes" : 100,
+    "warmupSec" : 3,
+    "durationSec" : 15
+  },
+  "result" : {
+    "spec" : {
+      "nodes" : 5,
+      "fsyncBatching" : true,
+      "clients" : 64,
+      "writePercent" : 100,
+      "keys" : 1000,
+      "valueBytes" : 100,
+      "warmupSec" : 3,
+      "durationSec" : 15
+    },
+    "opsPerSec" : 1233.867,
+    "writesPerSec" : 1233.867,
+    "readsPerSec" : 0.0,
+    "ops" : 18508,
+    "timeouts" : 0,
+    "writes" : {
+      "count" : 18508,
+      "meanMs" : 52.027,
+      "p50Ms" : 51.903,
+      "p90Ms" : 64.927,
+      "p99Ms" : 79.999,
+      "p999Ms" : 171.903,
+      "maxMs" : 186.751,
+      "distribution" : [ [ 21.174, 5.0 ], [ 26.468, 140.0 ], [ 33.086, 738.0 ], [ 41.358, 2185.0 ], [ 51.697, 6035.0 ], [ 64.622, 7499.0 ], [ 80.778, 1755.0 ], [ 100.973, 87.0 ], [ 157.771, 28.0 ], [ 197.214, 36.0 ] ]
+    },
+    "reads" : {
+      "count" : 0,
+      "meanMs" : 0.0,
+      "p50Ms" : 0.0,
+      "p90Ms" : 0.0,
+      "p99Ms" : 0.0,
+      "p999Ms" : 0.0,
+      "maxMs" : 0.0,
+      "distribution" : [ ]
+    },
+    "perSecond" : [ {
+      "second" : 1,
+      "ops" : 1264,
+      "p50Ms" : 49.407,
+      "p99Ms" : 71.679
+    }, {
+      "second" : 2,
+      "ops" : 1323,
+      "p50Ms" : 48.255,
+      "p99Ms" : 69.119
+    }, {
+      "second" : 3,
+      "ops" : 1255,
+      "p50Ms" : 52.351,
+      "p99Ms" : 68.927
+    }, {
+      "second" : 4,
+      "ops" : 1268,
+      "p50Ms" : 51.327,
+      "p99Ms" : 76.031
+    }, {
+      "second" : 5,
+      "ops" : 1287,
+      "p50Ms" : 48.447,
+      "p99Ms" : 92.671
+    }, {
+      "second" : 6,
+      "ops" : 1223,
+      "p50Ms" : 52.799,
+      "p99Ms" : 80.575
+    }, {
+      "second" : 7,
+      "ops" : 1316,
+      "p50Ms" : 49.439,
+      "p99Ms" : 69.439
+    }, {
+      "second" : 8,
+      "ops" : 1154,
+      "p50Ms" : 55.007,
+      "p99Ms" : 83.519
+    }, {
+      "second" : 9,
+      "ops" : 1097,
+      "p50Ms" : 55.007,
+      "p99Ms" : 173.311
+    }, {
+      "second" : 10,
+      "ops" : 1160,
+      "p50Ms" : 55.583,
+      "p99Ms" : 76.607
+    }, {
+      "second" : 11,
+      "ops" : 1166,
+      "p50Ms" : 55.807,
+      "p99Ms" : 87.935
+    }, {
+      "second" : 12,
+      "ops" : 1265,
+      "p50Ms" : 52.639,
+      "p99Ms" : 68.287
+    }, {
+      "second" : 13,
+      "ops" : 1239,
+      "p50Ms" : 51.839,
+      "p99Ms" : 78.655
+    }, {
+      "second" : 14,
+      "ops" : 1180,
+      "p50Ms" : 55.615,
+      "p99Ms" : 73.535
+    }, {
+      "second" : 15,
+      "ops" : 1247,
+      "p50Ms" : 52.287,
+      "p99Ms" : 78.271
+    } ],
+    "server" : {
+      "fsyncs" : 1588,
+      "fsyncMeanMs" : 5.715,
+      "fsyncP99Ms" : 11.185,
+      "batchMean" : 50.596,
+      "batchP99" : 271.9375
+    }
+  }
+}

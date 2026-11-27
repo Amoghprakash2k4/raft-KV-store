@@ -1,0 +1,87 @@
+{
+  "id" : "load-20261125-233530-598",
+  "kind" : "load",
+  "label" : "3 nodes, 16 clients, writes, batching on",
+  "createdAt" : "2026-11-25T23:35:30.598651",
+  "gitCommit" : "8db8b6d-dirty",
+  "machine" : {
+    "os" : "Mac OS X 27.2.1 aarch64",
+    "cpus" : "11",
+    "java" : "25.0.3"
+  },
+  "settings" : {
+    "nodes" : 3,
+    "fsyncBatching" : true,
+    "clients" : 16,
+    "writePercent" : 100,
+    "keys" : 1000,
+    "valueBytes" : 100,
+    "warmupSec" : 1,
+    "durationSec" : 4
+  },
+  "result" : {
+    "spec" : {
+      "nodes" : 3,
+      "fsyncBatching" : true,
+      "clients" : 16,
+      "writePercent" : 100,
+      "keys" : 1000,
+      "valueBytes" : 100,
+      "warmupSec" : 1,
+      "durationSec" : 4
+    },
+    "opsPerSec" : 574.25,
+    "writesPerSec" : 574.25,
+    "readsPerSec" : 0.0,
+    "ops" : 2297,
+    "timeouts" : 0,
+    "writes" : {
+      "count" : 2297,
+      "meanMs" : 28.029,
+      "p50Ms" : 28.063,
+      "p90Ms" : 35.103,
+      "p99Ms" : 43.903,
+      "p999Ms" : 51.551,
+      "maxMs" : 51.679,
+      "distribution" : [ [ 13.551, 4.0 ], [ 16.939, 76.0 ], [ 21.174, 221.0 ], [ 26.468, 636.0 ], [ 33.086, 963.0 ], [ 41.358, 336.0 ], [ 51.697, 61.0 ] ]
+    },
+    "reads" : {
+      "count" : 0,
+      "meanMs" : 0.0,
+      "p50Ms" : 0.0,
+      "p90Ms" : 0.0,
+      "p99Ms" : 0.0,
+      "p999Ms" : 0.0,
+      "maxMs" : 0.0,
+      "distribution" : [ ]
+    },
+    "perSecond" : [ {
+      "second" : 1,
+      "ops" : 589,
+      "p50Ms" : 27.775,
+      "p99Ms" : 39.167
+    }, {
+      "second" : 2,
+      "ops" : 578,
+      "p50Ms" : 27.055,
+      "p99Ms" : 44.447
+    }, {
+      "second" : 3,
+      "ops" : 539,
+      "p50Ms" : 30.159,
+      "p99Ms" : 45.311
+    }, {
+      "second" : 4,
+      "ops" : 575,
+      "p50Ms" : 28.159,
+      "p99Ms" : 41.791
+    } ],
+    "server" : {
+      "fsyncs" : 701,
+      "fsyncMeanMs" : 4.849,
+      "fsyncP99Ms" : 0.0,
+      "batchMean" : 11.444,
+      "batchP99" : 41.9375
+    }
+  }
+}

@@ -4027,3 +4027,341 @@ covered only by the simulator's `SimDisk` (H3).
 | **fail-stop** | on an error you can't reason about (failed fsync), stop completely rather than continue wrongly |
 | **integration test** | a test of the real pieces together; here 3 JVMs and SIGKILL |
 | **H6** | the harness note that widened the client-liveness window to 2 s, with the measurement behind it |
+
+---
+
+# M6: Benchmarks (group commit, raft-bench, the dashboard)
+
+**Status:** done (2026-11-27). The measured numbers with charts are in [BENCHMARKS.md](BENCHMARKS.md) and the
+dashboard's **Benchmarks** tab. Decisions: DESIGN.md M6-A to M6-D. Limits: DEVIATIONS.md BM1–BM5. Interview
+answers about all of this: [INTERVIEW_PREP.md](INTERVIEW_PREP.md) §9.
+
+## 0. Words you need first
+
+| Term | Meaning |
+|---|---|
+| **throughput** | how many operations finish per second (ops/s) |
+| **latency** | how long one operation takes, from the client's send to its answer |
+| **percentile (p50, p99)** | p50 = half of the operations were faster than this (the typical case); p99 = 99% were faster (the slow tail users still notice) |
+| **tail latency** | the slow end of the distribution (p99, max); what makes a system *feel* slow |
+| **closed-loop client** | sends one request, waits for its answer, then sends the next. More clients = more load |
+| **open-loop load** | requests arrive on a fixed schedule whether or not earlier ones finished (like real users) |
+| **warm-up** | the first seconds of a run, not counted: the JVM is still compiling code (JIT) and caches are cold |
+| **median of repeats** | run each setting several times and report the middle value, so one unlucky run doesn't decide the result |
+| **fsync** | the call that forces written data from memory onto the disk. Slow (≈ 3 ms here) and the bottleneck of a durable system |
+| **group commit** | saving many waiting writes with one fsync instead of one fsync each |
+| **batch** | the set of events handled together, with one fsync |
+| **Little's law** | in a steady system, *items inside = arrival rate × time inside*. For closed-loop clients: clients = throughput × latency |
+| **Nagle's algorithm** | TCP holds back a small packet until the previous one is acknowledged, to avoid sending many tiny packets |
+| **delayed ACK** | the receiver waits a little (up to 40 ms on Linux) before acknowledging, hoping to combine the ACK with a reply |
+| **TCP_NODELAY** | a socket option that turns Nagle's algorithm off |
+| **F_FULLFSYNC** | the macOS call that really forces data onto the flash; plain `fsync` on macOS stops at the drive's cache |
+| **confusion matrix** | a 2×2 table of (bug planted or not) × (flagged or not): caught, missed, false alarm, clean pass |
+| **false alarm** | a clean run flagged as broken. For a checker, the worst outcome: it means the checker itself is wrong |
+
+### Why fsync decides everything: an example
+
+```
+Without group commit (one fsync per write, ≈ 3–6 ms each):
+  write A: [append][== fsync ==][send][wait majority] ok
+  write B:                                            [append][== fsync ==] ...
+  → about 150 writes/s, no matter how many clients wait
+
+With group commit:
+  writes A..Z arrive while the previous fsync runs
+  batch:   [append A..Z][== one fsync ==][send all][wait majority] 26 × ok
+  → the fsync cost is shared; at 64 clients one fsync carries about 45 writes
+```
+
+## 1. What M6 builds
+
+- **Group commit** in the driver, the server and the simulator, with a new planted bug
+  (`SEND_BEFORE_SYNC`) and a gate run with batching on.
+- **`raft-bench`**: starts real server processes, drives load with real clients, kills leaders, saves every
+  run as JSON. Commands `load`, `failover`, `matrix`, and `load --attach` for an already-running cluster.
+- **`raft-dashboard`** (`MainApplication`, http://localhost:8090): a localhost lab with Simulator, Blind
+  bug test, Throughput & latency, Leader failover, Compare runs and Benchmarks tabs.
+- **The measurements**: a 96-run matrix, 200 leader kills, a Docker run, a macOS fsync probe.
+- **A bug fix the measurements found**: the 40 ms Nagle stall on Linux (§6).
+
+## 2. Group commit
+
+### 2.1 The idea
+
+The disk flush costs about 3 ms whatever you write, 100 bytes or 100 KB. So the cheap thing is to flush
+**more data per flush**. While one flush runs, new requests keep arriving in the mailbox. When the flush
+ends, the event loop takes **all** of them, steps the core for each, writes all their log records, and
+flushes **once**.
+
+```mermaid
+sequenceDiagram
+    participant C as clients
+    participant MB as mailbox
+    participant L as event loop
+    participant D as disk
+    C->>MB: write 1
+    MB->>L: batch [1]
+    L->>D: fsync (≈3 ms)
+    C->>MB: writes 2, 3, 4 arrive meanwhile
+    D-->>L: done → send, apply, answer 1
+    MB->>L: batch [2, 3, 4] (drained at once)
+    L->>D: ONE fsync for 2, 3, 4
+    D-->>L: done → send, apply, answer 2, 3, 4
+```
+
+There is **no timer**: the loop never waits for a batch to fill. With one client every batch has one event
+and latency is the same as before. The batch grows only when there is waiting work, which is exactly when
+it helps. Measured: 1.2 events per fsync at 1 client, 3.6 at 4, 12.7 at 16, 45 at 64.
+
+### 2.2 Why it is still safe (rule E1, per event)
+
+E1 says: persist + fsync → send → apply → notify. `NodeDriver.handleBatch` keeps that order **for every
+event in the batch**: no message from any event is sent until the one fsync that covers all of them has
+returned.
+
+A natural worry: the core steps event 2 while event 1's entries are written but **not yet synced**. Is that
+allowed? Yes, because of D1: the core never reads storage. It keeps its own in-memory log and already
+behaves as if its writes were durable. Nobody else can see them until the fsync, because nothing is sent
+before it. If the node crashes inside the fsync, the whole batch is lost together, and no other node ever
+heard about any of it.
+
+### 2.3 The planted bug: `SEND_BEFORE_SYNC`
+
+The mutation sends each event's messages as soon as it is stepped, **before** the batch's fsync. Now a
+crash inside the fsync is dangerous: other nodes have already received votes and acknowledgements that the
+crashed node no longer has after restart.
+
+```mermaid
+sequenceDiagram
+    participant A as node A (buggy)
+    participant B as node B
+    Note over A: batch: grant vote to B in term 7
+    A->>B: VoteGranted (sent BEFORE the fsync)
+    Note over A: crash inside the fsync: the vote is lost
+    Note over A: restarts, votedFor = none in term 7
+    A->>A: grants its vote again in term 7 → two leaders possible
+```
+
+Measured (crash loop + batching, 3 nodes): caught in **78/100** seeds (Durability checker 74, Election
+Safety 4). With the durability checkers switched off, so only the *consequences* can catch it, it is still
+caught in **97/300** (Leader Completeness 75, Election Safety 22). The control run (no mutation) is clean.
+With group commit off it shows much less (3 of 10 in a quick dashboard run), because single-event batches
+rarely have a crash between send and sync. That's why it is tested under the crash loop with batching.
+
+### 2.4 In the simulator
+
+`SimConfig.withBatching(2)` holds each node's incoming events for up to 2 ms of virtual time, then hands
+them to `handleBatch` together, like the real mailbox. So simulated crashes land **inside** batched
+fsyncs, the dangerous case. The gate runs every fault mix with and without batching (§9).
+
+## 3. How to benchmark without fooling yourself
+
+1. **Measure at the client.** Latency is timed from the client's call to its answer, retries included,
+   because that's what a user sees. Server-side numbers (fsync time, batch size) come from the leader's
+   `/metrics`, to explain the client numbers.
+2. **Warm up.** The first 3 s are thrown away: the JVM is still compiling hot code.
+3. **Report percentiles, not averages.** An average hides the slow tail. p50 and p99 come from an
+   HdrHistogram, which records every latency exactly.
+4. **Repeat and take the median.** Each setting ran 3 × 15 s. Most repeats agreed within 15%; the worst
+   setting varied 39%. Repeats tell you how much to trust a difference: 148 → 2,075 is real; 142 vs 149 is
+   noise.
+5. **Check the numbers against a law.** With closed-loop clients, Little's law says
+   *clients = throughput × latency*. 64 / 148 ops/s ≈ 432 ms; measured p50 442 ms. 64 / 2,075 ≈ 31 ms;
+   measured 31 ms. If these disagreed, something in the measurement would be wrong.
+6. **Write down the limits** (one laptop, apps open, closed loop): DEVIATIONS.md BM1–BM5.
+
+**Closed vs open loop.** A closed-loop client slows down when the server slows down (it waits for each
+answer), so it can hide how bad overload is. That is called *coordinated omission*. Real users arrive
+open-loop. For comparing settings on one machine closed loop is fine and simpler; it's listed as BM3.
+
+## 4. Results in one table
+
+| | Result |
+|---|---|
+| Group commit, 3 nodes, 64 clients | 148 → **2,075** writes/s (14×), p99 541 → **50** ms |
+| 5 nodes, same | 119 → 1,234 writes/s |
+| Idle read vs write | 0.4 ms vs 8.0 ms (ReadIndex: no log entry, no fsync) |
+| Failover, 3 nodes, 100 kills | election p50 199, p99 386, max 409 ms |
+| Failover, 5 nodes, 100 kills | election p50 186, p99 247, max 250 ms |
+| Docker, 64 clients (after the fix) | 4,655 writes/s, p99 24 ms |
+
+Full tables and charts: BENCHMARKS.md.
+
+## 5. Failover: what "200 ms" is made of
+
+```mermaid
+gantt
+    title One leader kill (3 nodes, typical)
+    dateFormat x
+    axisFormat %L ms
+    section Followers
+    waiting for heartbeats (random 150–300 ms)   :0, 190
+    PreVote + vote round                          :190, 199
+    section Client
+    retries hit the dead leader, then find the new one :0, 212
+```
+
+1. The leader dies; heartbeats stop.
+2. Each follower's election timer (random 150–300 ms) runs out; the first one starts PreVote, then the
+   real vote. On localhost the vote round takes a few ms.
+3. The client's next retry reaches the new leader: the client gap is 10–20 ms longer than the election.
+
+The 3-node p99 (386 ms) comes from **2 kills out of 100** where both followers timed out close together,
+split the vote, and needed a second round (the term rose by 2). The 5-node run had no split vote. That is
+what the random timeout is for: it makes split votes rare, not impossible.
+
+## 6. The 40 ms bug (found by the Docker benchmark)
+
+**Symptom:** on Docker one client got 20 writes/s, each about 51 ms. On the Mac: 149/s.
+
+**Narrowing it down, one layer at a time:**
+
+| Test | Result | Conclusion |
+|---|---|---|
+| `curl` PUT to the leader | 5 ms | Raft and the disk are not the problem |
+| Java client, PUT | 50 ms | something in how Java talks to it |
+| Java client, GET `/status` (no body, no Raft) | 45 ms | not the request body, not Raft |
+| Java client forced to HTTP/1.1 | 50 ms | not HTTP/2 negotiation |
+| `curl`, 6 requests on **one reused** connection | 3.5 ms, then **42 ms** each | it's connection reuse |
+| same against a local (macOS) node | 1.2 ms, then 0.5 ms | Linux only |
+
+**Cause:**
+
+```mermaid
+sequenceDiagram
+    participant S as server (Linux, Nagle on)
+    participant C as client
+    C->>S: request 2 on a kept-alive connection
+    S->>C: response headers (small packet)
+    Note over S: body ready, but Nagle holds it:<br/>an earlier packet is still un-ACKed
+    Note over C: delayed ACK: waits up to 40 ms<br/>hoping to piggyback the ACK
+    C->>S: ACK (after ~40 ms)
+    S->>C: response body
+```
+
+The JDK HTTP server writes headers and body as two writes. Nagle holds the second until the first is
+acknowledged; the Linux receiver delays that acknowledgement. Two reasonable optimisations deadlock for
+40 ms on every request. A new connection doesn't show it (no un-ACKed data yet), which is why `curl` was
+fast.
+
+**Fix:** `TCP_NODELAY` via `sun.net.httpserver.nodelay=true`, set in `ClientApi` before the server classes
+load, pinned by `ClientApiNoDelayTest`. Result: 20 → **543** writes/s for one client, 1,396 → **4,655** at
+64. Local numbers unchanged (re-measured 142 vs 149 and 2,140 vs 2,075 ops/s).
+
+**Lessons:** measure each layer separately; benchmark on the OS you deploy to; a test pinned the setting
+because the symptom can't be reproduced on macOS.
+
+## 7. Is the Mac's fsync real?
+
+DEVIATIONS.md S1 used to say Java's `force` on macOS is plain `fsync`, which stops at the drive's cache. A
+probe measured all three on the same SSD: `fsync` 0.03 ms, `F_FULLFSYNC` 2.97 ms, Java `force(true)` 2.96 ms.
+`force(true)` costs exactly what the full flush costs, so it is the full flush on this JDK, and S1 was
+corrected. Docker's VM flushes in 0.5–0.9 ms; that one is **not** verified, so its numbers are for
+comparison only.
+
+## 8. The dashboard and the blind bug test
+
+`./gradlew :raft-dashboard:run` (or ▶ on `MainApplication`) serves http://localhost:8090. Each run is saved
+in `results/` and can be reopened or compared later.
+
+**Blind bug test.** You choose bugs and how many seeds get each. They are hidden among clean seeds. Only
+at the end do you see the answer key:
+
+```
+                 flagged by a checker    not flagged
+bug planted      CAUGHT                  MISSED      (the bug's situation never occurred)
+clean            FALSE ALARM (!)         CLEAN PASS
+```
+
+- **False alarms must be 0.** A false alarm means a checker reports a violation in correct code, so its
+  other reports can't be trusted either. In every blind run so far: 0.
+- **Misses are expected.** A planted bug only breaks something when the random faults create its
+  situation. For example, the Figure 8 bug needs a rare sequence of elections and was caught 0 of 10 in a
+  600-seed blind run, while the lying-disk bug was caught 10 of 10. Each missed seed says why.
+- Detection rates per bug match the dedicated mutation tests (MILESTONES.md).
+
+## 9. The gate with group commit
+
+The usual gate, doubled: 5,000 seeds × {3, 5} nodes × {chaos, crash loop} × group commit {off, on} =
+**40,000 runs, 0 violations** of invariants 1–7, vote durability, replica state and liveness (7 min 40 s).
+
+With batching on, the crash loop still crashed nodes about 255,000 times on 3 nodes, about 92,000 of them
+**inside an fsync**, now often a batched fsync carrying several events. Batches in the simulator average
+1.5–1.7 events (up to 170): smaller than the server's 45 at 64 clients, because the simulator's 5 clients
+make less load, but large enough that every crash-inside-a-batch case gets exercised. Table:
+MILESTONES.md M6.
+
+**What this proves:** group commit changed *how many* fsyncs happen, not *what* is guaranteed. Every
+checker that held one event at a time still holds with batches.
+
+## 10. All M6 tests
+
+| Test | What it checks |
+|---|---|
+| `NodeDriverBatchTest` | one fsync per batch before anything is sent; no fsync if nothing was persisted; a failed fsync halts and sends nothing; 5 proposals commit with one fsync and answer in order; a batch ends in the same state as one-by-one; reads wait in a batch; the mutation sends first |
+| `ChaosTest` (+ 4 batching configs) | invariants 1–7 and liveness with group commit on |
+| `MutationSanityTest` (`SEND_BEFORE_SYNC` ×2, control) | the new bug is caught, the control is clean |
+| `ServerMetricsTest` | Prometheus parsing; p99 from histogram buckets (and the `quantile=` vs `le=` trap) |
+| `LatencyTest`, `ResultStoreTest` | percentile summaries; saved runs, including path-traversal ids |
+| `BlindTestTest`, `SimJobTest` | the blind plan (counts, shuffling, validation), failed seeds keep their stats |
+| `ClientApiNoDelayTest` | the client API turns Nagle off |
+
+`./gradlew build`: 411 tests, green.
+
+## 11. What M6 doesn't do
+
+- No multi-machine run (BM1): every number is from one laptop.
+- No open-loop load generator (BM3).
+- Read latency under load equals write latency; the cause (queueing on the event loop) is a guess (BM5).
+- Parallel leader fsync (thesis §10.2.1) and pipelining are not built: they'd change E1's ordering.
+
+## 12. Study questions (with answers)
+
+1. **Why does throughput stay at about 150 writes/s without group commit, even with 64 clients?** Each
+   write needs its own fsync, one after another on one event loop; at about 3–6 ms per fsync plus the
+   follower's fsync, that's the ceiling. More clients only make the queue longer.
+2. **Why did latency get better with group commit, not worse?** The latency was mostly waiting in the
+   queue for earlier fsyncs. Batching empties the queue faster, so waiting shrinks (541 → 50 ms p99).
+3. **Can a batch break "persist before send"?** No. All of a batch's messages are sent after its one
+   fsync. The core stepping ahead is fine because it never reads storage (D1) and nothing leaves the node
+   early.
+4. **What does `SEND_BEFORE_SYNC` break, concretely?** A vote or an acknowledgement reaches other nodes,
+   then the node crashes before the fsync and forgets it. It can vote twice in one term, or the leader can
+   count an entry as replicated that the follower no longer has.
+5. **Why is there no batch timer?** A timer adds latency when the system is idle. Draining what is already
+   waiting gives the benefit exactly when there is load, and costs nothing otherwise.
+6. **How do you know 64 clients / 148 ops/s should give 432 ms?** Little's law for a closed system:
+   clients = throughput × latency.
+7. **Why report p99 and not the average?** Averages hide the slow tail; at scale every user hits the p99
+   regularly.
+8. **Why median of 3 runs?** A single run can be disturbed by other programs. The median ignores one bad
+   run, and the spread shows how big a difference must be before it means something.
+9. **Why is the 3-node failover p99 386 ms when the median is 199?** Two of 100 kills had a split vote and
+   needed a second election round.
+10. **Why was Docker 20 ops/s, and why didn't the Mac show it?** Nagle + Linux delayed ACK on a reused
+    connection: 40 ms per request. macOS loopback acknowledges at once.
+11. **Why is Docker faster than the Mac after the fix?** Its VM's fsync takes 0.5–0.9 ms against 3 ms. Not
+    verified as durable, so not the reference.
+12. **What does a false alarm in the blind test mean, and why does it matter more than a miss?** A checker
+    flagged correct code, so the checker is wrong and none of its verdicts can be trusted. A miss only means
+    the random run never reached the bug's situation.
+13. **Why do 5 nodes give lower throughput than 3?** Two more followers to send to, one more fsync to wait
+    for (3 of 5), and here all 5 share one laptop. More nodes buy fault tolerance, not speed.
+
+## 13. Glossary additions
+
+| Term | Meaning |
+|---|---|
+| **group commit** | one fsync for every event that was waiting, instead of one per event |
+| **`handleBatch`** | the driver method that steps a batch, fsyncs once, then sends, applies and answers |
+| **`SEND_BEFORE_SYNC`** | the M6 planted bug: messages leave before the batch's fsync |
+| **closed loop** | each client waits for its answer before sending again |
+| **HdrHistogram** | a histogram that records latencies precisely across a huge range, used for p50/p99 |
+| **Little's law** | clients = throughput × latency (closed loop) |
+| **client gap** | the longest pause a writing client sees around a leader kill |
+| **split vote** | two candidates in the same term, neither gets a majority; a new round follows |
+| **Nagle + delayed ACK** | two TCP optimisations that together stall a two-part response for up to 40 ms |
+| **TCP_NODELAY** | turns Nagle off on a socket |
+| **F_FULLFSYNC** | the macOS flush that reaches the flash |
+| **blind test** | bugs hidden among clean seeds; the answer key is revealed only at the end |
+| **false alarm** | a clean seed flagged as broken |

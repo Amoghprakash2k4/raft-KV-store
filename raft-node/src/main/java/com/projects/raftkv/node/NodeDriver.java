@@ -60,6 +60,7 @@ public final class NodeDriver {
     private long appliedIndex;
     private final long snapshotEvery;
     private boolean halted;
+    private boolean sendBeforeSync;   // MUTATION (test only)
     private long snapshotsTaken;
     private long snapshotsInstalled;
 
@@ -130,11 +131,19 @@ public final class NodeDriver {
      * goes to the read listener as {@link ReadOutcome}. {@code readId} must not be in flight already.
      */
     public void read(long readId, Bytes query) {
+        handle(prepareRead(readId, query));
+    }
+
+    /**
+     * For a batching caller: registers {@code query} under {@code readId} and returns the event that starts
+     * the read, to be passed to {@link #handleBatch} with the others.
+     */
+    public Event prepareRead(long readId, Bytes query) {
         Objects.requireNonNull(query);
         if (halted) throw new NodeHaltedException("node halted after a storage failure", null);
         if (readQueries.putIfAbsent(readId, query) != null)
             throw new IllegalArgumentException("read " + readId + " is already in flight");
-        handle(new Event.ReadRequested(readId));
+        return new Event.ReadRequested(readId);
     }
 
     /** As above, without snapshots. */
@@ -143,24 +152,50 @@ public final class NodeDriver {
         return create(core, storage, transport, stateMachine, outcomes, 0);
     }
 
+    /** One event: the same as a batch of one (E1: persist + fsync → send → apply → notify). */
     public void handle(Event event) {
-        if (halted) throw new NodeHaltedException("node halted after a storage failure", null);
-        Ready ready = core.step(event);
+        handleBatch(List.of(event));
+    }
 
-        // 1. Persist + one fsync. Nothing below happens if this fails (E1a rule 2).
-        if (ready.mustSync()) {
-            try {
+    /**
+     * Group commit (DESIGN.md M6-A, etcd's Ready batching): step the core once per event, in order, and
+     * write every step's persist ops; then ONE fsync for the whole batch; only then send every message,
+     * and finally, step by step, apply, answer clients and serve reads. Nothing leaves the node before the
+     * fsync that covers it, so E1 holds for each event. The core never reads storage (D1), so stepping
+     * event k+1 before event k's ops are synced is safe: the core already assumed they would be.
+     * A failed fsync halts the node with nothing from the batch sent.
+     */
+    public void handleBatch(List<Event> events) {
+        if (halted) throw new NodeHaltedException("node halted after a storage failure", null);
+        List<Ready> readys = new ArrayList<>(events.size());
+        boolean mustSync = false;
+        try {
+            for (Event event : events) {
+                Ready ready = core.step(event);
+                readys.add(ready);
+                // 1. Persist (the fsync comes once, below).
                 for (PersistOp op : ready.persist()) persist(op);
-                storage.sync();
-            } catch (StorageException e) {
-                halted = true;
-                throw new NodeHaltedException("fsync failed; halting before sending anything", e);
+                mustSync |= ready.mustSync();
+                if (sendBeforeSync) ready.messages().forEach(transport::send);   // MUTATION (test only)
             }
+            if (mustSync) storage.sync();
+        } catch (StorageException e) {
+            halted = true;
+            throw new NodeHaltedException("fsync failed; halting before sending anything", e);
         }
         // 2. Send.
-        for (Message m : ready.messages()) {
-            transport.send(m);
+        if (!sendBeforeSync) {
+            for (Ready ready : readys) {
+                for (Message m : ready.messages()) transport.send(m);
+            }
         }
+        // 3 and 4, step by step so outcomes come in exactly the order the events had.
+        for (Ready ready : readys) applyAndNotify(ready);
+        // Between two batches: maybe take a snapshot.
+        maybeSnapshot();
+    }
+
+    private void applyAndNotify(Ready ready) {
         // Bookkeeping for proposals accepted in this step; must precede apply so the match is seen.
         for (ClientNotice n : ready.notices()) {
             if (n instanceof ClientNotice.ProposalAccepted a) track(a);
@@ -183,8 +218,15 @@ public final class NodeDriver {
             }
         }
         serveReads();
-        // Between two events: maybe take a snapshot.
-        maybeSnapshot();
+    }
+
+    /**
+     * Test only: break E1 on purpose (DESIGN.md M2-C, M6-A). Only {@link ProtocolMutation#SEND_BEFORE_SYNC}
+     * concerns the driver; the core gets its mutations separately.
+     */
+    public NodeDriver withMutationsForTesting(java.util.Set<com.projects.raftkv.core.ProtocolMutation> mutations) {
+        sendBeforeSync = mutations.contains(com.projects.raftkv.core.ProtocolMutation.SEND_BEFORE_SYNC);   // MUTATION (test only)
+        return this;
     }
 
     /** Thesis §6.4 step 4: answer every released read whose readIndex has been applied. */

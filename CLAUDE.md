@@ -8,7 +8,7 @@ A Raft-based replicated key-value store in plain Java 21, built from scratch as 
 for the owner: a new grad with about 6 months of Java/Spring experience who wants to deeply understand
 consensus and end up with an interview-grade project. You act as a **senior distributed-systems mentor**.
 
-## Status (last updated 2026-11-25)
+## Status (last updated 2026-11-26)
 - **M1 Leader Election: DONE.** Gate passed: 0 Election Safety violations over 5,000 seeds × {3, 5} nodes.
 - **M2 Log Replication: DONE** (accepted by the owner 2026-11-23). 0 violations of invariants 1–5 over
   5,000 seeds × {3, 5} nodes; all mutation checks caught (rates in MILESTONES.md).
@@ -18,10 +18,28 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   The gate found a real ReadIndex bug (seed 4811: a stale-term rejection echoed a read round); fixed.
   Sessions + dedup, `ClientSession` (raft-client), ReadIndex, linearizability checker (invariant 7),
   lossy client links, three mutations caught. Gate numbers in MILESTONES.md.
-- **M5 Hardening: built and verified, NOT yet accepted or committed** (branch `m5`). PreVote + CheckQuorum
-  + stickiness (flags), gRPC transport, `raft-server` (event loop, HTTP API, metrics), `raft-cli`,
-  kill -9 integration test (6 runs, 162 kills, all linearizable), Docker compose verified by hand. Gate
-  passed with hardening on after seed 3064 (client-liveness window too tight → H6, 2 s, measured).
+- **M5 Hardening: DONE, committed `8db8b6d` on `m5` and pushed to `origin/m5` (2026-11-25), not merged to
+  `main`** (ask the owner). PreVote + CheckQuorum + stickiness (flags), gRPC transport, `raft-server`
+  (event loop, HTTP API, metrics), `raft-cli`, kill -9 integration test (6 runs, 162 kills, all
+  linearizable), Docker compose verified by hand. Gate passed with hardening on after seed 3064
+  (client-liveness window too tight → H6, 2 s, measured).
+- **M6 Benchmarks: DONE** (2026-11-27; docs written, merged to `main` and pushed at the owner's request).
+  All six milestones are built. Results: BENCHMARKS.md; decisions DESIGN M6-A..D; limits DEVIATIONS BM1–BM5.
+  - **Built and tested** (411 tests green):
+    - group commit (mailbox drain, one fsync per batch) in the driver, server and simulator, with the
+      SEND_BEFORE_SYNC mutation; gate passed at 5,000 seeds × 8 configurations;
+    - `raft-bench` (load, failover, matrix);
+    - `raft-dashboard` (`MainApplication`, :8090): Simulator, Blind bug test, Throughput, Failover and
+      Compare tabs;
+    - failed seeds keep their stats (`SimulationFailure.partial()`).
+  - **Measured (2026-11-27):** matrix (96 runs), failover 100 kills × {3, 5}, Docker, macOS fsync probe
+    (Java `force(true)` = F_FULLFSYNC, ~3 ms, so DEVIATIONS S1 needs correcting). Docker found a real bug:
+    Nagle + delayed ACK stalled every kept-alive HTTP request 40 ms on Linux; fixed with
+    `sun.net.httpserver.nodelay` in `ClientApi` (20 → 543 ops/s, one client).
+  - **Added 2026-11-27:** `raft-bench load --attach <ports>`, dashboard **Benchmarks** tab (`benchmarks.js`,
+    fixed explained report; numbers are medians from `results/`), `INTERVIEW_PREP.md`.
+  - `results/`: load-* and failover-* are committed; sim-* and blind-* are git-ignored (up to 299 MB each).
+  - Docs done: BENCHMARKS.md, DESIGN M6, DEVIATIONS (S1 corrected, BM1–BM5), MILESTONES M6, EXPLANATION `# M6`.
 - **Git:** history rewritten 2026-11-24 (author → "Amogh P"): M1 `a645fa8`, docs `069cc15`, M2 `ec88c75`, M3 `be439fc`. M2 committed and pushed to `origin/main` on 2026-11-23, M3 on
   2026-11-24 (the owner asked each time). M4 work happens on the `m4` branch. Never commit or push without an explicit yes from the owner.
 
@@ -84,8 +102,9 @@ consensus and end up with an interview-grade project. You act as a **senior dist
   event-loop thread + mailbox, Micrometer/Prometheus from published `View`s; M5-E kill -9 test with 3
   JVMs + Dockerfile/compose.
 
-## Still open (ask at the named milestone)
-- **M6:** benchmarks and report: ask before choosing tools and workloads.
+## Still open
+- Nothing planned. Possible extensions (ask first): membership changes (R2), follower reads (K4), a
+  multi-machine benchmark (BM1), verifying the reads-under-load hypothesis (BM5).
 
 ## Layout
 ```
@@ -114,12 +133,19 @@ raft-sim/           com.projects.raftkv.sim        Simulation, NetworkConfig, Fa
                                                    VoteDurability, LogMatching, LeaderAppendOnly,
                                                    LeaderCompleteness, StateMachineSafety, ReplicaState,
                                                    Durability; HistoryRecorder, LinearizabilityChecker
-compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md
+raft-bench/         com.projects.raftkv.bench      BenchMain (load, failover, matrix, --attach), ProcessCluster,
+                                                   LoadRun, FailoverRun, ServerMetrics, ResultStore, RunRecord
+raft-dashboard/     com.projects.raftkv.dashboard  MainApplication (:8090), DashboardServer, Jobs, SimJob, BlindTest;
+                                                   web/ index.html, app.js, benchmarks.js, style.css, echarts
+compose.yaml, DESIGN.md, DEVIATIONS.md, MILESTONES.md, EXPLANATION.md, PROJECT_BRIEF.md, BENCHMARKS.md,
+INTERVIEW_PREP.md, results/ (load-*/failover-* committed)
 ```
 
 ## Commands
 ```
-./gradlew build                                   # all modules, 369 tests, 300 seeds per chaos test
+./gradlew build                                   # all modules, 411 tests, 300 seeds per chaos test
+./gradlew :raft-dashboard:run                     # the dashboard on http://localhost:8090
+./gradlew :raft-bench:run --args="matrix --repeat 3"   # the benchmark matrix (~37 min, idle machine)
 ./gradlew :raft-server:integrationTest            # 3 JVMs + kill -9 loop (~40 s; -Pkill9.kills=30 ≈ 90 s)
 docker compose up -d --build                      # real 3-node cluster on :8081-8083 (Docker Desktop must run)
 ./gradlew :raft-sim:test --tests '*ChaosTest*' -Psim.seeds=5000   # milestone gate (chaos + crash loop × {3, 5})

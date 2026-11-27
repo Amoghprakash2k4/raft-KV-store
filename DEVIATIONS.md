@@ -52,7 +52,7 @@ Removed in M4: **H1** (client links were reliable; they are now lossy, DESIGN.md
 
 | # | What | Why it is acceptable now | Revisit |
 |---|------|--------------------------|---------|
-| S1 | On macOS, `FileChannel.force` is `fsync(2)`, which doesn't flush the drive's write cache (`F_FULLFSYNC` does), and `RealDisk.fsyncDir` silently does nothing if the directory can't be opened as a channel. | Linux in Docker is the deployment target (compose uses named volumes on the Linux VM's disk, not macOS bind mounts); the simulator tests the protocol's use of fsync independently. | Kept |
+| S1 | `RealDisk.fsyncDir` silently does nothing if the directory can't be opened as a channel. **Corrected in M6:** this row used to say that on macOS `FileChannel.force` is plain `fsync(2)`, which doesn't flush the drive's cache. Measured on JDK 21.0.11, same APFS volume, 4 KB writes: `fsync()` median 0.03 ms, `fcntl(F_FULLFSYNC)` 2.97 ms (p99 4.08), Java `force(true)` 2.96 ms (p99 4.06). `force(true)` behaves as the full flush, so local benchmark numbers are durable ones. Docker Desktop's Linux VM flushes in 0.5–0.9 ms; whether that reaches the physical SSD is **not** verified. | It only matters if the directory can't be opened as a channel; the simulator tests the protocol's use of fsync independently. | Kept (directory fsync); the macOS concern is closed |
 | S2 | Memory: the core holds the latest snapshot's bytes (M3-C), and `FileWalStorage` keeps its own copy of the log after the base (`LogImage`, for checkpoints). | The KV store lives in RAM anyway; both copies are bounded by snapshotting. | Kept (a production system would stream snapshots from disk) |
 | S3 | Serializing a snapshot runs on the driver thread and blocks the event loop. | Fine at this size; etcd/TiKV use copy-on-write state and background snapshots. | Later, if measured to matter |
 
@@ -68,6 +68,16 @@ with the same seq and dedup makes it exactly-once).
 | R3 | Back-pressure to clients beyond "mailbox full → 503" | Bounded mailbox and per-peer queues; clients retry | Under overload, latency is not shaped; requests are refused |
 | R4 | Leadership transfer (thesis §3.10) | A leader keeps its role until it fails or loses quorum | Planned restarts of the leader cost one election timeout of unavailability |
 
+## Benchmark limits (M6)
+
+| # | What | Why it is acceptable | Revisit |
+|---|------|----------------------|---------|
+| BM1 | Every benchmark runs all nodes on one MacBook: they share one CPU and one SSD, and messages travel over localhost (no network delay). | It compares settings fairly (group commit on/off, 3 vs 5 nodes) on identical hardware. Absolute numbers would differ on separate machines: more disk bandwidth, but a network round trip per write. | Run on 3 cloud VMs |
+| BM2 | Other apps (IDE, browser) were open during the matrix. | 3 repeats per setting, medians reported; most repeats agree within 15%, the worst setting varied 39% (3 nodes, group commit off, 16 clients). | Kept |
+| BM3 | Closed-loop clients only, 100-byte values, uniform keys. | Simple, and Little's law confirms the numbers (64 / 148 ops/s ≈ 432 ms vs 442 ms measured). Open-loop load would show queueing beyond saturation. | Later |
+| BM4 | Docker numbers rely on the Linux VM's fsync, whose durability is not verified (S1). | Shown for comparison only; the Mac numbers are the reference. | Kept |
+| BM5 | Read latency under load roughly equals write latency; the likely cause (reads queue behind writes on the single event loop) is a hypothesis, not measured. | Idle reads are 0.4 ms against 8 ms for writes, which shows ReadIndex itself is cheap. | Profile the event loop |
+
 ## Open
 
-Nothing. M6 (benchmarks and report) is next.
+Nothing. All six milestones are built.
